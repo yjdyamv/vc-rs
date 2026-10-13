@@ -149,6 +149,15 @@ pub struct OpenOptions {
     pub volume_type: Option<VolumeType>,
     /// Read the backup header instead of the primary one.
     pub use_backup_header: bool,
+    /// Freeze the container's timestamps for as long as the volume is open and
+    /// put them back when it is dropped.
+    ///
+    /// This is VeraCrypt's "Preserve modification timestamp of file containers",
+    /// on by default there: mounting a volume, or even just checking a password,
+    /// must not reveal when the container was last used. Everything that opens a
+    /// volume for a user (the `vcrs` CLI, the iSCSI mount) sets this; the library
+    /// leaves it off so that opening a volume has no side effects unless asked.
+    pub preserve_timestamps: bool,
 }
 
 impl OpenOptions {
@@ -156,6 +165,25 @@ impl OpenOptions {
     pub fn effective_password(&self, volume: Option<&Path>) -> Result<Vec<u8>> {
         apply_keyfiles(&self.password, &self.keyfiles, volume)
     }
+}
+
+/// The timestamps of the container file, saved while they are frozen.
+///
+/// VeraCrypt's driver freezes them when a container is mounted ("Preserve
+/// modification timestamp of file containers", on by default: `bPreserveTimestamp
+/// = TRUE` in `src/Common/Dlgcode.c`) so that using a volume does not reveal
+/// *when* it was used -- the file's last-write time is exactly the kind of
+/// metadata that gives a container away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileTimestamps {
+    /// Last access time, as the host file reported it before it was frozen.
+    pub last_access: std::time::SystemTime,
+    /// Last write time, as the host file reported it before it was frozen.
+    pub last_write: std::time::SystemTime,
+    /// Creation, access, write and change times in Windows `FILETIME` units
+    /// (100 ns since 1601), which is what the freeze/restore calls use.
+    #[cfg(windows)]
+    raw: [i64; 4],
 }
 
 /// A host-file byte range that must not be written to.
@@ -209,6 +237,9 @@ pub struct Volume {
     /// Set when the volume's in-place encryption was interrupted, i.e. when part
     /// of the data area is still plaintext.
     in_place: Option<InPlaceState>,
+    /// Timestamps saved by [`OpenOptions::preserve_timestamps`], to put back when
+    /// the volume (and with it the file handle) is dropped.
+    timestamps: Option<FileTimestamps>,
 }
 
 impl Volume {
@@ -303,7 +334,7 @@ impl Volume {
         write_fake_hidden_region(&file, backup_offset + VOLUME_HEADER_SIZE, host_size, host_size, options)?;
 
         file.sync_all()?;
-        Volume::from_parts(file, layout, header, host_size)
+        Volume::from_parts(file, layout, header, host_size, None)
     }
 
     /// Create a hidden volume inside the existing container `path`.
@@ -375,13 +406,34 @@ impl Volume {
         }
 
         file.sync_all()?;
-        Volume::from_parts(file, layout, header, host_size)
+        Volume::from_parts(file, layout, header, host_size, None)
     }
 
     /// Open an existing volume, trying the layouts, PRFs and encryption
     /// algorithms in VeraCrypt's order.
     pub fn open(path: &Path, options: &OpenOptions) -> Result<Volume> {
         let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+        // VeraCrypt freezes the timestamps of a container as soon as it opens it
+        // (`OpenVolume(..., preserveTimestamps, ...)`), and the order matters:
+        // the filesystem records an access when the first read happens, and once
+        // it has, no later "do not update" flag takes effect (measured on this
+        // machine: freezing after a read leaves the access time updated).
+        let timestamps = if options.preserve_timestamps {
+            match freeze_file_timestamps(&file) {
+                Ok(timestamps) => {
+                    if timestamps.is_some() {
+                        log::debug!("preserving the container's timestamps while it is open");
+                    }
+                    timestamps
+                }
+                Err(e) => {
+                    log::warn!("could not preserve the container's timestamp: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let host_size = file.metadata()?.len();
         // The keyfile pool is mixed in once; every trial below derives from it.
         let password = options.effective_password(Some(path))?;
@@ -450,7 +502,7 @@ impl Volume {
                                 continue;
                             }
                             log::info!("opened {layout:?} volume with PRF {prf} and {ea}");
-                            return Volume::from_parts(file, *layout, header, host_size);
+                            return Volume::from_parts(file, *layout, header, host_size, timestamps);
                         }
                         Err(Error::HigherVersionRequired(v)) => {
                             return Err(Error::HigherVersionRequired(v));
@@ -479,7 +531,13 @@ impl Volume {
         }
     }
 
-    fn from_parts(file: File, layout: VolumeLayout, header: VolumeHeader, host_size: u64) -> Result<Volume> {
+    fn from_parts(
+        file: File,
+        layout: VolumeLayout,
+        header: VolumeHeader,
+        host_size: u64,
+        timestamps: Option<FileTimestamps>,
+    ) -> Result<Volume> {
         let xts = Xts::new(header.ea, header.data_key())?;
         let in_place = in_place_state(&header);
         // An unfinished in-place volume describes the *boundary* between its
@@ -509,6 +567,7 @@ impl Volume {
             protected: OnceLock::new(),
             protection_triggered: AtomicBool::new(false),
             in_place,
+            timestamps,
         })
     }
 
@@ -1347,6 +1406,7 @@ pub fn encrypt_in_place_stopping_after(
             volume_type: Some(VolumeType::Normal),
             // Only the backup copy exists until the run has finished.
             use_backup_header: !finished,
+            preserve_timestamps: false,
         },
     )
 }
@@ -1430,6 +1490,7 @@ pub fn decrypt_in_place_stopping_after(
             volume_type: Some(VolumeType::Normal),
             // A resumed run has already overwritten the primary header group.
             use_backup_header: true,
+            preserve_timestamps: false,
         },
     )?;
     if volume.header.flags & HEADER_FLAG_NONSYS_INPLACE_ENC == 0 {
@@ -1608,6 +1669,157 @@ fn random_master_key(ea: EncryptionAlgorithm) -> Result<Vec<u8>> {
     }
 }
 
+/// Windows `FILE_BASIC_INFO`, i.e. what `FileBasicInfo` returns: four
+/// `FILETIME` values (100 ns since 1601) and the file attributes.
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FileBasicInfo {
+    creation_time: i64,
+    last_access_time: i64,
+    last_write_time: i64,
+    change_time: i64,
+    file_attributes: u32,
+}
+
+/// `FILE_INFO_BY_HANDLE_CLASS::FileBasicInfo`.
+#[cfg(windows)]
+const FILE_BASIC_INFO_CLASS: u32 = 0;
+
+#[cfg(windows)]
+mod file_info_ffi {
+    use super::FileTime;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn GetFileInformationByHandleEx(
+            handle: *mut core::ffi::c_void,
+            class: u32,
+            info: *mut core::ffi::c_void,
+            size: u32,
+        ) -> i32;
+
+        pub fn SetFileInformationByHandle(
+            handle: *mut core::ffi::c_void,
+            class: u32,
+            info: *mut core::ffi::c_void,
+            size: u32,
+        ) -> i32;
+
+        pub fn SetFileTime(
+            handle: *mut core::ffi::c_void,
+            creation_time: *const FileTime,
+            last_access_time: *const FileTime,
+            last_write_time: *const FileTime,
+        ) -> i32;
+    }
+}
+
+/// A Win32 `FILETIME` (two halves of a 100 ns count since 1601).
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FileTime {
+    low: u32,
+    high: u32,
+}
+
+#[cfg(windows)]
+impl FileTime {
+    /// The timestamp `-1`, which Win32 reads as "the filesystem should not
+    /// update this one" (VeraCrypt passes it for the access time in
+    /// `src/Common/Dlgcode.c:12241`).
+    const DONT_UPDATE: FileTime = FileTime {
+        low: 0xFFFF_FFFF,
+        high: 0xFFFF_FFFF,
+    };
+}
+
+/// Tell the filesystem not to bump the last access time while this handle is
+/// open.
+///
+/// Restoring the saved timestamps is not enough on its own: Windows (with
+/// "last access time updates" enabled, which is the default) queues the access
+/// to the file object and writes it when the handle is **closed**, i.e. after
+/// the restore has already happened.
+#[cfg(windows)]
+fn freeze_access_time(file: &File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    let ok = unsafe {
+        file_info_ffi::SetFileTime(
+            file.as_raw_handle() as *mut core::ffi::c_void,
+            std::ptr::null(),
+            &FileTime::DONT_UPDATE,
+            std::ptr::null(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    Ok(())
+}
+
+/// Read the container's four `FILETIME` values.
+#[cfg(windows)]
+fn query_file_basic_info(file: &File) -> Result<[i64; 4]> {
+    let info = query_file_basic(file)?;
+    Ok([
+        info.creation_time,
+        info.last_access_time,
+        info.last_write_time,
+        info.change_time,
+    ])
+}
+
+#[cfg(windows)]
+fn query_file_basic(file: &File) -> Result<FileBasicInfo> {
+    use std::os::windows::io::AsRawHandle;
+
+    let mut info = FileBasicInfo::default();
+    let size = std::mem::size_of::<FileBasicInfo>() as u32;
+    let ok = unsafe {
+        file_info_ffi::GetFileInformationByHandleEx(
+            file.as_raw_handle() as *mut core::ffi::c_void,
+            FILE_BASIC_INFO_CLASS,
+            &mut info as *mut FileBasicInfo as *mut core::ffi::c_void,
+            size,
+        )
+    };
+    if ok == 0 {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    Ok(info)
+}
+
+/// Write the container's four `FILETIME` values, leaving the attributes as they
+/// are (this is what VeraCrypt's driver does: query, overwrite the times, set).
+#[cfg(windows)]
+fn set_file_basic_info(file: &File, times: [i64; 4]) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    let mut info = query_file_basic(file)?;
+    info.creation_time = times[0];
+    info.last_access_time = times[1];
+    info.last_write_time = times[2];
+    info.change_time = times[3];
+
+    let size = std::mem::size_of::<FileBasicInfo>() as u32;
+    let ok = unsafe {
+        file_info_ffi::SetFileInformationByHandle(
+            file.as_raw_handle() as *mut core::ffi::c_void,
+            FILE_BASIC_INFO_CLASS,
+            &mut info as *mut FileBasicInfo as *mut core::ffi::c_void,
+            size,
+        )
+    };
+    if ok == 0 {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
 /// Mark an open host file as sparse (Windows `FSCTL_SET_SPARSE`), so that the
 /// parts of a quick-formatted container that are never written do not occupy
 /// disk space. Unix filesystems do that by themselves, so it is a no-op there.
@@ -1713,6 +1925,58 @@ pub fn write_all_at(file: &File, offset: u64, buf: &[u8]) -> std::io::Result<()>
     file.write_all_at(buf, offset)
 }
 
+/// Save `file`'s timestamps and ask the filesystem to stop updating them.
+///
+/// This is VeraCrypt's "Preserve modification timestamp of file containers" (on
+/// by default there). On Windows it uses the `FILETIME` sentinel the driver uses
+/// (`src/Driver/Ntvol.c`: the timestamps are set to `-1`, which tells the
+/// filesystem not to update them, after saving the original values); elsewhere
+/// the values are only saved for the caller to restore.
+///
+/// Must run **before** the file is read for the first time: the filesystem
+/// records the access on the first read, and nothing can take that back
+/// afterwards (see [`OpenOptions::preserve_timestamps`]).
+fn freeze_file_timestamps(file: &File) -> Result<Option<FileTimestamps>> {
+    let metadata = file.metadata()?;
+    let timestamps = FileTimestamps {
+        last_access: metadata.accessed().unwrap_or(std::time::UNIX_EPOCH),
+        last_write: metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+        #[cfg(windows)]
+        raw: query_file_basic_info(file)?,
+    };
+
+    #[cfg(windows)]
+    {
+        // `CreationTime = 0` leaves the creation time alone, `-1` tells the
+        // filesystem to stop updating the other three.
+        set_file_basic_info(file, [0, -1, -1, -1])?;
+        // The access time additionally needs the flag Win32 sets through
+        // `SetFileTime`: `FILE_BASIC_INFO` alone does not stop NTFS from
+        // recording the reads this process is about to make.
+        freeze_access_time(file)?;
+    }
+
+    Ok(Some(timestamps))
+}
+
+/// Put timestamps saved by [`freeze_file_timestamps`] back.
+fn restore_file_timestamps(file: &File, timestamps: FileTimestamps) -> Result<()> {
+    #[cfg(windows)]
+    {
+        set_file_basic_info(file, timestamps.raw)?;
+    }
+
+    #[cfg(not(windows))]
+    {
+        let times = std::fs::FileTimes::new()
+            .set_accessed(timestamps.last_access)
+            .set_modified(timestamps.last_write);
+        file.set_times(times)?;
+    }
+
+    Ok(())
+}
+
 impl std::fmt::Debug for Volume {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Volume")
@@ -1724,6 +1988,18 @@ impl std::fmt::Debug for Volume {
             .field("data_offset", &self.data_offset)
             .field("data_size", &self.data_size)
             .finish()
+    }
+}
+
+/// Put back the timestamps frozen for [`OpenOptions::preserve_timestamps`] when
+/// the volume is dropped, which is what closes the file handle.
+impl Drop for Volume {
+    fn drop(&mut self) {
+        if let Some(timestamps) = self.timestamps.take() {
+            if let Err(e) = restore_file_timestamps(&self.file, timestamps) {
+                log::warn!("could not restore the container's timestamp: {e}");
+            }
+        }
     }
 }
 
@@ -2124,6 +2400,7 @@ pub fn restore_headers_from_master_key(
             ea: Some(options.ea),
             volume_type: Some(options.volume_type),
             use_backup_header: false,
+            preserve_timestamps: false,
         },
     )?;
     log::info!(

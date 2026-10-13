@@ -82,7 +82,7 @@ fn the_data_area_is_xts_at_512_byte_units_regardless_of_the_sector_size() {
     // has to be exactly what XTS produces for unit 256 over the data area.
     let path = temp("sector-units");
     let plaintext = pattern(8192, 5);
-    let mut volume = Volume::create(&path, HOST_SIZE, &options(4096)).unwrap();
+    let volume = Volume::create(&path, HOST_SIZE, &options(4096)).unwrap();
     let master_key = volume.header.data_key().to_vec();
     volume.write_data(0, &plaintext).unwrap();
     volume.flush().unwrap();

@@ -148,6 +148,12 @@ pub struct IscsiMountOptions {
     pub disk_mode: DiskMode,
     /// First LBA of the synthetic partition (1 MiB by default).
     pub partition_start_lba: u64,
+    /// Preserve the container's modification timestamp (VeraCrypt's "Preserve
+    /// modification timestamp of file containers", which is on by default
+    /// there): writing through the mount must not reveal *when* the container
+    /// was last used. The host's timestamps are frozen while the target runs and
+    /// written back when it stops.
+    pub preserve_timestamp: bool,
     /// VeraCrypt's *protect hidden volume* option.
     ///
     /// When set, the hidden volume inside this container is opened with these
@@ -167,6 +173,7 @@ impl Default for IscsiMountOptions {
             removable: false,
             disk_mode: DiskMode::default(),
             partition_start_lba: DEFAULT_PARTITION_START_LBA,
+            preserve_timestamp: true,
             protect_hidden: None,
         }
     }
@@ -223,7 +230,13 @@ pub struct ScsiVolume<A: DataArea = Volume> {
 impl ScsiVolume<Volume> {
     /// Open `path` and serve it according to `opts`.
     pub fn open(path: &Path, open: &OpenOptions, opts: &IscsiMountOptions) -> Result<Self> {
-        let volume = Volume::open(path, open)?;
+        // A mounted container must not look as if it had been used. The flag is
+        // handed to `Volume::open`, which freezes the timestamps before it reads
+        // anything -- doing it afterwards is too late for the access time, which
+        // the filesystem has already recorded by then.
+        let mut open = open.clone();
+        open.preserve_timestamps = opts.preserve_timestamp;
+        let volume = Volume::open(path, &open)?;
         if let Some(hidden_open) = &opts.protect_hidden {
             // VeraCrypt refuses to mount with hidden-volume protection unless the
             // hidden volume's own password is right, so failing here (instead of

@@ -424,3 +424,69 @@ fn hidden_volume_protection_refuses_writes_through_the_scsi_device() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+/// VeraCrypt's "Preserve modification timestamp of file containers", on by
+/// default there: serving a container must not reveal *when* it was used, so
+/// A served container keeps its timestamps while it is mounted: the volume is
+/// opened with `preserve_timestamp` (VeraCrypt's default too), so the host
+/// file's modification and access times are frozen and written back when the
+/// volume is closed.
+#[cfg(windows)]
+#[test]
+fn serving_a_volume_preserves_the_container_timestamp() {
+    let path = std::env::temp_dir().join(format!(
+        "vcrs-iscsi-timestamps-{}.vc",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    let mut create = CreateOptions::default();
+    create.password = PASSWORD.to_vec();
+    create.pim = 1;
+    create.full_format = false;
+    let volume = Volume::create(&path, VOLUME_SIZE, &create).expect("create volume");
+    drop(volume);
+
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 24 * 3600);
+    let times = std::fs::FileTimes::new()
+        .set_modified(past)
+        .set_accessed(past);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open the container to date it")
+        .set_times(times)
+        .expect("date the container");
+    let modified = || std::fs::metadata(&path).unwrap().modified().unwrap();
+    assert_eq!(modified(), past);
+
+    let mut open = OpenOptions::default();
+    open.password = PASSWORD.to_vec();
+    open.pim = 1;
+    let opts = IscsiMountOptions::for_volume(&path);
+    assert!(opts.preserve_timestamp, "preserving is the default, as in VeraCrypt");
+
+    {
+        let mut device = ScsiVolume::open(&path, &open, &opts).expect("open the device");
+        // Writing through the device is what the mounted filesystem does.
+        device
+            .write(PARTITION_START + 5, &pattern(), 512)
+            .expect("write a sector");
+        device.flush().expect("flush the device");
+        assert_eq!(
+            modified(),
+            past,
+            "writing through the mount must not move the container's timestamp"
+        );
+    }
+
+    assert_eq!(modified(), past, "dropping the device restores the saved values");
+
+    // The write still landed in the container.
+    let volume = Volume::open(&path, &open).expect("re-open the container");
+    let mut read = vec![0u8; 512];
+    volume.read_data(5 * 512, &mut read).expect("read it back");
+    assert_eq!(read, pattern());
+    drop(volume);
+    let _ = std::fs::remove_file(&path);
+}

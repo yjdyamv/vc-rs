@@ -13,7 +13,8 @@ iSCSI 发起程序，Windows 看到的是一块真实磁盘，于是**用 Window
 格式化并读写（已实测：Windows 在此磁盘上格式化 NTFS 并写入文件，真实 VeraCrypt 挂载同一容器
 能原样读到）。`vcrs format` 还能在卷内直接建 FAT 文件系统（不挂载也能用）。此外还支持
 备份/恢复卷头（`backup-headers`/`restore-headers`，含从主密钥重建）、改密码
-（`change`）、卷扩容、隐藏卷保护、就地加解密、动态卷（`--sparse`，按需分配磁盘空间）。系统加密（预启动认证）不在范围内。
+（`change`）、卷扩容、隐藏卷保护、就地加解密、动态卷（`--sparse`，按需分配磁盘空间）、
+容器时间戳保护（挂载/读写不会暴露容器的修改时间与访问时间）。系统加密（预启动认证）不在范围内。
 
 * Crypto: [Botan](https://botan.randombit.net/) 3.13 via `botan-rs` (vendored static build).
 * Mounting (Windows): an in-process **iSCSI target**; the in-box Microsoft iSCSI Initiator
@@ -49,6 +50,7 @@ iSCSI 发起程序，Windows 看到的是一块真实磁盘，于是**用 Window
 | Argon2id (default and PIM-derived costs) | ✅ |
 | Data area read/write, randomized **full format** by default (`--quick` skips it) | ✅ |
 | Sparse (VeraCrypt's "dynamic") containers (`--sparse`) | ✅ (full length, only written parts allocate: a 200 MiB container is 256 KiB on disk; implies a quick format, like VeraCrypt) |
+| Container timestamps are preserved (`--no-preserve-timestamp` on `mount` disables it) | ✅ (VeraCrypt's *Preserve modification timestamp of file containers*, on by default: opening, changing or mounting a container leaves its modification and access times alone) |
 | Hidden volumes (read/write both layouts, `create_hidden`) | ✅ |
 | Dump / inspect headers, raw data read/write | ✅ |
 | Backup header usable for recovery | ✅ (open with `--backup`) |
@@ -105,6 +107,12 @@ vcrs create fast.vc --size 1G --password pw --quick
 # filesystem occupies a few hundred KiB. It is quick-formatted by definition (a full
 # format would write every byte) and, like VeraCrypt, skips the free-space check.
 vcrs create dynamic.vc --size 100G --password pw --sparse
+
+# Containers keep their timestamps: like VeraCrypt, using a container (info, read, write,
+# change, or mounting it) does not move its modification or access time, so nothing about
+# the file says when it was last used. Pass --no-preserve-timestamp to mount if you want
+# the operating system's normal behaviour instead.
+vcrs mount secret.vc --password "correct horse" --no-preserve-timestamp
 
 # Volume sector size: 512 by default. VeraCrypt's own format wizard only ever uses a
 # non-512 size for device-backed volumes (its file containers are always 512), but the
@@ -222,11 +230,12 @@ the iSCSI *target* itself needs no administration, only the initiator does).
 | Backup file layout | Each 64 KiB half of the `.hc` file is a self-contained header region (password + its own salt opens it) — the layout VeraCrypt's own restore reads | ✅ (`crates/vcrs-core/tests/header_restore.rs`) |
 | Backup/restore/change round trip | 11 tests: restore from file / from the embedded copy / from the master key, a wrong backup leaves the container alone, both header copies rewritten, the outer volume's slots untouched when a hidden volume is changed, quick vs full detection | ✅ (`crates/vcrs-core/tests/header_restore.rs`) |
 | Sparse (dynamic) container | A 4 MiB `--sparse` container round-trips data, really occupies less than a quarter of that on disk (`GetCompressedFileSize`), and a full format is refused | ✅ (`crates/vcrs-core/tests/sparse.rs`) |
+| Container timestamps | A container whose times are set 30 days back keeps **both** its modification and access time through `vcrs info`, `read`, `write` and `expand`, and while it is served over iSCSI; a control test shows a write *does* move the time when the freeze is off | ✅ (`crates/vcrs-core/tests/timestamps.rs`, `crates/vcrs-mount/tests/iscsi_device.rs`) |
 | Dokany-era checks (historical) | With the Dokany filesystem mount (removed since; code in git history): files written through the drive letter were read back by VeraCrypt, a file VeraCrypt wrote into the vc-rs-made FAT was read back through the mount, and the same held for hidden volumes | ✅ (`scripts/vc-dokan-crosscheck.ps1` = `ALL OK`, `scripts/vc-hidden-test.ps1` = `HIDDEN ROUND TRIP OK: True`, `FULL HIDDEN CHAIN OK: True`) |
 
 Header encodings are also pinned by unit tests for CRC-32 (VeraCrypt's own self-test
 value `0x91267E8A`), the header byte layout and the KDF parameters. Regression suite:
-`crates/vcrs-core/tests/{ea_prf_matrix,hidden_volume,backup_header,header_restore,xts_kat,in_place,sparse,sector_size}.rs` (the matrix
+`crates/vcrs-core/tests/{ea_prf_matrix,hidden_volume,backup_header,header_restore,xts_kat,in_place,sparse,sector_size,timestamps}.rs` (the matrix
 test covers all 15 ciphers × 6 KDFs = 90 combinations, the backup test destroys the primary
 header and recovers the volume from the backup copy) and
 `crates/vcrs-mount/tests/{fat_in_volume,iscsi_device}.rs` (FAT format → write → reopen →

@@ -185,6 +185,10 @@ impl PasswordArgs {
             pim: self.pim,
             volume_type,
             use_backup_header,
+            // VeraCrypt's tools do not leave a trace in the container's
+            // timestamps, whether they mount it, change its password or just
+            // check that the password is right.
+            preserve_timestamps: true,
             ..Default::default()
         })
     }
@@ -301,6 +305,12 @@ struct MountArgs {
     /// Refuse all writes.
     #[arg(long)]
     read_only: bool,
+    /// Do not preserve the container's modification timestamp. VeraCrypt keeps
+    /// it unchanged by default (its "Preserve modification timestamp of file
+    /// containers" option), so that using a volume does not reveal when it was
+    /// used; pass this to let the container's timestamp change normally.
+    #[arg(long)]
+    no_preserve_timestamp: bool,
     #[command(flatten)]
     kind: VolumeKindArgs,
     #[command(flatten)]
@@ -953,6 +963,7 @@ fn run() -> Result<()> {
             iscsi.disk_mode = disk_mode;
             iscsi.read_only = a.read_only;
             iscsi.removable = a.removable;
+            iscsi.preserve_timestamp = !a.no_preserve_timestamp;
             iscsi.protect_hidden = a.protect.hidden_open_options()?;
             if let Some(bind) = &a.bind {
                 iscsi.bind_addr = bind.clone();
