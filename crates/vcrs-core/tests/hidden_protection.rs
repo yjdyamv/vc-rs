@@ -38,6 +38,7 @@ fn options(password: &str) -> CreateOptions {
         keyfiles: Vec::new(),
         sector_size: 512,
         full_format: false,
+        sparse: false,
     }
 }
 

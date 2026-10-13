@@ -104,6 +104,12 @@ pub struct CreateOptions {
     /// as in VeraCrypt) the whole data area is filled with zeros encrypted
     /// under a throwaway key, exactly like VeraCrypt's slow format.
     pub full_format: bool,
+    /// Create the container as a sparse (VeraCrypt's "dynamic") file: it is
+    /// created at its full size, but only the parts that are actually written
+    /// use disk space. VeraCrypt only sets the sparse flag together with a quick
+    /// format (a full format writes every byte, which would defeat the point),
+    /// so the two are mutually exclusive here as well.
+    pub sparse: bool,
 }
 
 impl Default for CreateOptions {
@@ -116,6 +122,7 @@ impl Default for CreateOptions {
             pim: 0,
             sector_size: MIN_SECTOR_SIZE,
             full_format: true,
+            sparse: false,
         }
     }
 }
@@ -229,6 +236,20 @@ impl Volume {
             .create(true)
             .truncate(true)
             .open(path)?;
+        if options.sparse {
+            if options.full_format {
+                return Err(Error::InvalidParameter(
+                    "a sparse (dynamic) container has to be quick-formatted: a full format writes \
+                     every byte of the data area, which is what a sparse file is meant to avoid \
+                     (VeraCrypt only sets the sparse flag for a quick format)"
+                        .into(),
+                ));
+            }
+            // Before the file is extended: everything that is never written then
+            // stays unallocated and reads back as zeros, like VeraCrypt's
+            // dynamic containers.
+            set_sparse(&file)?;
+        }
         file.set_len(host_size)?;
 
         let volume_size = layout
@@ -1122,6 +1143,7 @@ pub fn encrypt_in_place_stopping_after(
         pim,
         sector_size: DATA_UNIT_SIZE as u32,
         full_format: false,
+        sparse: false,
     };
 
     // While a volume is being encrypted in place only its *backup* header is
@@ -1586,7 +1608,59 @@ fn random_master_key(ea: EncryptionAlgorithm) -> Result<Vec<u8>> {
     }
 }
 
-fn random_bytes(len: usize) -> Result<Vec<u8>> {
+/// Mark an open host file as sparse (Windows `FSCTL_SET_SPARSE`), so that the
+/// parts of a quick-formatted container that are never written do not occupy
+/// disk space. Unix filesystems do that by themselves, so it is a no-op there.
+#[cfg(windows)]
+fn set_sparse(file: &File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    /// `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 49, METHOD_BUFFERED, FILE_SPECIAL_ACCESS)`.
+    const FSCTL_SET_SPARSE: u32 = 0x0009_00C4;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn DeviceIoControl(
+            handle: *mut core::ffi::c_void,
+            code: u32,
+            in_buffer: *mut core::ffi::c_void,
+            in_size: u32,
+            out_buffer: *mut core::ffi::c_void,
+            out_size: u32,
+            returned: *mut u32,
+            overlapped: *mut core::ffi::c_void,
+        ) -> i32;
+    }
+
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as *mut core::ffi::c_void,
+            FSCTL_SET_SPARSE,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn set_sparse(_file: &File) -> Result<()> {
+    // Unix filesystems allocate blocks when they are written, so a file created
+    // with `set_len` is already sparse.
+    Ok(())
+}
+
+/// Fill a buffer with cryptographically strong random bytes from the system
+/// random generator (used for salts, master keys and keyfiles).
+pub fn random_bytes(len: usize) -> Result<Vec<u8>> {
     let mut rng = botan::RandomNumberGenerator::new()?;
     Ok(rng.read(len)?)
 }
@@ -2028,6 +2102,7 @@ pub fn restore_headers_from_master_key(
             pim: options.pim,
             sector_size: options.sector_size,
             full_format: false,
+            sparse: false,
         };
         for offset in [HIDDEN_SLOT_OFFSET, host_size - VOLUME_HEADER_SIZE] {
             if region_is_zero(&file, offset, HEADER_SALT_SIZE)? {

@@ -46,17 +46,18 @@ pub mod xts;
 
 pub use cipher::{CipherId, EncryptionAlgorithm};
 pub use error::{Error, Result};
-pub use header::{VolumeHeader, VolumeType};
+pub use header::{crc32, VolumeHeader, VolumeType};
 pub use keyfile::apply_keyfiles;
 pub use layout::VolumeLayout;
 pub use prf::Prf;
 pub use volume::{
     backup_headers, decrypt_in_place, decrypt_in_place_stopping_after, encrypt_in_place,
     encrypt_in_place_stopping_after, looks_quick_formatted, read_header_area, read_header_group,
-    restore_headers, restore_headers_from_embedded, restore_headers_from_master_key, CreateOptions,
-    DecryptOutcome, InPlaceState, OpenOptions, ProtectedRange, RestoreHeaderOptions, Volume,
-    IN_PLACE_CHUNK_SIZE, IN_PLACE_HEADER_UPDATE_INTERVAL, MIN_IN_PLACE_DATA_SIZE,
+    restore_headers, restore_headers_from_embedded, restore_headers_from_master_key, random_bytes,
+    CreateOptions, DecryptOutcome, InPlaceState, OpenOptions, ProtectedRange, RestoreHeaderOptions,
+    Volume, IN_PLACE_CHUNK_SIZE, IN_PLACE_HEADER_UPDATE_INTERVAL, MIN_IN_PLACE_DATA_SIZE,
 };
+
 pub use xts::Xts;
 
 /// Version of the VeraCrypt volume format this crate implements

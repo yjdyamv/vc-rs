@@ -11,6 +11,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use vcrs_core::header::{
     HEADER_ENCRYPTED_DATA_OFFSET, MASTER_KEY_AREA_OFFSET, VOLUME_HEADER_SIZE, VOLUME_HEADER_SIZE_LEGACY,
+    VolumeHeader,
 };
 use vcrs_core::volume::{CreateOptions, OpenOptions, ProtectedRange, RestoreHeaderOptions, Volume};
 use vcrs_core::{EncryptionAlgorithm, Prf, VolumeLayout, VolumeType};
@@ -69,6 +70,17 @@ enum Command {
     /// "Change Volume Password"). Only the header is rewritten -- the data area
     /// is not re-encrypted, so it is instant.
     Change(ChangeArgs),
+    /// Write a new keyfile (VeraCrypt's "Create Keyfile"): a file of random
+    /// bytes that has to be given with `--keyfile` on top of the password, so
+    /// the password alone is not enough to open the volume.
+    CreateKeyfile(CreateKeyfileArgs),
+    /// List the volumes this machine has attached over iSCSI (`vcrs mount`),
+    /// together with the disk Windows sees for each of them.
+    List(ListArgs),
+    /// Run the built-in crypto self-test: the format's checksums, every header
+    /// hash, every encryption algorithm and a header round trip. Useful to
+    /// confirm a fresh build (and Botan) works before creating a volume.
+    Test(TestArgs),
 }
 
 #[derive(Args)]
@@ -77,8 +89,7 @@ struct CreateArgs {
     path: PathBuf,
     /// Volume size, e.g. `100M`, `4G`, or a byte count.
     #[arg(short, long, value_parser = parse_size)]
-    size: u64,
-    /// Encryption algorithm, e.g. `AES`, `Serpent-AES`, `AES-Twofish-Serpent`.
+    size: u64,    /// Encryption algorithm, e.g. `AES`, `Serpent-AES`, `AES-Twofish-Serpent`.
     #[arg(short, long, default_value = "AES")]
     ea: String,
     /// Header key derivation function, e.g. `SHA-512`, `Blake2s`, `Argon2`.
@@ -96,6 +107,12 @@ struct CreateArgs {
     /// filesystem (VeraCrypt refuses that too).
     #[arg(long)]
     no_size_check: bool,
+    /// Create a sparse (VeraCrypt's "dynamic") container: it is created at its
+    /// full size but only the parts that are written use disk space. Implies a
+    /// quick format (a full format would write every byte) and skips the
+    /// free-space check, like VeraCrypt.
+    #[arg(long)]
+    sparse: bool,
     /// Volume sector size (512, 1024, 2048 or 4096). VeraCrypt defaults to 512
     /// and uses 4096 for very large volumes; the header records it and the
     /// filesystem inside should match it. XTS data-unit numbering is 512-based
@@ -428,6 +445,33 @@ struct ChangeArgs {
     new: NewPasswordArgs,
 }
 
+/// Create a keyfile: a file of random bytes that has to be given with
+/// `--keyfile` in addition to the password.
+#[derive(Args)]
+struct CreateKeyfileArgs {
+    /// File to create (it must not exist unless --force is given).
+    path: PathBuf,
+    /// Take the bytes from this file instead of the system random generator
+    /// (the file is read from its start and repeated until the keyfile is full).
+    #[arg(long)]
+    random_source: Option<PathBuf>,
+    /// Overwrite the file if it already exists.
+    #[arg(long)]
+    force: bool,
+}
+
+/// List the volumes attached over iSCSI.
+#[derive(Args)]
+struct ListArgs {
+    /// Show every iSCSI session, not just the ones vc-rs serves.
+    #[arg(long)]
+    all: bool,
+}
+
+/// Run the built-in crypto self-test.
+#[derive(Args)]
+struct TestArgs {}
+
 /// Selects which volume of a container to address.
 #[derive(Args, Clone, Copy, Default)]
 struct VolumeKindArgs {
@@ -601,10 +645,26 @@ fn run() -> Result<()> {
         Command::Create(a) => {
             let ea = parse_ea(&a.ea)?;
             let prf = parse_prf(&a.prf)?;
-            if !a.no_size_check {
+            // A sparse (dynamic) container only uses the space that is actually
+            // written, so the free-space check does not apply to it -- and
+            // VeraCrypt only sets the sparse flag for a quick format.
+            let quick = a.quick || a.sparse;
+            if a.sparse && !a.quick {
+                println!(
+                    "note: a sparse (dynamic) container is quick-formatted; --sparse implies --quick"
+                );
+            }
+            if a.sparse {
+                println!(
+                    "note: {} is created at its full size but only uses the space that is written\n  \
+                     (Windows Explorer and `vcrs info` still show the maximum size; look at the file's\n  \
+                     \"Size on disk\" instead). Moving the file to another volume can expand it.",
+                    a.path.display()
+                );
+            } else if !a.no_size_check {
                 check_free_space(&a.path, a.size)?;
             }
-            if a.quick {
+            if quick && !a.sparse {
                 eprintln!(
                     "warning: --quick leaves the unused part of the data area empty on disk (zero \
                      bytes on\n  NTFS/ext4), so it is recognisable as a region nobody wrote to. \
@@ -619,7 +679,8 @@ fn run() -> Result<()> {
                 keyfiles: a.password.keyfiles.clone(),
                 pim: a.password.pim,
                 sector_size: a.sector_size,
-                full_format: !a.quick,
+                full_format: !quick,
+                sparse: a.sparse,
             };
             let started = std::time::Instant::now();
             let volume = Volume::create(&a.path, a.size, &options)?;
@@ -651,6 +712,7 @@ fn run() -> Result<()> {
                 pim: a.password.pim,
                 sector_size: a.sector_size,
                 full_format: false,
+                sparse: false,
             };
             let started = std::time::Instant::now();
             let volume = Volume::create_hidden(&a.path, a.size, &options)
@@ -875,6 +937,9 @@ fn run() -> Result<()> {
             print_header(&volume, false);
             Ok(())
         }
+        Command::CreateKeyfile(a) => create_keyfile(&a),
+        Command::List(a) => list_mounts(&a),
+        Command::Test(_) => self_test(),
         Command::Mount(a) => {
             let options = a.password.open_options(a.kind.volume_type(), false)?;
 
@@ -912,6 +977,283 @@ fn run() -> Result<()> {
 
 /// Detach a target from the Microsoft iSCSI Initiator (needs an elevated prompt).
 ///
+/// The keyfiles VeraCrypt writes are `VolumePassword::MaxSize` = 128 bytes of
+/// random data (see `CoreBase::CreateKeyfile` in src/Core/CoreBase.cpp).
+const KEYFILE_SIZE: usize = 128;
+
+/// The IQN prefix `vcrs mount` uses for the targets it serves.
+#[cfg(any(windows, test))]
+const VCRS_IQN_PREFIX: &str = "iqn.2025-12.io.vcrs:";
+
+/// Write a keyfile. The bytes are random (or taken from `--random-source`,
+/// which is what makes keyfile creation reproducible in tests).
+fn create_keyfile(a: &CreateKeyfileArgs) -> Result<()> {
+    if a.path.exists() && !a.force {
+        bail!(
+            "{} already exists; pass --force to overwrite it (the old keyfile would be lost)",
+            a.path.display()
+        );
+    }
+    let bytes = match &a.random_source {
+        Some(source) => {
+            let data = std::fs::read(source)
+                .with_context(|| format!("reading the random source {}", source.display()))?;
+            if data.is_empty() {
+                bail!("the random source {} is empty", source.display());
+            }
+            data.iter().copied().cycle().take(KEYFILE_SIZE).collect()
+        }
+        None => vcrs_core::random_bytes(KEYFILE_SIZE)?,
+    };
+    std::fs::write(&a.path, &bytes)
+        .with_context(|| format!("writing the keyfile {}", a.path.display()))?;
+    println!("wrote a {KEYFILE_SIZE} byte keyfile to {}", a.path.display());
+    println!(
+        "  pass it with `--keyfile {}` in addition to the password; losing it makes the volume unopenable",
+        a.path.display()
+    );
+    Ok(())
+}
+
+/// One `iscsicli SessionList 1` entry.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IscsiSession {
+    id: String,
+    initiator: String,
+    target: String,
+}
+
+/// Parse `iscsicli SessionList 1` output into one entry per session.
+#[cfg(any(windows, test))]
+fn parse_sessions(list: &str) -> Vec<IscsiSession> {
+    let mut sessions: Vec<IscsiSession> = Vec::new();
+    let mut current: Option<IscsiSession> = None;
+    for line in list.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.eq_ignore_ascii_case("Session Id") && !value.is_empty() {
+            if let Some(session) = current.take() {
+                sessions.push(session);
+            }
+            current = Some(IscsiSession {
+                id: value.to_string(),
+                initiator: String::new(),
+                target: String::new(),
+            });
+            continue;
+        }
+        if let Some(session) = current.as_mut() {
+            if key.eq_ignore_ascii_case("Initiator Node Name") {
+                session.initiator = value.to_string();
+            } else if (key.eq_ignore_ascii_case("Target Name")
+                || key.eq_ignore_ascii_case("Target Node Name"))
+                && session.target.is_empty()
+                && value != "(null)"
+            {
+                session.target = value.to_string();
+            }
+        }
+    }
+    if let Some(session) = current.take() {
+        sessions.push(session);
+    }
+    sessions
+}
+
+/// List the iSCSI sessions (ours, or all of them) and the disks Windows has.
+fn list_mounts(a: &ListArgs) -> Result<()> {
+    #[cfg(not(windows))]
+    {
+        let _ = a;
+        bail!("listing iSCSI sessions needs the Microsoft iSCSI Initiator (Windows only)");
+    }
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("iscsicli")
+            .args(["SessionList", "1"])
+            .output();
+        // `iscsicli` needs elevation, so an unelevated `vcrs list` shows the
+        // disks it can see and says why the sessions are missing.
+        let sessions = match output {
+            Ok(output) if output.status.success() => {
+                let text = String::from_utf8_lossy(&output.stdout).into_owned();
+                parse_sessions(&text)
+            }
+            Ok(output) => {
+                println!(
+                    "  (iscsicli SessionList failed: {}; it needs an elevated prompt)",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+                Vec::new()
+            }
+            Err(err) => {
+                println!("  (iscsicli SessionList could not run: {err}; it needs an elevated prompt)");
+                Vec::new()
+            }
+        };
+        let ours: Vec<IscsiSession> = sessions
+            .into_iter()
+            .filter(|s| a.all || s.target.starts_with(VCRS_IQN_PREFIX))
+            .collect();
+        if ours.is_empty() {
+            if a.all {
+                println!("no iSCSI session is logged in");
+            } else {
+                println!(
+                    "no vc-rs volume is attached (pass --all to list every iSCSI session)"
+                );
+            }
+        } else {
+            for session in &ours {
+                println!("{}  (session {})", session.target, session.id);
+                if !session.initiator.is_empty() {
+                    println!("  initiator {}", session.initiator);
+                }
+            }
+        }
+
+        let script = "Get-Disk | Where-Object { $_.FriendlyName -like '*VeraCrypt volume*' } | ForEach-Object { \
+             $letters = (Get-Partition -DiskNumber $_.Number -ErrorAction SilentlyContinue | \
+             Where-Object { $_.DriveLetter } | ForEach-Object { $_.DriveLetter + ':' }) -join ','; \
+             '  disk {0}: {1} bytes, offline={2}, drive letters: {3}' -f $_.Number, $_.Size, $_.IsOffline, $letters }";
+        match std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", script])
+            .output()
+        {
+            Ok(out) => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                let text = text.trim();
+                if text.is_empty() {
+                    println!("no disk with the vc-rs disk name is present");
+                } else {
+                    println!("disks:");
+                    for line in text.lines() {
+                        println!("{}", line.trim_end());
+                    }
+                }
+            }
+            Err(err) => println!("  (could not query the disks: {err})"),
+        }
+        Ok(())
+    }
+}
+
+/// Exercise everything the crypto backend has to get right, without touching a
+/// volume. The CRC-32 value is VeraCrypt's own self-test value, so a mismatch
+/// means the format's checksums would not be accepted by VeraCrypt either.
+fn self_test() -> Result<()> {
+    use vcrs_core::prf::{argon2_params, HEADER_KEY_SIZE, SALT_SIZE};
+
+    println!("vcrs self-test");
+    let mut checks = 0usize;
+
+    let crc_data: Vec<u8> = (0u8..32).collect();
+    let crc = vcrs_core::crc32(&crc_data);
+    anyhow::ensure!(
+        crc == 0x9126_7E8A && vcrs_core::crc32(b"123456789") == 0xCBF4_3926,
+        "crc32 self-test failed: {crc:#010x} where VeraCrypt's own test wants 0x91267e8a"
+    );
+    println!("  crc32                      ok (VeraCrypt's own check value)");
+    checks += 1;
+
+    let salt = [0x42u8; SALT_SIZE];
+    for prf in Prf::ALL {
+        let mut key = vec![0u8; HEADER_KEY_SIZE];
+        let mut again = vec![0u8; HEADER_KEY_SIZE];
+        let mut other = vec![0u8; HEADER_KEY_SIZE];
+        prf.derive(b"vcrs self-test", &salt, 1, &mut key)?;
+        prf.derive(b"vcrs self-test", &salt, 1, &mut again)?;
+        prf.derive(b"vcrs self-test!", &salt, 1, &mut other)?;
+        anyhow::ensure!(key == again, "{prf}: the derivation is not deterministic");
+        anyhow::ensure!(key != other, "{prf}: a different password gave the same key");
+        anyhow::ensure!(key.iter().any(|byte| *byte != 0), "{prf}: the key is all zero");
+        let label = prf.to_string();
+        if prf == Prf::Argon2 {
+            let (memory_kib, iterations, parallelism) = argon2_params(1);
+            println!(
+                "  {label:<26} ok (PIM 1: {memory_kib} KiB, {iterations} passes, parallelism {parallelism})"
+            );
+        } else {
+            println!(
+                "  {label:<26} ok ({} iterations at PIM 1, {} at PIM 0)",
+                prf.iterations(1),
+                prf.iterations(0)
+            );
+        }
+        checks += 1;
+    }
+
+    let mut plain = vec![0u8; 3 * vcrs_core::xts::DATA_UNIT_SIZE];
+    for (index, byte) in plain.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    for ea in EncryptionAlgorithm::ALL {
+        let key = vec![0x11u8; ea.key_size() * 2];
+        let xts = vcrs_core::Xts::new(ea, &key)?;
+        let mut buffer = plain.clone();
+        xts.encrypt(&mut buffer, 7)?;
+        anyhow::ensure!(buffer != plain, "{ea}: XTS left the data unchanged");
+        let mut twice = plain.clone();
+        xts.encrypt(&mut twice, 7)?;
+        anyhow::ensure!(twice == buffer, "{ea}: XTS is not deterministic");
+        xts.decrypt(&mut buffer, 7)?;
+        anyhow::ensure!(buffer == plain, "{ea}: the XTS round trip changed the data");
+        println!("  {:<26} ok (XTS, {} byte key)", ea.to_string(), ea.key_size() * 2);
+        checks += 1;
+    }
+
+    for (ea, prf) in [
+        (EncryptionAlgorithm::Aes, Prf::Sha512),
+        (EncryptionAlgorithm::SerpentTwofishAes, Prf::Argon2),
+    ] {
+        let header = VolumeHeader {
+            version: vcrs_core::VOLUME_HEADER_VERSION,
+            required_min_version: 0x010b,
+            volume_type: VolumeType::Normal,
+            creation_time: 0,
+            modification_time: 0,
+            hidden_volume_data_size: 0,
+            volume_data_size: 4 * 1024 * 1024,
+            encrypted_area_start: 131072,
+            encrypted_area_length: 4 * 1024 * 1024,
+            flags: 0,
+            sector_size: 512,
+            ea,
+            prf,
+            salt: vec![0x5au8; SALT_SIZE],
+            master_key: vec![0x7eu8; ea.key_size() * 2],
+        };
+        let mut header_key = vec![0u8; HEADER_KEY_SIZE];
+        prf.derive(b"vcrs self-test", &header.salt, 1, &mut header_key)?;
+        let region = header.encrypt_with_salt(VOLUME_HEADER_SIZE as usize, &header_key, &header.salt)?;
+        anyhow::ensure!(
+            &region[HEADER_ENCRYPTED_DATA_OFFSET..HEADER_ENCRYPTED_DATA_OFFSET + 4] != b"VERA",
+            "{ea} + {prf}: the header body is not encrypted"
+        );
+        anyhow::ensure!(
+            VolumeHeader::region_has_magic(&region, &header_key, ea)?,
+            "{ea} + {prf}: the magic is not detectable"
+        );
+        let back = VolumeHeader::decrypt(&region, &header_key, ea, prf)?;
+        anyhow::ensure!(back.master_key == header.master_key, "{ea} + {prf}: the master key was lost");
+        anyhow::ensure!(
+            back.volume_data_size == header.volume_data_size
+                && back.encrypted_area_start == header.encrypted_area_start
+                && back.sector_size == header.sector_size,
+            "{ea} + {prf}: the header fields were lost"
+        );
+        println!("  header round trip          ok ({ea} + {prf})");
+        checks += 1;
+    }
+
+    println!("all {checks} checks passed");
+    Ok(())
+}
+
 /// The initiator identifies a login by its *session id*, not by the target name,
 /// so the session list has to be parsed: `LogoutTarget` only accepts a session
 /// id and `QLogoutTarget` does not exist.  A session whose disk Windows is still
@@ -950,6 +1292,25 @@ fn iscsi_logout(iqn: &str) -> Result<()> {
             }
         }
         run_tool("RemoveTarget", "iscsicli", &["RemoveTarget", iqn]);
+
+        // The initiator refuses to log out a session whose disk Windows is still
+        // holding ("the session cannot be logged out since a device on that
+        // session is currently being used"), and it keeps the disk until the
+        // session actually goes away -- which happens when the serving process
+        // stops. Say so instead of leaving a disk behind silently.
+        let stale = "Get-Disk | Where-Object { $_.FriendlyName -like '*VeraCrypt volume*' } | \
+             ForEach-Object { '{0} ({1} bytes)' -f $_.Number, $_.Size }";
+        if let Ok(out) = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", stale])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let text = text.trim();
+            if !text.is_empty() {
+                println!("  Windows still lists disk {text} because the session is still alive:");
+                println!("  stop the `vcrs mount` process (Ctrl-C) -- the disk goes away with it");
+            }
+        }
         Ok(())
     }
     #[cfg(not(windows))]
@@ -1328,7 +1689,44 @@ fn human_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_master_key, human_size, parse_sector_size, session_id_for_target};
+    use super::{
+        format_master_key, human_size, parse_sector_size, parse_sessions, session_id_for_target,
+        IscsiSession,
+    };
+
+    #[test]
+    fn lists_every_session_in_the_list() {
+        // Trimmed-down `iscsicli SessionList 1` output from a real run with one
+        // vc-rs target and one unrelated session.
+        let list = "Microsoft iSCSI Initiator Version 10.0 Build 26300\n\
+                    Total of 2 sessions\n\
+                    Session Id             : ffffe68332afe010-4000013700000006\n\
+                    Initiator Node Name    : iqn.1991-05.com.microsoft:desktop-985akhr\n\
+                    Target Node Name       : (null)\n\
+                    Target Name            : iqn.2025-12.io.vcrs:probe\n\
+                    ISID                   : 40 00 01 37 00 00\n\
+                    Session Id             : ffffe68332afe010-4000013700000009\n\
+                    Initiator Node Name    : iqn.1991-05.com.microsoft:desktop-985akhr\n\
+                    Target Node Name       : iqn.other:storage\n\
+                    ISID                   : 40 00 01 37 00 00\n";
+        assert_eq!(
+            parse_sessions(list),
+            vec![
+                IscsiSession {
+                    id: "ffffe68332afe010-4000013700000006".to_string(),
+                    initiator: "iqn.1991-05.com.microsoft:desktop-985akhr".to_string(),
+                    target: "iqn.2025-12.io.vcrs:probe".to_string(),
+                },
+                IscsiSession {
+                    id: "ffffe68332afe010-4000013700000009".to_string(),
+                    initiator: "iqn.1991-05.com.microsoft:desktop-985akhr".to_string(),
+                    target: "iqn.other:storage".to_string(),
+                },
+            ]
+        );
+        assert!(parse_sessions("").is_empty());
+        assert!(parse_sessions("Total of 0 sessions\n").is_empty());
+    }
 
     #[test]
     fn finds_the_session_id_for_a_target() {

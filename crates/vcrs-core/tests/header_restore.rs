@@ -41,6 +41,7 @@ fn create_options(password: &[u8]) -> CreateOptions {
         // Quick: none of these tests cares about the contents of the untouched
         // data area, and a full format would only make them slow.
         full_format: false,
+        sparse: false,
     }
 }
 

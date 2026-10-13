@@ -29,6 +29,7 @@ fn options(sector_size: u32) -> CreateOptions {
         pim: PIM,
         sector_size,
         full_format: false,
+        sparse: false,
     }
 }
 
@@ -49,7 +50,7 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
 #[test]
 fn a_4096_byte_sector_volume_round_trips() {
     let path = temp("sector-4096");
-    let mut volume = Volume::create(&path, HOST_SIZE, &options(4096)).unwrap();
+    let volume = Volume::create(&path, HOST_SIZE, &options(4096)).unwrap();
     assert_eq!(volume.header.sector_size, 4096);
     assert_eq!(volume.data_size, HOST_SIZE - 262144);
 
