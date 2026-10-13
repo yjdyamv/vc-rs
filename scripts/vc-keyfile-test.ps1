@@ -21,15 +21,32 @@ function Check($name, $ok) {
     Say ("  {0,-32} {1}" -f $name, $ok)
     if (-not $ok) { $script:failures += $name }
 }
-function Wait-Drive($drive, $seconds) {
+function Wait-Drive($drive, $seconds = 15) {
     for ($i = 0; $i -lt $seconds; $i++) {
         if (Test-Path "$drive\") { return $true }
         Start-Sleep -Seconds 1
     }
     return $false
 }
+function Wait-Volume($drive, $seconds = 15) {
+    for ($i = 0; $i -lt $seconds; $i++) {
+        if (Get-Volume -DriveLetter $drive -ErrorAction SilentlyContinue) { return $true }
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
+# Get-Volume does not always list a VeraCrypt-mounted volume, so ask the Win32
+# logical-disk view (which does) for the filesystem name.
+function Wait-FileSystem($drive, $seconds = 15) {
+    for ($i = 0; $i -lt $seconds; $i++) {
+        $fs = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$drive'" -ErrorAction SilentlyContinue).FileSystem
+        if ($fs) { return $fs }
+        Start-Sleep -Seconds 1
+    }
+    return ''
+}
 function Dismount-Everything {
-    foreach ($letter in 'Y', 'Z') {
+    foreach ($letter in 'Y', 'Z', 'W', 'V', 'X') {
         & $VeraCrypt /dismount $letter /quit /silent 2>&1 | Out-Null
     }
 }
@@ -44,13 +61,17 @@ Say "=== vc-rs keyfile cross-check ($(Get-Date -Format s)) ==="
 Say "keyfile: $Key ($((Get-Item $Key).Length) bytes)"
 Dismount-Everything
 
-# 1. A VeraCrypt-made keyfile container mounts, and vc-rs reads the same volume.
+# 1. vc-rs opens a VeraCrypt-made keyfile container, and that same container
+#    mounts in VeraCrypt.  (The mount locks the container file, so the vcrs side
+#    is checked first.)
 Say '1. VeraCrypt-made keyfile container (vc-kf.vc, password KfTest!2024)'
-& $VeraCrypt /volume (Join-Path $Repo 'testdata\vc-kf.vc') /letter Y /password 'KfTest!2024' /keyfile $Key /quit /silent 2>&1 | Out-Null
-Check 'veracrypt-mounts-vc-keyfile' (Wait-Drive 'Y:')
-Check 'volume-is-fat' ($null -ne (Get-Volume -DriveLetter Y -ErrorAction SilentlyContinue))
 $vcrsRead = & (Join-Path $Repo 'target\debug\vcrs.exe') info (Join-Path $Repo 'testdata\vc-kf.vc') -p 'KfTest!2024' -k $Key 2>&1 | Out-String
 Check 'vcrs-opens-vc-keyfile' ($vcrsRead -match 'volume data size')
+$vcrsNoKey = & (Join-Path $Repo 'target\debug\vcrs.exe') info (Join-Path $Repo 'testdata\vc-kf.vc') -p 'KfTest!2024' 2>&1 | Out-String
+Check 'vcrs-rejects-missing-keyfile' ($vcrsNoKey -match 'incorrect password')
+& $VeraCrypt /volume (Join-Path $Repo 'testdata\vc-kf.vc') /letter Y /password 'KfTest!2024' /keyfile $Key /quit /silent 2>&1 | Out-Null
+Check 'veracrypt-mounts-vc-keyfile' (Wait-Drive 'Y:')
+Check 'volume-is-fat' ((Wait-FileSystem 'Y:') -eq 'FAT')
 & $VeraCrypt /dismount Y /quit /silent 2>&1 | Out-Null
 
 # 2. A vc-rs-made keyfile container (holding a VeraCrypt-created FAT16 image)
@@ -60,9 +81,28 @@ Say '2. vc-rs-made keyfile container (ours-kf.vc, password PwKf!2024)'
 Check 'veracrypt-mounts-ours-keyfile' (Wait-Drive 'Z:')
 $txt = Get-Content 'Z:\fromvc.txt' -Raw -ErrorAction SilentlyContinue
 Check 'veracrypt-reads-ours-file' ($null -ne $txt -and $txt.Trim() -eq 'VC-ORIGINAL-12345')
-Check 'veracrypt-wrong-password-refused' (
-    $null -eq (& $VeraCrypt /volume (Join-Path $Repo 'testdata\ours-kf.vc') /letter X /password 'not-the-password' /keyfile $Key /quit /silent 2>&1 | Where-Object { Test-Path 'X:\' }))
 & $VeraCrypt /dismount Z /quit /silent 2>&1 | Out-Null
+
+# 3. Without the keyfile VeraCrypt cannot mount the vc-rs-made container.
+Say '3. negative control'
+& $VeraCrypt /volume (Join-Path $Repo 'testdata\ours-kf.vc') /letter X /password 'PwKf!2024' /quit /silent 2>&1 | Out-Null
+Check 'veracrypt-refuses-missing-keyfile' (-not (Test-Path 'X:\'))
+& $VeraCrypt /dismount X /quit /silent 2>&1 | Out-Null
+
+# 4. A directory of keyfiles behaves like VeraCrypt's `-k <dir>`: vc-rs opens the
+#    VeraCrypt-made container and VeraCrypt mounts the vc-rs-made one.
+Say '4. directory of keyfiles (vc-kfdir.vc / ours-kfdir.vc, -k testdata\kfdir)'
+$kfdir = Join-Path $Repo 'testdata\kfdir'
+$dirRead = & (Join-Path $Repo 'target\debug\vcrs.exe') info (Join-Path $Repo 'testdata\vc-kfdir.vc') -p 'KfDir!2024' -k $kfdir 2>&1 | Out-String
+Check 'vcrs-opens-vc-dirkeyfile' ($dirRead -match 'volume data size')
+& $VeraCrypt /volume (Join-Path $Repo 'testdata\vc-kfdir.vc') /letter W /password 'KfDir!2024' /keyfile $kfdir /quit /silent 2>&1 | Out-Null
+Check 'veracrypt-mounts-vc-dirkeyfile' (Wait-Drive 'W:')
+& $VeraCrypt /dismount W /quit /silent 2>&1 | Out-Null
+& $VeraCrypt /volume (Join-Path $Repo 'testdata\ours-kfdir.vc') /letter V /password 'PwKfDir!2024' /keyfile $kfdir /quit /silent 2>&1 | Out-Null
+Check 'veracrypt-mounts-ours-dirkeyfile' (Wait-Drive 'V:')
+$txt2 = Get-Content 'V:\fromvc.txt' -Raw -ErrorAction SilentlyContinue
+Check 'veracrypt-reads-ours-dirkeyfile' ($null -ne $txt2 -and $txt2.Trim() -eq 'VC-ORIGINAL-12345')
+& $VeraCrypt /dismount V /quit /silent 2>&1 | Out-Null
 Dismount-Everything
 
 Say ''
