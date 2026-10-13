@@ -121,6 +121,11 @@ vcrs mount both.vc --password outer --protect-hidden --hidden-password inner
 keyfile pool is mixed into the password exactly as VeraCrypt does (64-byte legacy pool
 for passwords up to 64 bytes, 128-byte pool above that).
 `RUST_LOG=debug` prints the trial-decryption details (which layout/PRF/EA matched).
+The master key is the one secret that decrypts the data area *without* the password
+(it is what a VeraCrypt rescue disk stores), so `vcrs create`, `vcrs create-hidden` and
+`vcrs info` print it masked; `--show-master-key` prints it in full if you really need it
+(VeraCrypt's format wizard does the same: the fields show stars until “Display keys” is
+ticked).
 
 ## Compatibility evidence
 

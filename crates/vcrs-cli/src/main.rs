@@ -71,6 +71,9 @@ struct CreateArgs {
     /// Write random-looking data over the whole data area (VeraCrypt "full" format).
     #[arg(long)]
     full: bool,
+    /// Print the master key of the new volume (it is masked otherwise).
+    #[arg(long)]
+    show_master_key: bool,
     #[command(flatten)]
     password: PasswordArgs,
 }
@@ -86,6 +89,9 @@ struct CreateHiddenArgs {
     ea: String,
     #[arg(long, default_value = "SHA-512")]
     prf: String,
+    /// Print the master key of the new hidden volume (it is masked otherwise).
+    #[arg(long)]
+    show_master_key: bool,
     #[command(flatten)]
     password: PasswordArgs,
 }
@@ -340,6 +346,10 @@ struct InfoArgs {
     /// Open the backup header (at the end of the file) instead of the primary one.
     #[arg(long)]
     backup: bool,
+    /// Print the master key (masked by default: it decrypts the data area without
+    /// the password).
+    #[arg(long)]
+    show_master_key: bool,
     #[command(flatten)]
     kind: VolumeKindArgs,
     #[command(flatten)]
@@ -429,7 +439,7 @@ fn run() -> Result<()> {
                 a.size as f64 / (1024.0 * 1024.0),
                 started.elapsed().as_secs_f64()
             );
-            print_header(&volume);
+            print_header(&volume, a.show_master_key);
             Ok(())
         }
         Command::CreateHidden(a) => {
@@ -451,13 +461,13 @@ fn run() -> Result<()> {
                 a.path.display(),
                 started.elapsed().as_secs_f64()
             );
-            print_header(&volume);
+            print_header(&volume, a.show_master_key);
             Ok(())
         }
         Command::Info(a) => {
             let options = a.password.open_options(a.kind.volume_type(), a.backup)?;
             let volume = Volume::open(&a.path, &options)?;
-            print_header(&volume);
+            print_header(&volume, a.show_master_key);
             Ok(())
         }
         Command::Header(a) => dump_header_region(&a),
@@ -741,7 +751,7 @@ fn parse_hex(s: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-fn print_header(volume: &Volume) {
+fn print_header(volume: &Volume, show_master_key: bool) {
     let h = &volume.header;
     println!("header:");
     println!("  magic             VERA");
@@ -759,11 +769,23 @@ fn print_header(volume: &Volume) {
     println!("  creation time     {}", h.creation_time);
     println!("  modification time {}", h.modification_time);
     println!("  salt              {}", hex(&h.salt));
-    println!("  master key        {}", hex(&h.master_key));
+    println!("  master key        {}", format_master_key(show_master_key, &h.master_key));
     println!("layout:");
     println!("  host size         {} bytes", volume.host_size);
     println!("  data offset       {}", volume.data_offset);
     println!("  data size         {} bytes", volume.data_size);
+}
+
+/// The master key is the one secret that decrypts the data area without the
+/// password (that is why VeraCrypt's rescue disk stores it), so it stays hidden
+/// unless the caller explicitly asks for it. VeraCrypt's format wizard does the
+/// same thing: the fields show stars until "Display keys" is ticked.
+fn format_master_key(show: bool, master_key: &[u8]) -> String {
+    if show {
+        hex(master_key)
+    } else {
+        format!("<{} bytes, pass --show-master-key to print>", master_key.len())
+    }
 }
 
 fn dump_header_region(args: &HeaderArgs) -> Result<()> {
@@ -812,7 +834,7 @@ fn hex(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::session_id_for_target;
+    use super::{format_master_key, session_id_for_target};
 
     #[test]
     fn finds_the_session_id_for_a_target() {
@@ -830,5 +852,14 @@ mod tests {
         );
         assert_eq!(session_id_for_target(list, "iqn.other:target"), None);
         assert_eq!(session_id_for_target("", "iqn.2025-12.io.vcrs:probe"), None);
+    }
+
+    #[test]
+    fn the_master_key_is_masked_unless_requested() {
+        let key = [0xab, 0xcd];
+        assert_eq!(format_master_key(true, &key), "abcd");
+        let hidden = format_master_key(false, &key);
+        assert!(!hidden.contains("abcd"), "the key must not appear: {hidden}");
+        assert!(hidden.contains("2 bytes") && hidden.contains("--show-master-key"));
     }
 }
