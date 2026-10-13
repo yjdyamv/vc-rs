@@ -57,7 +57,7 @@ ListDrive 'H'
 if (Test-Path 'H:\fromvc.txt') {
     $content = (Get-Content 'H:\fromvc.txt' -Raw)
     Say "  outer file content: '$content'"
-    Say "  OUTER OK: $($content -eq 'VC-ORIGINAL-12345')"
+    Say "  OUTER OK: $($content.Trim() -eq 'VC-ORIGINAL-12345')"
 } else {
     Say "  !! outer filesystem not readable"
 }

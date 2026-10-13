@@ -105,6 +105,10 @@ because VeraCrypt mounts through its kernel driver — the Dokany mounts do not)
 | Dokany → VeraCrypt | Files written through the `vcrs mount` drive letter (`hello.txt`, `sub/nested.txt`) are read back by VeraCrypt mounting the same container | ✅ |
 | VeraCrypt → Dokany | VeraCrypt writes `fromvc.txt` into the vc-rs-made FAT; `vcrs mount` lists and reads it, and the file written through Dokany is still intact | ✅ (`scripts/vc-dokan-crosscheck.ps1`, `RESULT: ALL OK`) |
 | Mount persistence | Write through Dokany, dismount, remount in a new process: the files are still there | ✅ |
+| Hidden volume → VeraCrypt | VeraCrypt mounts the hidden volume vc-rs carved into a container, given only the hidden password (no switch selects it) | ✅ |
+| VeraCrypt → Dokany (hidden) | A file written through VeraCrypt's mount of the hidden volume is listed and read through `vcrs mount --hidden` | ✅ |
+| Dokany → VeraCrypt (hidden) | A file written through the Dokany mount of the hidden volume is read back by VeraCrypt | ✅ (`scripts/vc-hidden-test.ps1`, `HIDDEN ROUND TRIP OK: True`, `FULL HIDDEN CHAIN OK: True`) |
+| Outer + hidden coexist | After the hidden volume was carved in, VeraCrypt still reads the outer FAT16 filesystem and its file | ✅ |
 
 Header encodings are also pinned by unit tests for CRC-32 (VeraCrypt's own self-test
 value `0x91267E8A`), the header byte layout and the KDF parameters. Regression suite:
