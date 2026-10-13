@@ -32,6 +32,21 @@ pub enum Error {
     Unsupported(String),
     /// The header needs a newer VeraCrypt than the format version supports.
     HigherVersionRequired(u16),
+    /// A write would have landed inside the hidden volume that the outer volume
+    /// was mounted with hidden-volume protection for.
+    HiddenVolumeProtected {
+        /// Host-file offset of the refused write.
+        offset: u64,
+        /// Length of the refused write.
+        length: u64,
+        /// Start of the protected range (host bytes).
+        start: u64,
+        /// End of the protected range (host bytes, exclusive).
+        end: u64,
+    },
+    /// Hidden-volume protection was already triggered on this volume, so every
+    /// further write is refused (VeraCrypt does the same on purpose).
+    HiddenVolumeProtectionActive,
 }
 
 impl fmt::Display for Error {
@@ -51,6 +66,17 @@ impl fmt::Display for Error {
             Error::HigherVersionRequired(v) => {
                 write!(f, "volume requires a newer VeraCrypt (header requires program version 0x{v:04x})")
             }
+            Error::HiddenVolumeProtected { offset, length, start, end } => write!(
+                f,
+                "hidden volume protection: refusing a {length}-byte write at host offset {offset} \
+                 because it overlaps the protected range {start}..{end} (the hidden volume); \
+                 the hidden volume was left untouched"
+            ),
+            Error::HiddenVolumeProtectionActive => write!(
+                f,
+                "hidden volume protection has been triggered on this volume: refusing the write \
+                 (VeraCrypt does the same, so the volume behaves like a failing device)"
+            ),
         }
     }
 }

@@ -181,6 +181,43 @@ fn partitioned_disk_exposes_the_filesystem_inside_a_synthetic_mbr() {
 }
 
 #[test]
+fn an_expanded_volume_leaves_the_new_space_unallocated() {
+    // After `vcrs expand` the data area is bigger than the filesystem inside it.
+    // The synthetic MBR must then describe only the filesystem: the extra space
+    // has to show up as unallocated space on the disk, because that is the only
+    // state in which Windows' "Extend Volume" / `Resize-Partition` can grow the
+    // filesystem into it. (Proven end to end by scripts/vc-expand-test.ps1.)
+    let mut target = Fixture::new("expanded", DiskMode::Partitioned, false);
+    assert_eq!(target.device().capacity(), PARTITION_START + DATA_SECTORS);
+
+    let new_host_size = VOLUME_SIZE * 2;
+    let mut plain = target.reopen();
+    plain
+        .expand(new_host_size, PASSWORD, 1)
+        .expect("expand the container");
+    drop(plain);
+
+    // A re-attach is what a real user does, so rebuild the device from the file.
+    target.device = Some(
+        ScsiVolume::open(&target.path, &target.open, &target.opts).expect("re-open the device"),
+    );
+    let grown_sectors = (new_host_size - HEADER_SIZE) / 512;
+    assert_eq!(
+        target.device().capacity(),
+        PARTITION_START + grown_sectors,
+        "the disk must cover the whole, grown data area"
+    );
+
+    let mbr = read_sector(target.device(), 0);
+    let entry = 0x1BE;
+    let sectors = u32::from_le_bytes(mbr[entry + 12..entry + 16].try_into().unwrap()) as u64;
+    assert_eq!(
+        sectors, DATA_SECTORS,
+        "the partition must keep the filesystem's size, leaving the new space unallocated"
+    );
+}
+
+#[test]
 fn raw_mode_exposes_the_bare_data_area() {
     let target = Fixture::new("raw", DiskMode::Raw, false);
 
@@ -293,4 +330,97 @@ fn the_server_starts_and_answers_tcp() {
     // The listener really is up (the probe is not an iSCSI session, so the
     // server just drops it).
     std::net::TcpStream::connect(mount.addr()).expect("the listener must answer");
+}
+
+/// VeraCrypt's "protect hidden volume": the hidden volume inside the served
+/// container must survive whatever the initiator's filesystem does to the outer
+/// volume. `ScsiVolume::open` takes the hidden volume's credentials, and from
+/// then on every write that would land in the hidden volume's data area fails
+/// (the initiator sees a medium error) while reads keep working.
+#[test]
+fn hidden_volume_protection_refuses_writes_through_the_scsi_device() {
+    const HIDDEN_SIZE: u64 = 4 * 1024 * 1024;
+    let hidden_password = b"hidden-password";
+
+    let path = std::env::temp_dir().join(format!("vcrs-iscsi-protect-{}.vc", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let mut create = CreateOptions::default();
+    create.password = PASSWORD.to_vec();
+    create.pim = 1;
+    let outer = Volume::create(&path, VOLUME_SIZE, &create).expect("create the outer volume");
+    let hidden = Volume::create_hidden(&path, HIDDEN_SIZE, &{
+        let mut hidden_create = create.clone();
+        hidden_create.password = hidden_password.to_vec();
+        hidden_create
+    })
+    .expect("create the hidden volume");
+    let hidden_marker = vec![0x5au8; 512];
+    hidden.write_data(0, &hidden_marker).expect("write the hidden marker");
+    let hidden_start = hidden.data_offset;
+    let hidden_end = hidden.data_offset + hidden.data_size;
+    drop(hidden);
+    drop(outer);
+
+    let mut open = OpenOptions::default();
+    open.password = PASSWORD.to_vec();
+    open.pim = 1;
+    let mut hidden_open = OpenOptions::default();
+    hidden_open.password = hidden_password.to_vec();
+    hidden_open.pim = 1;
+
+    let mut opts = IscsiMountOptions::for_volume(&path);
+    opts.disk_mode = DiskMode::Partitioned;
+    opts.bind_addr = format!("127.0.0.1:{}", free_loopback_port().expect("free port"));
+    opts.protect_hidden = Some(hidden_open);
+
+    let mut device = ScsiVolume::open(&path, &open, &opts).expect("open with hidden protection");
+
+    // The partition starts at LBA 2048; a data-area offset maps to
+    // `PARTITION_START + offset / 512`.
+    let outer_lba = PARTITION_START; // data offset 0, outside the hidden volume
+    let inside_lba = PARTITION_START + hidden_start / 512;
+    assert_eq!(hidden_start % 512, 0);
+    assert_eq!(hidden_end % 512, 0);
+
+    // Reads of the protected area are fine (they go through the outer key, so
+    // the plaintext is meaningless -- what matters is that the read succeeds).
+    let _ = read_sector(&device, inside_lba);
+
+    // A write in the outer volume's own area works.
+    let mut payload = vec![0x11u8; 512];
+    device.write(outer_lba, &payload, 512).expect("write outside the hidden volume");
+    assert_eq!(read_sector(&device, outer_lba), payload);
+
+    // A write into the hidden volume's area fails with a device error.
+    payload = vec![0x22u8; 512];
+    let err = device
+        .write(inside_lba, &payload, 512)
+        .expect_err("writing into the hidden volume must fail");
+    let message = err.to_string();
+    assert!(
+        message.contains("hidden volume protection"),
+        "unexpected error: {message}"
+    );
+
+    // ... and, as in VeraCrypt, every later write fails too, even in the outer
+    // area, so a filesystem that ignores the error cannot keep writing.
+    let err = device
+        .write(outer_lba + 1, &[0x33u8; 512], 512)
+        .expect_err("after a violation all writes must fail");
+    assert!(err.to_string().contains("hidden volume protection"), "unexpected error: {err}");
+
+    // The bytes we tried to overwrite are untouched and the hidden volume still
+    // opens with its own password and keeps its marker.
+    drop(device);
+    let mut open = OpenOptions::default();
+    open.password = hidden_password.to_vec();
+    open.pim = 1;
+    open.volume_type = Some(vcrs_core::VolumeType::Hidden);
+    let hidden = Volume::open(&path, &open).expect("the hidden volume survives");
+    let mut marker = vec![0u8; 512];
+    hidden.read_data(0, &mut marker).expect("read the hidden marker");
+    assert_eq!(marker, hidden_marker, "the hidden volume was not modified");
+
+    let _ = std::fs::remove_file(&path);
 }

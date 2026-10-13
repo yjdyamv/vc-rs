@@ -12,7 +12,7 @@ use clap::{Args, Parser, Subcommand};
 use vcrs_core::header::{
     HEADER_ENCRYPTED_DATA_OFFSET, MASTER_KEY_AREA_OFFSET, VOLUME_HEADER_SIZE, VOLUME_HEADER_SIZE_LEGACY,
 };
-use vcrs_core::volume::{CreateOptions, OpenOptions, Volume};
+use vcrs_core::volume::{CreateOptions, OpenOptions, ProtectedRange, Volume};
 use vcrs_core::{EncryptionAlgorithm, Prf, VolumeLayout, VolumeType};
 
 #[derive(Parser)]
@@ -44,6 +44,11 @@ enum Command {
     Mount(MountArgs),
     /// Detach a volume mounted with `vcrs mount` from the iSCSI initiator.
     Dismount(DismountArgs),
+    /// Grow an existing container (VeraCrypt's Volume Expander). The data area
+    /// gets bigger and the existing data is kept; the filesystem inside keeps
+    /// its old size and has to be extended from the operating system once the
+    /// volume is mounted.
+    Expand(ExpandArgs),
 }
 
 #[derive(Args)]
@@ -143,6 +148,8 @@ struct FormatArgs {
     kind: VolumeKindArgs,
     #[command(flatten)]
     password: PasswordArgs,
+    #[command(flatten)]
+    protect: HiddenProtectionArgs,
 }
 
 #[derive(Args)]
@@ -180,6 +187,8 @@ struct MountArgs {
     kind: VolumeKindArgs,
     #[command(flatten)]
     password: PasswordArgs,
+    #[command(flatten)]
+    protect: HiddenProtectionArgs,
 }
 
 #[derive(Args)]
@@ -193,6 +202,22 @@ struct DismountArgs {
         default_missing_value = "iqn.2025-12.io.vcrs:volume"
     )]
     iscsi: Option<String>,
+}
+
+#[derive(Args)]
+struct ExpandArgs {
+    /// Container to grow.
+    path: PathBuf,
+    /// New size of the container, e.g. `200M`, `2G` (must be larger than the
+    /// current size).
+    #[arg(short, long, value_parser = parse_size)]
+    size: u64,
+    /// Confirm the expansion even though any hidden volume inside the container
+    /// is destroyed by it (VeraCrypt asks the same question interactively).
+    #[arg(long)]
+    force: bool,
+    #[command(flatten)]
+    password: PasswordArgs,
 }
 
 /// Selects which volume of a container to address.
@@ -211,6 +236,80 @@ impl VolumeKindArgs {
             None
         }
     }
+}
+
+/// VeraCrypt's *protect hidden volume* option: while the outer volume is in use,
+/// any write that would land inside the hidden volume fails instead of
+/// destroying it. Needs the hidden volume's own credentials.
+#[derive(Args, Clone)]
+struct HiddenProtectionArgs {
+    /// Protect the hidden volume inside this outer volume from being written to.
+    #[arg(long)]
+    protect_hidden: bool,
+    /// Password of the hidden volume.
+    #[arg(long = "hidden-password", env = "VCRS_HIDDEN_PASSWORD", hide_env_values = true)]
+    hidden_password: Option<String>,
+    /// Read the hidden volume's password from stdin (raw bytes).
+    #[arg(long = "hidden-password-stdin", conflicts_with = "hidden_password")]
+    hidden_password_stdin: bool,
+    /// PIM of the hidden volume.
+    #[arg(long = "hidden-pim", default_value_t = 0)]
+    hidden_pim: i32,
+    /// Keyfile of the hidden volume (repeatable).
+    #[arg(long = "hidden-keyfile", value_name = "PATH", action = clap::ArgAction::Append)]
+    hidden_keyfiles: Vec<PathBuf>,
+}
+
+impl HiddenProtectionArgs {
+    /// How to open the hidden volume, or `None` when protection is off.
+    fn hidden_open_options(&self) -> Result<Option<OpenOptions>> {
+        if !self.protect_hidden {
+            if self.hidden_password.is_some()
+                || self.hidden_password_stdin
+                || !self.hidden_keyfiles.is_empty()
+            {
+                bail!("--hidden-password/--hidden-pim/--hidden-keyfile need --protect-hidden");
+            }
+            return Ok(None);
+        }
+        let creds = PasswordArgs {
+            password: self.hidden_password.clone(),
+            password_stdin: self.hidden_password_stdin,
+            pim: self.hidden_pim,
+            keyfiles: self.hidden_keyfiles.clone(),
+        };
+        let options = creds.open_options(Some(VolumeType::Hidden), false).context(
+            "--protect-hidden needs the hidden volume's password \
+             (--hidden-password, $VCRS_HIDDEN_PASSWORD or --hidden-password-stdin)",
+        )?;
+        Ok(Some(options))
+    }
+}
+
+/// Turn on hidden-volume protection for an already opened outer volume.
+fn apply_hidden_protection(
+    volume: &Volume,
+    protect: &HiddenProtectionArgs,
+    path: &Path,
+) -> Result<()> {
+    let Some(hidden_options) = protect.hidden_open_options()? else {
+        return Ok(());
+    };
+    let hidden = Volume::open(path, &hidden_options).with_context(|| {
+        format!(
+            "opening the hidden volume of {} (needed by --protect-hidden)",
+            path.display()
+        )
+    })?;
+    let range = ProtectedRange::new(hidden.data_offset, hidden.data_size);
+    println!(
+        "protecting the hidden volume: host range {}..{} ({} bytes) is now write-protected",
+        range.start,
+        range.end(),
+        range.length
+    );
+    volume.protect_hidden_volume(range);
+    Ok(())
 }
 
 #[derive(Args)]
@@ -270,6 +369,8 @@ struct WriteArgs {
     kind: VolumeKindArgs,
     #[command(flatten)]
     password: PasswordArgs,
+    #[command(flatten)]
+    protect: HiddenProtectionArgs,
 }
 
 fn main() -> ExitCode {
@@ -357,6 +458,7 @@ fn run() -> Result<()> {
                 (None, None) => bail!("pass --hex or --from"),
             };
             let volume = open_rw(&a.path, &a.password, a.kind.volume_type())?;
+            apply_hidden_protection(&volume, &a.protect, &a.path)?;
             volume.write_data(a.offset, &data)?;
             volume.flush()?;
             println!("wrote {} bytes at data offset {}", data.len(), a.offset);
@@ -369,6 +471,7 @@ fn run() -> Result<()> {
                 _ => vcrs_mount::FatKind::Auto,
             };
             let mut volume = open_rw(&a.path, &a.password, a.kind.volume_type())?;
+            apply_hidden_protection(&volume, &a.protect, &a.path)?;
             vcrs_mount::format_volume(&mut volume, kind, &a.label)?;
             volume.flush()?;
             println!(
@@ -377,6 +480,40 @@ fn run() -> Result<()> {
                 a.path.display()
             );
             println!("expose it to Windows with: vcrs mount {}", a.path.display());
+            Ok(())
+        }
+        Command::Expand(a) => {
+            if !a.force {
+                bail!(
+                    "expanding a container destroys any hidden volume inside it (VeraCrypt asks \
+                     the same question interactively); pass --force if you are sure that {} has \
+                     no hidden volume",
+                    a.path.display()
+                );
+            }
+            // Build the options once: `--password-stdin` can only be read once.
+            let options = a.password.open_options(None, false)?;
+            let password = options.effective_password(Some(&a.path))?;
+            let mut volume = Volume::open(&a.path, &options)?;
+            let old_host_size = volume.host_size;
+            let old_data_size = volume.data_size;
+            let started = std::time::Instant::now();
+            volume.expand(a.size, &password, a.password.pim)?;
+            volume.flush()?;
+            println!(
+                "expanded {} from {old_host_size} to {} bytes in {:.2}s",
+                a.path.display(),
+                volume.host_size,
+                started.elapsed().as_secs_f64()
+            );
+            println!(
+                "  data area: {} -> {} bytes (the master key and the existing data are unchanged)",
+                old_data_size, volume.data_size
+            );
+            println!(
+                "  the filesystem inside still has its old size: mount the volume and extend it \
+                 there (Windows: Disk Management -> Extend Volume, or `Resize-Partition`)"
+            );
             Ok(())
         }
         Command::Mount(a) => {
@@ -392,6 +529,7 @@ fn run() -> Result<()> {
             iscsi.disk_mode = disk_mode;
             iscsi.read_only = a.read_only;
             iscsi.removable = a.removable;
+            iscsi.protect_hidden = a.protect.hidden_open_options()?;
             if let Some(bind) = &a.bind {
                 iscsi.bind_addr = bind.clone();
             }

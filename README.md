@@ -54,7 +54,9 @@ iSCSI 发起程序，Windows 看到的是一块真实磁盘，于是**用 Window
 | Raw disk for Windows over iSCSI (`vcrs mount`): any filesystem Windows supports | ✅ (verified: Windows formatted NTFS through it, VeraCrypt read the files back) |
 | Read-only disks, hidden volumes, `--disk-mode raw`, removable-media reporting | ✅ |
 | Keyfiles (password + keyfile pool, file or directory, repeatable) | ✅ (verified against VeraCrypt both ways, incl. a 102-byte password and directories: `scripts/vc-keyfile-test.ps1` = `ALL OK`) |
-| System (pre-boot) encryption, in-place encryption of a system partition | ⬜ out of scope |
+| Container expansion (`vcrs expand`): bigger data area, both headers rewritten with fresh salts, master key and data untouched | ✅ (verified: Windows' own tools extend the filesystem into the new space through the iSCSI disk, files survive, VeraCrypt reads the grown container — `scripts/vc-expand-test.ps1` = `ALL OK`) |
+| Hidden-volume protection while writing to the outer volume (`--protect-hidden`) | ✅ (a write that would land in the hidden volume is refused, and every later write too, exactly like VeraCrypt; the hidden volume stays byte-identical) |
+| In-place encryption of a *system* partition | ⬜ out of scope |
 
 ## Build
 
@@ -99,6 +101,12 @@ vcrs info   secret.vc --password "correct horse" -k "D:\keyfiles"
 
 # Cascades, other KDFs and PIM work too:
 vcrs create paranoia.vc --size 200M --password pw --ea AES-Twofish-Serpent --prf Whirlpool --pim 30
+
+# Grow a container. The filesystem inside keeps its size; extend it from the OS afterwards.
+vcrs expand secret.vc --size 200M --force
+
+# Mount the outer volume, but refuse any write that would destroy the hidden volume inside:
+vcrs mount both.vc --password outer --protect-hidden --hidden-password inner
 ```
 
 `--password-stdin` (raw bytes) and `$VCRS_PASSWORD` are supported; prefer those over
@@ -136,6 +144,9 @@ the iSCSI *target* itself needs no administration, only the initiator does).
 | VeraCrypt → vc-rs (keyfile + 102-byte password) | Same with a password longer than 64 bytes, i.e. VeraCrypt's 128-byte keyfile pool layout | ✅ |
 | vc-rs → VeraCrypt (keyfile) | `vcrs create -k` makes a container holding a VeraCrypt-created FAT16 image; VeraCrypt mounts it with `/keyfile` and reads `fromvc.txt`; without `-k` VeraCrypt refuses the volume | ✅ (`scripts/vc-keyfile-test.ps1`, `RESULT: ALL OK`) |
 | Directory of keyfiles | `-k <dir>` means "all files in it" for both sides: vc-rs opens VeraCrypt's directory-keyfile container and VeraCrypt mounts vc-rs's one, reading the file back | ✅ (`scripts/vc-keyfile-test.ps1`) |
+| Expansion | vc-rs grows an NTFS container from 20 MiB to 40 MiB; re-attached, the new space shows up as unallocated on the disk and Windows' own tools extend the partition and the NTFS into it; the files written before the expansion are intact, and real VeraCrypt mounts the expanded container and reads them | ✅ (`scripts/vc-expand-test.ps1`, `RESULT: ALL OK`) |
+| Expansion (FAT) | An expanded container whose FAT filesystem is smaller than the data area is still fully VeraCrypt-readable after the expansion | ✅ (same script, part 2) |
+| Hidden-volume protection | Writes overlapping the hidden volume's data area fail (`HiddenVolumeProtected`) and so does every later write (`HiddenVolumeProtectionActive`); the hidden volume's bytes are unchanged and its own password still opens it | ✅ (`crates/vcrs-core/tests/hidden_protection.rs`, `crates/vcrs-mount/tests/iscsi_device.rs`) |
 | Dokany-era checks (historical) | With the Dokany filesystem mount (removed since; code in git history): files written through the drive letter were read back by VeraCrypt, a file VeraCrypt wrote into the vc-rs-made FAT was read back through the mount, and the same held for hidden volumes | ✅ (`scripts/vc-dokan-crosscheck.ps1` = `ALL OK`, `scripts/vc-hidden-test.ps1` = `HIDDEN ROUND TRIP OK: True`, `FULL HIDDEN CHAIN OK: True`) |
 
 Header encodings are also pinned by unit tests for CRC-32 (VeraCrypt's own self-test
@@ -219,6 +230,45 @@ Three things to know:
 4. A mounted container is held **exclusively** — VeraCrypt locks the file (so does
    `vcrs mount`) — so `vcrs info`/`read`/`write` on that same file fail with a sharing
    violation or "access is denied" until it is dismounted. Work on one side at a time.
+
+### Expanding a container
+
+`vcrs expand <file> --size <new size> [--force]` grows a file-hosted normal container the
+way VeraCrypt's volume expander does:
+
+* the file grows and the new part of the data area is filled with random data encrypted
+  under a throwaway key (so "empty" looks random, like VeraCrypt's full format),
+* `VolumeDataSize`/`EncryptedAreaLength` grow while `EncryptedAreaStart` and the **master
+  key** stay the same, which is why everything already written is untouched,
+* both headers are rewritten with **new random salts** (the backup header moves to the end
+  of the now larger file) and the old backup-header area in the middle is overwritten,
+* `--force` is needed because expanding destroys any hidden volume inside the container
+  (VeraCrypt asks the same question interactively).
+
+The filesystem inside keeps its old size — growing *it* is the operating system's job.
+With the iSCSI mount the new space appears as **unallocated** space on the disk (the
+synthetic MBR only describes the filesystem while that is smaller than the data area), so
+Windows can grow it:
+
+```powershell
+Resize-Partition -DiskNumber 1 -PartitionNumber 1 `
+  -Size (Get-PartitionSupportedSize -DiskNumber 1 -PartitionNumber 1).SizeMax
+# or in the GUI: Disk Management -> Extend Volume
+```
+
+Verified end to end by `scripts/vc-expand-test.ps1`: 20 MiB container → NTFS formatted by
+Windows through the iSCSI disk → files written → `vcrs expand --size 40M` → re-attached →
+Windows extends the NTFS into the new space → the files are intact → real VeraCrypt mounts
+the expanded container, reads the files and sees the new size.
+
+### Hidden-volume protection
+
+`--protect-hidden --hidden-password <pw>` (plus `--hidden-keyfile`/`--hidden-pim`) makes
+`vcrs` open the hidden volume as well and refuse any write from the outer volume that
+would land in the hidden volume's data area — the same protection VeraCrypt offers when
+mounting an outer volume, including the deliberate "every later write fails" behaviour, so
+a filesystem that ignores the error cannot keep going and damage the hidden volume.
+Reads are never restricted.
 
 The whole chain is covered by `scripts/vc-iscsi-e2e.ps1` (elevated), which creates a
 container, serves it, logs in, checks the disk/MBR/partition geometry, formats NTFS

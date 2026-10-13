@@ -84,7 +84,7 @@ use std::{
     time::{Duration, Instant},
 };
 use iscsi_target::{IscsiError, IscsiServer, ScsiBlockDevice, ScsiResult};
-use vcrs_core::volume::{OpenOptions, Volume};
+use vcrs_core::volume::{OpenOptions, ProtectedRange, Volume};
 
 use crate::device::{DataArea, SECTOR_SIZE};
 use crate::{Error, Result};
@@ -148,6 +148,14 @@ pub struct IscsiMountOptions {
     pub disk_mode: DiskMode,
     /// First LBA of the synthetic partition (1 MiB by default).
     pub partition_start_lba: u64,
+    /// VeraCrypt's *protect hidden volume* option.
+    ///
+    /// When set, the hidden volume inside this container is opened with these
+    /// credentials and its data area becomes a protected range: every write
+    /// that would land inside it fails instead of destroying the hidden volume.
+    /// VeraCrypt does the same when you mount an outer volume with "protect
+    /// hidden volume".
+    pub protect_hidden: Option<OpenOptions>,
 }
 
 impl Default for IscsiMountOptions {
@@ -159,6 +167,7 @@ impl Default for IscsiMountOptions {
             removable: false,
             disk_mode: DiskMode::default(),
             partition_start_lba: DEFAULT_PARTITION_START_LBA,
+            protect_hidden: None,
         }
     }
 }
@@ -215,6 +224,27 @@ impl ScsiVolume<Volume> {
     /// Open `path` and serve it according to `opts`.
     pub fn open(path: &Path, open: &OpenOptions, opts: &IscsiMountOptions) -> Result<Self> {
         let volume = Volume::open(path, open)?;
+        if let Some(hidden_open) = &opts.protect_hidden {
+            // VeraCrypt refuses to mount with hidden-volume protection unless the
+            // hidden volume's own password is right, so failing here (instead of
+            // serving the outer volume unprotected) is the safe behaviour.
+            let hidden = Volume::open(path, hidden_open).map_err(|e| {
+                Error::InvalidParameter(format!(
+                    "hidden volume protection: the hidden volume of {} could not be opened \
+                     ({e}); refusing to serve the outer volume without protection",
+                    path.display()
+                ))
+            })?;
+            let range = ProtectedRange::new(hidden.data_offset, hidden.data_size);
+            log::info!(
+                "hidden volume protection: writes into the hidden data area at host offsets \
+                 {}..{} ({} bytes) will be refused",
+                range.start,
+                range.end(),
+                range.length
+            );
+            volume.protect_hidden_volume(range);
+        }
         // A stable, non-zero disk signature: Windows keeps track of disks by it,
         // and deriving it from the container's header salt means it does not
         // change between sessions (and differs between containers).
@@ -263,8 +293,24 @@ impl<A: DataArea> ScsiVolume<A> {
                     Ok(()) => detect_partition_type(&vbr),
                     Err(_) => partition_type::NTFS,
                 };
+                // How much of the data area does the filesystem actually use?
+                // After `vcrs expand` the filesystem is smaller than the data
+                // area, and that is exactly the state in which the user is
+                // supposed to grow it from Windows. If the MBR claimed the
+                // whole data area, the extra space would live *inside* the
+                // partition and Windows' "Extend Volume" would have nothing to
+                // grow into, so describe only the filesystem and leave the rest
+                // of the disk unallocated.
+                let fs_blocks = filesystem_sectors(&vbr, block_size)
+                    .unwrap_or(blocks)
+                    .clamp(1, blocks);
+                if fs_blocks < blocks {
+                    log::info!(
+                        "the filesystem inside the volume uses {fs_blocks} of the {blocks} sectors                          of the data area; the rest stays unallocated so Windows can extend it"
+                    );
+                }
                 let mut prefix = vec![0u8; (start * block_size as u64) as usize];
-                let mbr = build_mbr(fs_type, start, blocks, disk_signature);
+                let mbr = build_mbr(fs_type, start, fs_blocks, disk_signature);
                 prefix[..mbr.len()].copy_from_slice(&mbr);
                 (prefix, start + blocks)
             }
@@ -425,6 +471,42 @@ pub mod partition_type {
     pub const FAT32_LBA: u8 = 0x0C;
     /// FAT16 with LBA addressing.
     pub const FAT16_LBA: u8 = 0x0E;
+}
+
+/// How many sectors (in `block_size` units) the filesystem inside the data area
+/// occupies, read from its volume boot record.
+///
+/// `None` when the boot sector is not a filesystem we recognise -- a freshly
+/// created, still unformatted container decrypts to noise -- or when the
+/// filesystem does not say how big it is.
+fn filesystem_sectors(vbr: &[u8], block_size: u32) -> Option<u64> {
+    if vbr.len() < 512 || vbr[510] != 0x55 || vbr[511] != 0xAA {
+        return None;
+    }
+    let bytes_per_sector = u16::from_le_bytes([vbr[0x0B], vbr[0x0C]]) as u64;
+    if bytes_per_sector == 0 {
+        return None;
+    }
+    let be32 = |at: usize| u32::from_le_bytes(vbr[at..at + 4].try_into().unwrap()) as u64;
+    let total_sectors = match &vbr[3..11] {
+        b"NTFS    " => u64::from_le_bytes(vbr[0x28..0x30].try_into().unwrap()),
+        b"EXFAT   " => u64::from_le_bytes(vbr[0x48..0x50].try_into().unwrap()),
+        _ if &vbr[0x52..0x5A] == b"FAT32   " => be32(0x20),
+        _ if matches!(&vbr[0x36..0x3E], b"FAT16   " | b"FAT12   ") => {
+            let small = u16::from_le_bytes([vbr[0x13], vbr[0x14]]) as u64;
+            if small != 0 {
+                small
+            } else {
+                be32(0x20)
+            }
+        }
+        _ => return None,
+    };
+    let bytes = total_sectors.checked_mul(bytes_per_sector)?;
+    if bytes == 0 {
+        return None;
+    }
+    Some(bytes.div_ceil(block_size as u64))
 }
 
 /// Guess the MBR partition type from a volume boot record.

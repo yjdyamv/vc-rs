@@ -14,13 +14,15 @@
 use std::fs::File;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 use crate::cipher::EncryptionAlgorithm;
 use crate::keyfile::apply_keyfiles;
 use crate::header::{
     VolumeHeader, VolumeType, HEADER_SALT_SIZE, MAX_SECTOR_SIZE, MIN_SECTOR_SIZE,
-    TOTAL_VOLUME_HEADERS_SIZE, TC_VOLUME_MIN_REQUIRED_PROGRAM_VERSION, VOLUME_HEADER_SIZE,
-    VOLUME_HEADER_VERSION,
+    TOTAL_VOLUME_HEADERS_SIZE, TC_VOLUME_MIN_REQUIRED_PROGRAM_VERSION, VOLUME_HEADER_GROUP_SIZE,
+    VOLUME_HEADER_SIZE, VOLUME_HEADER_VERSION,
 };
 use crate::layout::{VolumeLayout, HIDDEN_RESERVED_END_AREA};
 use crate::prf::{Prf, HEADER_KEY_SIZE};
@@ -31,6 +33,10 @@ use crate::{Error, Result};
 pub const MIN_FAT_FS_SIZE: u64 = 9 * MAX_SECTOR_SIZE as u64;
 /// `TC_MIN_VOLUME_SIZE`.
 pub const MIN_VOLUME_SIZE: u64 = TOTAL_VOLUME_HEADERS_SIZE + MIN_FAT_FS_SIZE;
+
+/// How much a container has to grow by, at least (`TC_MINVAL_FS_EXPAND` in
+/// `src/ExpandVolume/ExpandVolume.h`).
+pub const MIN_EXPAND_BYTES: u64 = 64 * 1024;
 /// `TC_MIN_HIDDEN_VOLUME_SIZE`.
 pub const MIN_HIDDEN_VOLUME_SIZE: u64 = MIN_FAT_FS_SIZE + HIDDEN_RESERVED_END_AREA;
 /// `TC_MIN_HIDDEN_VOLUME_HOST_SIZE`.
@@ -101,6 +107,38 @@ impl OpenOptions {
     }
 }
 
+/// A host-file byte range that must not be written to.
+///
+/// This is VeraCrypt's *hidden volume protection*: the outer volume is mounted
+/// normally, but a write that would land inside the hidden volume's data area
+/// fails instead of destroying it (`src/Driver/EncryptedIoQueue.c`, the
+/// `bProtectHiddenVolume` / `bHiddenVolProtectionAction` logic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtectedRange {
+    /// First protected host byte.
+    pub start: u64,
+    /// Number of protected bytes.
+    pub length: u64,
+}
+
+impl ProtectedRange {
+    /// A range starting at `start` and covering `length` host bytes.
+    pub const fn new(start: u64, length: u64) -> Self {
+        Self { start, length }
+    }
+
+    /// First byte past the protected range.
+    pub const fn end(&self) -> u64 {
+        self.start.saturating_add(self.length)
+    }
+
+    /// True when `[offset, offset + len)` intersects the protected range.
+    /// A zero-length write never intersects.
+    pub const fn overlaps(&self, offset: u64, len: u64) -> bool {
+        len > 0 && offset < self.end() && self.start < offset.saturating_add(len)
+    }
+}
+
 /// An opened VeraCrypt volume.
 pub struct Volume {
     file: File,
@@ -113,6 +151,10 @@ pub struct Volume {
     /// Size of the volume data area in bytes.
     pub data_size: u64,
     xts: Xts,
+    /// Host-file range writes must not touch (hidden-volume protection).
+    protected: OnceLock<ProtectedRange>,
+    /// Set once a write has been refused, after which *every* write is refused.
+    protection_triggered: AtomicBool,
 }
 
 impl Volume {
@@ -370,7 +412,17 @@ impl Volume {
         let xts = Xts::new(header.ea, header.data_key())?;
         let data_offset = layout.data_offset(&header, host_size);
         let data_size = header.encrypted_area_length;
-        Ok(Volume { file, header, layout, host_size, data_offset, data_size, xts })
+        Ok(Volume {
+            file,
+            header,
+            layout,
+            host_size,
+            data_offset,
+            data_size,
+            xts,
+            protected: OnceLock::new(),
+            protection_triggered: AtomicBool::new(false),
+        })
     }
 
     /// Read and decrypt raw host bytes. `host_offset` and `buf.len()` must be
@@ -385,6 +437,7 @@ impl Volume {
     /// Encrypt and write raw host bytes.
     pub fn write_at(&self, host_offset: u64, buf: &[u8]) -> Result<()> {
         self.check_range(host_offset, buf.len())?;
+        self.check_protection(host_offset, buf.len() as u64)?;
         let mut enc = buf.to_vec();
         self.xts.encrypt(&mut enc, host_offset / DATA_UNIT_SIZE as u64)?;
         write_all_at(&self.file, host_offset, &enc)?;
@@ -413,6 +466,174 @@ impl Volume {
     /// Overwrite `data` (a whole number of sectors) at volume sector `sector`.
     pub fn write_sectors(&self, sector: u64, data: &[u8]) -> Result<()> {
         self.write_data(sector * DATA_UNIT_SIZE as u64, data)
+    }
+
+    /// Turn on VeraCrypt's hidden-volume protection for `range` (host bytes).
+    ///
+    /// Writes overlapping the range are refused, and once a write has been
+    /// refused *every* subsequent write is refused as well. VeraCrypt behaves
+    /// the same way (`HiddenVolumeProtectionAction` in
+    /// `src/Driver/EncryptedIoQueue.c`): a filesystem that ignores the write
+    /// error must not be able to quietly destroy the hidden volume.
+    pub fn protect_hidden_volume(&self, range: ProtectedRange) {
+        let _ = self.protected.set(range);
+    }
+
+    /// The protected range, when hidden-volume protection is enabled.
+    pub fn protected_range(&self) -> Option<ProtectedRange> {
+        self.protected.get().copied()
+    }
+
+    /// True once a write has been refused by hidden-volume protection.
+    pub fn protection_triggered(&self) -> bool {
+        self.protection_triggered.load(Ordering::Relaxed)
+    }
+
+    /// Grow the container to `new_host_size` bytes, the way VeraCrypt's Volume
+    /// Expander does it for a file-hosted normal volume
+    /// (`src/ExpandVolume/ExpandVolume.c`).
+    ///
+    /// `password` is the password as the KDF sees it, i.e. with the keyfile pool
+    /// already mixed in (see [`OpenOptions::effective_password`]). Both the
+    /// primary and the backup header are rewritten with *fresh* random salts, so
+    /// the header key is derived from the password again; the master key is
+    /// **kept**, which is why the existing data does not have to be
+    /// re-encrypted. The newly exposed bytes are filled with ciphertext under a
+    /// throwaway key (VeraCrypt's `FormatNoFs`, "init free space"), and the old
+    /// backup header group -- now in the middle of the data area -- is
+    /// overwritten with random data.
+    ///
+    /// The filesystem inside the volume keeps its old size: extending it is the
+    /// operating system's job.
+    ///
+    /// Only V2 normal volumes can grow. This does **not** look for a hidden
+    /// volume: growing an outer volume destroys it, so the caller has to ask the
+    /// user first (which is what VeraCrypt's expansion wizard does). The caller
+    /// must also have opened the volume with the same password, which is what
+    /// validates it -- with a wrong `password` the headers end up encrypted under
+    /// a key nobody knows.
+    pub fn expand(&mut self, new_host_size: u64, password: &[u8], pim: i32) -> Result<()> {
+        let layout = self.layout;
+        if !matches!(layout, VolumeLayout::V2Normal) {
+            return Err(Error::Unsupported(format!(
+                "expanding a {layout:?} volume is not supported; VeraCrypt only expands \
+                 file-hosted normal volumes"
+            )));
+        }
+        if self.header.volume_type != VolumeType::Normal || self.header.hidden_volume_data_size != 0 {
+            return Err(Error::Unsupported(
+                "a hidden volume cannot be expanded (VeraCrypt refuses that too)".into(),
+            ));
+        }
+        if self.header.is_encrypted_system() {
+            return Err(Error::Unsupported(
+                "a system-encryption volume cannot be expanded".into(),
+            ));
+        }
+        let old_host_size = self.host_size;
+        if new_host_size < old_host_size {
+            return Err(Error::InvalidParameter(format!(
+                "the new size {new_host_size} is smaller than the current {old_host_size}; \
+                 containers can only grow"
+            )));
+        }
+        if new_host_size % self.header.sector_size as u64 != 0
+            || new_host_size % DATA_UNIT_SIZE as u64 != 0
+        {
+            return Err(Error::InvalidParameter(format!(
+                "the new size must be a multiple of the sector size ({} bytes)",
+                self.header.sector_size
+            )));
+        }
+        let new_data_size = layout
+            .max_data_size(new_host_size)
+            .ok_or_else(|| Error::InvalidParameter("the new host is too small".into()))?;
+        if new_data_size < self.data_size + MIN_EXPAND_BYTES {
+            return Err(Error::InvalidParameter(format!(
+                "a container has to grow by at least {MIN_EXPAND_BYTES} bytes of data area \
+                 (old data area {}, requested {new_data_size})",
+                self.data_size
+            )));
+        }
+
+        // 1. Grow the host file (VeraCrypt: SetFilePointerEx + SetEndOfFile).
+        self.file.set_len(new_host_size)?;
+
+        // 2. Fill the newly exposed area with zeroes encrypted under a throwaway
+        //    key, so the free space looks like ciphertext (FormatNoFs). This also
+        //    covers the fake hidden-header slot of the new backup header group.
+        randomize_data_area(
+            &self.file,
+            old_host_size,
+            new_host_size - old_host_size,
+            self.header.ea,
+        )?;
+
+        // 3. The new header fields; the master key does not change.
+        let mut header = self.header.clone();
+        header.volume_data_size = new_data_size;
+        header.hidden_volume_data_size = 0;
+        header.encrypted_area_start = self.data_offset;
+        header.encrypted_area_length = new_data_size;
+
+        // 4. Backup header first, then the primary one, each with its own fresh
+        //    salt (VeraCrypt's CreateVolumeHeaderInMemory generates one per copy).
+        let backup_offset = new_host_size - VOLUME_HEADER_GROUP_SIZE;
+        let backup_salt = random_bytes(HEADER_SALT_SIZE)?;
+        write_header_region(&self.file, backup_offset, &header, password, pim, &backup_salt)?;
+        let primary_salt = random_bytes(HEADER_SALT_SIZE)?;
+        write_header_region(
+            &self.file,
+            layout.header_offset(),
+            &header,
+            password,
+            pim,
+            &primary_salt,
+        )?;
+        header.salt = primary_salt;
+
+        // 5. The old backup header group sits inside the data area now; wipe it
+        //    so no stale, decryptable header survives.
+        wipe_region(
+            &self.file,
+            old_host_size - VOLUME_HEADER_GROUP_SIZE,
+            VOLUME_HEADER_GROUP_SIZE,
+        )?;
+
+        self.file.sync_all()?;
+        self.host_size = new_host_size;
+        self.header = header;
+        self.data_size = new_data_size;
+        log::info!(
+            "expanded to {new_host_size} bytes (data area {new_data_size} bytes, backup header at \
+             {backup_offset})"
+        );
+        Ok(())
+    }
+
+    fn check_protection(&self, host_offset: u64, len: u64) -> Result<()> {
+        let Some(range) = self.protected.get().copied() else {
+            return Ok(());
+        };
+        if self.protection_triggered.load(Ordering::Relaxed) {
+            return Err(Error::HiddenVolumeProtectionActive);
+        }
+        if range.overlaps(host_offset, len) {
+            self.protection_triggered.store(true, Ordering::Relaxed);
+            log::warn!(
+                "hidden volume protection triggered: a {len}-byte write at host offset {host_offset} \
+                 overlaps the protected range {}..{}",
+                range.start,
+                range.end()
+            );
+            return Err(Error::HiddenVolumeProtected {
+                offset: host_offset,
+                length: len,
+                start: range.start,
+                end: range.end(),
+            });
+        }
+        Ok(())
     }
 
     /// The raw (still encrypted) header region this volume was opened from.
@@ -590,6 +811,20 @@ fn randomize_data_area(file: &File, data_offset: u64, data_size: u64, ea: Encryp
         xts.encrypt(slice, (data_offset + written) / DATA_UNIT_SIZE as u64)?;
         write_all_at(file, data_offset + written, slice)?;
         written += len as u64;
+    }
+    Ok(())
+}
+
+/// Overwrite `len` bytes at `offset` with random data (one pass; VeraCrypt runs
+/// the user's wipe algorithm over the old backup header group).
+fn wipe_region(file: &File, offset: u64, len: u64) -> Result<()> {
+    const CHUNK: usize = 1024 * 1024;
+    let mut written = 0u64;
+    while written < len {
+        let n = std::cmp::min(CHUNK as u64, len - written) as usize;
+        let buf = random_bytes(n)?;
+        write_all_at(file, offset + written, &buf)?;
+        written += n as u64;
     }
     Ok(())
 }
