@@ -1,0 +1,22 @@
+[package]
+name = "vcrs-mount"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Windows volume mounting (Dokany) for vcrs-core VeraCrypt-compatible volumes"
+
+[dependencies]
+vcrs-core = { path = "../vcrs-core" }
+log.workspace = true
+thiserror.workspace = true
+fatfs.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+dokan.workspace = true
+# `dokan`'s public API is expressed in `widestring`/`winapi`/`dokan-sys` types
+# (`&U16CStr` paths, `ACCESS_MASK`, the `FILE_*` create flags), so they are
+# needed directly.  All three are already in the dependency graph as direct
+# dependencies of `dokan` at exactly these versions -- no new crate is added.
+dokan-sys = "0.3.1"
+widestring = "0.4.3"
+winapi = { version = "0.3.9", features = ["minwindef", "ntdef", "ntstatus", "winnt"] }

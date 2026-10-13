@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/vcrs-core", "crates/vcrs-cli", "crates/vcrs-mount"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/example/vc-rs"
+
+[workspace.dependencies]
+botan = { version = "0.14", default-features = false, features = ["std", "vendored"] }
+# Direct dependency on the raw FFI layer: the safe `botan` wrapper passes
+# passphrases as `&str` (Botan then calls strlen), which cannot express
+# VeraCrypt's byte-exact password+keyfile-pool input.
+botan-sys = "1"
+zeroize = { version = "1", features = ["derive"] }
+thiserror = "2"
+dokan = "0.3.1"
+fatfs = "0.3"
+log = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

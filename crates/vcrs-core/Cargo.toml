@@ -1,0 +1,16 @@
+[package]
+name = "vcrs-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VeraCrypt volume format implementation in Rust (botan-rs backend)"
+
+[dependencies]
+botan.workspace = true
+botan-sys.workspace = true
+zeroize.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+hex = "0.4"

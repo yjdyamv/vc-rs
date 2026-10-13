@@ -1,0 +1,18 @@
+[package]
+name = "vcrs-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command line front-end for vcrs (VeraCrypt-compatible volumes in Rust)"
+
+[[bin]]
+name = "vcrs"
+path = "src/main.rs"
+
+[dependencies]
+vcrs-core = { path = "../vcrs-core" }
+vcrs-mount = { path = "../vcrs-mount" }
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+log.workspace = true
+env_logger = "0.11"
