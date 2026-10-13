@@ -432,13 +432,33 @@ impl Volume {
     /// Open an existing volume, trying the layouts, PRFs and encryption
     /// algorithms in VeraCrypt's order.
     pub fn open(path: &Path, options: &OpenOptions) -> Result<Volume> {
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+        // A raw partition goes through the device layer: its size has to come
+        // from the disk ioctl (`GetFileSizeEx` reports 0 for some volumes), it
+        // needs `FSCTL_ALLOW_EXTENDED_DASD_IO` for the sectors the filesystem
+        // driver guards, and VeraCrypt forces `preserveTimestamps = FALSE` for
+        // devices because their handles reject `FILE_BASIC_INFO`.
+        let is_device = crate::device::looks_like_device(path);
+        let (file, host_size) = if is_device {
+            let device = crate::device::Device::open(path, true)?;
+            // Best effort: an encrypted (RAW) device has no filesystem attached,
+            // so the ioctl fails, and it is only needed when a driver guards the
+            // sectors past the filesystem's end. VeraCrypt does the same.
+            if let Err(e) = device.allow_extended_dasd_io() {
+                log::debug!("raw access was not needed for {path:?}: {e}");
+            }
+            let size = device.len();
+            (device.into_file(), size)
+        } else {
+            let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+            let size = file.metadata()?.len();
+            (file, size)
+        };
         // VeraCrypt freezes the timestamps of a container as soon as it opens it
         // (`OpenVolume(..., preserveTimestamps, ...)`), and the order matters:
         // the filesystem records an access when the first read happens, and once
         // it has, no later "do not update" flag takes effect (measured on this
         // machine: freezing after a read leaves the access time updated).
-        let timestamps = if options.preserve_timestamps {
+        let timestamps = if options.preserve_timestamps && !is_device {
             match freeze_file_timestamps(&file) {
                 Ok(timestamps) => {
                     if timestamps.is_some() {
@@ -454,7 +474,6 @@ impl Volume {
         } else {
             None
         };
-        let host_size = file.metadata()?.len();
         // The keyfile pool is mixed in once; every trial below derives from it.
         let password = options.effective_password(Some(path))?;
 
@@ -1638,6 +1657,475 @@ pub fn decrypt_in_place_stopping_after(
 /// [`decrypt_in_place_stopping_after`] with no early stop and no resume.
 pub fn decrypt_in_place(path: &Path, password: &[u8], pim: i32) -> Result<DecryptOutcome> {
     decrypt_in_place_stopping_after(path, password, pim, false, None)
+}
+
+/// Options for transforming a *partition* in place, i.e. VeraCrypt's non-system
+/// in-place encryption of a mounted NTFS volume (`src/Format/InPlace.c`).
+#[derive(Clone, Debug)]
+pub struct DeviceInPlaceOptions {
+    pub password: Vec<u8>,
+    pub keyfiles: Vec<PathBuf>,
+    pub pim: i32,
+    /// The algorithm the volume is encrypted with (encryption only: decryption
+    /// reads it from the header).
+    pub ea: EncryptionAlgorithm,
+    /// The header hash (encryption only: decryption reads it from the header).
+    pub prf: Prf,
+    /// See [`CreateOptions::random_source`].
+    pub random_source: Option<PathBuf>,
+}
+
+impl DeviceInPlaceOptions {
+    /// The password bytes the KDF sees, i.e. with the keyfile pool mixed in.
+    pub fn effective_password(&self, device: Option<&Path>) -> Result<Vec<u8>> {
+        apply_keyfiles(&self.password, &self.keyfiles, device)
+    }
+
+    fn random_supply(&self) -> Result<RandomSupply> {
+        match &self.random_source {
+            None => Ok(RandomSupply::system()),
+            Some(path) => RandomSupply::from_file(path),
+        }
+    }
+}
+
+/// What a run over a partition did. The device keeps its size, so there is no
+/// new host size to report -- only how far the transformation got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceInPlaceOutcome {
+    /// Bytes transformed by this call.
+    pub transformed: u64,
+    /// Bytes the whole transformation covers.
+    pub total: u64,
+    /// The extent of the filesystem once the run finishes.
+    pub data_size: u64,
+    /// The size of the device, which never changes.
+    pub device_size: u64,
+    /// Whether the transformation is complete.
+    pub finished: bool,
+}
+
+impl DeviceInPlaceOutcome {
+    pub fn progress(&self) -> f32 {
+        if self.total == 0 {
+            1.0
+        } else {
+            self.transformed as f32 / self.total as f32
+        }
+    }
+}
+
+/// The header a partition carries while it is being transformed, if the
+/// password opens it. This has to try every header hash and algorithm: on a
+/// resumed run the volume's own header is the only record of what they are.
+fn open_in_place_header(
+    region: &[u8],
+    password: &[u8],
+    pim: i32,
+    preferred_prf: Prf,
+) -> Option<VolumeHeader> {
+    let prfs = std::iter::once(preferred_prf)
+        .chain(Prf::ALL.into_iter().filter(|prf| *prf != preferred_prf));
+    for prf in prfs {
+        let mut header_key = vec![0u8; HEADER_KEY_SIZE];
+        if prf
+            .derive(password, &region[..HEADER_SALT_SIZE], pim, &mut header_key)
+            .is_err()
+        {
+            continue;
+        }
+        for ea in EncryptionAlgorithm::ALL {
+            if !VolumeHeader::region_has_magic(region, &header_key, ea).unwrap_or(false) {
+                continue;
+            }
+            if let Ok(header) = VolumeHeader::decrypt(region, &header_key, ea, prf) {
+                return Some(header);
+            }
+        }
+    }
+    None
+}
+
+/// Encrypt a partition in place: shrink the NTFS filesystem so that the header
+/// areas fit behind it, conceal its boot sector and then move the whole
+/// filesystem `VOLUME_HEADER_GROUP_SIZE` bytes towards the end of the device
+/// while encrypting it. This is VeraCrypt's non-system in-place encryption
+/// (`src/Format/InPlace.c`); the device keeps its size, and the resulting volume
+/// is an ordinary VeraCrypt volume on a partition (VeraCrypt can mount it).
+///
+/// The volume cannot be mounted while it is half transformed: the data area does
+/// not look like a filesystem any more and the primary header group, which is
+/// part of the filesystem's own head, has not been written yet. The backup
+/// header at the end of the device records how far the run got, so an
+/// interrupted run can be continued; it is also the only header VeraCrypt can
+/// use to resume its own runs.
+///
+/// `stop_after` stops the run early on purpose (used by the tests).
+pub fn encrypt_device_in_place(
+    device: &crate::device::Device,
+    options: &DeviceInPlaceOptions,
+    stop_after: Option<u64>,
+) -> Result<DeviceInPlaceOutcome> {
+    let info = device.info().clone();
+    if let Some(reason) = info.blocker() {
+        return Err(Error::Unsupported(reason));
+    }
+    validate_sector_size(info.sector_size)?;
+    // Raw access has to be granted before anything is read or written: the NTFS
+    // driver guards the sectors past the filesystem's end (where the backup
+    // header goes), and it refuses those without this ioctl. A resume runs
+    // against a volume whose filesystem our own lock/dismount released, so a
+    // refusal here is reported and then judged by the first tail write.
+    if let Err(e) = device.allow_extended_dasd_io() {
+        log::warn!("continuing without raw access to {}: {e}", info.path.display());
+    }
+    let device_size = info.size;
+    let data_size = info.data_area_size();
+    let file = device.file();
+    let password = options.effective_password(Some(&info.path))?;
+    let mut random = options.random_supply()?;
+
+    let backup_offset = device_size - VOLUME_HEADER_GROUP_SIZE;
+    let mut region = vec![0u8; VOLUME_HEADER_SIZE as usize];
+    read_exact_at(file, backup_offset, &mut region)
+        .map_err(|e| device_io_error("reading the backup header", backup_offset, e))?;
+    let existing = open_in_place_header(&region, &password, options.pim, options.prf);
+
+    let (mut header, backup_salt, mut start, mut done, initial_done, fresh) = match existing {
+        Some(header) if header.is_non_system_inplace_enc() => {
+            // A run of ours that stopped half way: continue where it stopped.
+            if header.volume_data_size != data_size {
+                return Err(Error::InvalidParameter(format!(
+                    "{} carries an in-place transformation of a {} byte data area, but the device's geometry wants {} bytes",
+                    info.path.display(),
+                    header.volume_data_size,
+                    data_size
+                )));
+            }
+            if header.encrypted_area_start + header.encrypted_area_length != backup_offset {
+                return Err(Error::InvalidParameter(format!(
+                    "{} reports an inconsistent in-place encrypted area (start {}, length {}, data area {})",
+                    info.path.display(),
+                    header.encrypted_area_start,
+                    header.encrypted_area_length,
+                    data_size
+                )));
+            }
+            log::info!(
+                "resuming the in-place encryption of {} ({} of {} bytes left)",
+                info.path.display(),
+                data_size - header.encrypted_area_length,
+                data_size
+            );
+            let salt = region[..HEADER_SALT_SIZE].to_vec();
+            let done = header.encrypted_area_length;
+            let start = header.encrypted_area_start;
+            (header, salt, start, done, done, false)
+        }
+        Some(_) => {
+            return Err(Error::Unsupported(format!(
+                "{} already holds a completed VeraCrypt volume; there is nothing to encrypt in place",
+                info.path.display()
+            )))
+        }
+        None => {
+            // Make room for the two header groups: the filesystem has to give up
+            // everything from the data area's end on (VeraCrypt shrinks it to
+            // exactly that size, and NTFS is the only filesystem Windows can
+            // shrink in place). The target comes from the filesystem's own size:
+            // NTFS keeps the device's last sector for itself.
+            let shrunk_to = device.shrink_ntfs_for_in_place()?;
+            log::info!(
+                "shrunk the filesystem of {} to {shrunk_to} bytes (the volume data area is {data_size} bytes)",
+                info.path.display()
+            );
+            let salt = random.bytes(HEADER_SALT_SIZE)?;
+            let header = VolumeHeader {
+                version: VOLUME_HEADER_VERSION,
+                required_min_version: TC_VOLUME_MIN_REQUIRED_PROGRAM_VERSION,
+                volume_type: VolumeType::Normal,
+                creation_time: 0,
+                modification_time: 0,
+                hidden_volume_data_size: 0,
+                volume_data_size: data_size,
+                // The encrypted area starts at the end of the filesystem and
+                // grows towards the front, so `EncryptedAreaStart` starts out as
+                // the *boundary* between the plaintext and the ciphertext, not
+                // as the start of the data area (VeraCrypt's convention: the sum
+                // of start and length stays at the data area's end).
+                encrypted_area_start: backup_offset,
+                encrypted_area_length: 0,
+                flags: HEADER_FLAG_NONSYS_INPLACE_ENC,
+                sector_size: info.sector_size,
+                ea: options.ea,
+                prf: options.prf,
+                salt: salt.clone(),
+                master_key: random_master_key(options.ea, &mut random)?,
+            };
+            (header, salt, backup_offset, 0, 0, true)
+        }
+    };
+
+    let fake_options = CreateOptions {
+        ea: header.ea,
+        prf: header.prf,
+        password: Vec::new(),
+        keyfiles: Vec::new(),
+        pim: 0,
+        sector_size: info.sector_size,
+        full_format: false,
+        sparse: false,
+        random_source: None,
+    };
+
+    // Nothing else may touch the device from here on: a filesystem driver
+    // writing into the data area while it is being moved would destroy it. The
+    // lock comes *before* the first write into the sectors the filesystem used
+    // to own, because the NTFS driver refuses raw writes past the end of a
+    // mounted filesystem (VeraCrypt dismounts here too, right after the shrink).
+    device.lock_and_dismount()?;
+    if fresh {
+        // The backup header group is the only live one during the run.
+        write_header_region(file, backup_offset, &header, &password, options.pim, &backup_salt)
+            .map_err(|e| Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("writing the new volume's backup header at offset {backup_offset}: {e}"),
+            )))?;
+        write_fake_hidden_region(
+            file,
+            backup_offset + VOLUME_HEADER_SIZE,
+            device_size,
+            data_size,
+            &fake_options,
+            &mut random,
+        )
+        .map_err(|e| Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "writing the fake hidden header at offset {}: {e}",
+                backup_offset + VOLUME_HEADER_SIZE
+            ),
+        )))?;
+        file.sync_all().map_err(Error::Io)?;
+    }
+
+    // Nothing else may touch the device from here on: a filesystem driver
+    // writing into the data area while it is being moved would destroy it.
+    if fresh {
+        // Make the filesystem look broken to Windows for the duration of the run
+        // (VeraCrypt's `ConcealNTFS`): the boot sector is XORed with 0xFF, and
+        // the chunk that moves it encrypts the real bytes.
+        device.conceal(true)?;
+        file.sync_all().map_err(Error::Io)?;
+    }
+
+    let xts = Xts::new(header.ea, header.data_key())?;
+    let total = data_size;
+    let mut last_update = done;
+    while done < total {
+        let mut chunk = (total - done).min(IN_PLACE_CHUNK_SIZE);
+        if let Some(limit) = stop_after {
+            if done >= limit {
+                break;
+            }
+            chunk = chunk.min(limit - done);
+        }
+        let dest = start - chunk;
+        let source = dest - VOLUME_HEADER_GROUP_SIZE;
+        let mut buffer = vec![0u8; chunk as usize];
+        read_exact_at(file, source, &mut buffer)
+            .map_err(|e| device_io_error("reading the device", source, e))?;
+        if source < crate::device::CONCEAL_PORTION_SIZE as u64 {
+            // This chunk holds the concealed boot sector; put the real bytes
+            // back before encrypting them.
+            let undo = (crate::device::CONCEAL_PORTION_SIZE as u64 - source).min(chunk) as usize;
+            for byte in &mut buffer[..undo] {
+                *byte ^= crate::device::CONCEAL_CONSTANT;
+            }
+        }
+        xts.encrypt(&mut buffer, dest / DATA_UNIT_SIZE as u64)?;
+        write_all_at(file, dest, &buffer)
+            .map_err(|e| device_io_error("writing the device", dest, e))?;
+        start = dest;
+        done += chunk;
+        if done - last_update >= IN_PLACE_HEADER_UPDATE_INTERVAL || done == total {
+            // VeraCrypt's FastVolumeHeaderUpdate: the same salt and key, so the
+            // run can be resumed from the backup header at any point.
+            header.encrypted_area_start = start;
+            header.encrypted_area_length = done;
+            write_header_region(file, backup_offset, &header, &password, options.pim, &backup_salt)?;
+            file.sync_all().map_err(Error::Io)?;
+            last_update = done;
+        }
+    }
+
+    let finished = done >= total;
+    if finished {
+        // The primary header group is written last; until then the data area
+        // holds a filesystem head that Windows would try to mount. The in-place
+        // flag stays set, exactly as in VeraCrypt: it marks a volume whose
+        // header areas are carved out of the filesystem (and which can therefore
+        // be decrypted in place again).
+        header.encrypted_area_start = VOLUME_HEADER_GROUP_SIZE;
+        header.encrypted_area_length = total;
+        let primary_salt = random.bytes(HEADER_SALT_SIZE)?;
+        write_header_region(file, 0, &header, &password, options.pim, &primary_salt)?;
+        write_fake_hidden_region(
+            file,
+            HIDDEN_SLOT_OFFSET,
+            device_size,
+            data_size,
+            &fake_options,
+            &mut random,
+        )?;
+        write_header_region(file, backup_offset, &header, &password, options.pim, &backup_salt)?;
+        write_fake_hidden_region(
+            file,
+            backup_offset + VOLUME_HEADER_SIZE,
+            device_size,
+            data_size,
+            &fake_options,
+            &mut random,
+        )?;
+        file.sync_all().map_err(Error::Io)?;
+        log::info!(
+            "encrypted {} in place ({} byte data area, backup header at {})",
+            info.path.display(),
+            total,
+            backup_offset
+        );
+    } else {
+        log::info!(
+            "paused after {} of {} bytes; resume with the same command",
+            done,
+            total
+        );
+    }
+
+    Ok(DeviceInPlaceOutcome {
+        transformed: done - initial_done,
+        total,
+        data_size,
+        device_size,
+        finished,
+    })
+}
+
+/// Decrypt a partition that was encrypted in place back to a plain filesystem
+/// (VeraCrypt's `DecryptPartitionInPlace`, the mirror image of
+/// [`encrypt_device_in_place`]). The filesystem is moved back down, the header
+/// areas at both ends (and the leftover ciphertext) are zeroed, and the device
+/// keeps its size.
+///
+/// A half encrypted and a half decrypted partition have identical header fields,
+/// so continuing an interrupted decryption has to be asked for with `resume`.
+pub fn decrypt_device_in_place(
+    device: &crate::device::Device,
+    options: &DeviceInPlaceOptions,
+    resume: bool,
+    stop_after: Option<u64>,
+) -> Result<DeviceInPlaceOutcome> {
+    let info = device.info().clone();
+    validate_sector_size(info.sector_size)?;
+    let device_size = info.size;
+    let file = device.file();
+    let password = options.effective_password(Some(&info.path))?;
+
+    let backup_offset = device_size - VOLUME_HEADER_GROUP_SIZE;
+    let mut region = vec![0u8; VOLUME_HEADER_SIZE as usize];
+    read_exact_at(file, backup_offset, &mut region).map_err(Error::Io)?;
+    let mut header = open_in_place_header(&region, &password, options.pim, options.prf).ok_or(
+        Error::PasswordIncorrect,
+    )?;
+    if !header.is_non_system_inplace_enc() {
+        return Err(Error::Unsupported(format!(
+            "{} holds a VeraCrypt volume that was not encrypted in place, so there is nothing to decrypt in place",
+            info.path.display()
+        )));
+    }
+
+    let total = header.volume_data_size;
+    let backup_salt = region[..HEADER_SALT_SIZE].to_vec();
+    let complete = header.encrypted_area_start == VOLUME_HEADER_GROUP_SIZE
+        && header.encrypted_area_length == total;
+    if !complete && !resume {
+        return Err(Error::Unsupported(format!(
+            "{} holds an unfinished in-place transformation ({} of {} bytes are still ciphertext); only a completed in-place volume can be decrypted from scratch, and continuing an interrupted decryption has to be asked for explicitly",
+            info.path.display(),
+            header.encrypted_area_length,
+            total
+        )));
+    }
+
+    let mut start = header.encrypted_area_start;
+    let mut done = header.encrypted_area_length;
+    let initial_done = done;
+
+    device.lock_and_dismount()?;
+
+    let xts = Xts::new(header.ea, header.data_key())?;
+    let mut last_update = done;
+    while done > 0 {
+        let mut chunk = done.min(IN_PLACE_CHUNK_SIZE);
+        if let Some(limit) = stop_after {
+            if done <= limit {
+                break;
+            }
+            chunk = chunk.min(done - limit);
+        }
+        let mut buffer = vec![0u8; chunk as usize];
+        read_exact_at(file, start, &mut buffer).map_err(Error::Io)?;
+        xts.decrypt(&mut buffer, start / DATA_UNIT_SIZE as u64)?;
+        write_all_at(file, start - VOLUME_HEADER_GROUP_SIZE, &buffer).map_err(Error::Io)?;
+        start += chunk;
+        done -= chunk;
+        if last_update - done >= IN_PLACE_HEADER_UPDATE_INTERVAL || done == 0 {
+            header.encrypted_area_start = start;
+            header.encrypted_area_length = done;
+            write_header_region(file, backup_offset, &header, &password, options.pim, &backup_salt)?;
+            file.sync_all().map_err(Error::Io)?;
+            last_update = done;
+        }
+    }
+
+    let finished = done == 0;
+    if finished {
+        // The filesystem is back at the front of the device; wipe everything
+        // from its end to the last sector of the device (the backup header and
+        // the ciphertext that is left over). VeraCrypt zeroes the same range;
+        // unlike a container, a partition is never truncated.
+        zero_region(file, total, device_size - info.sector_size as u64 - total)?;
+        file.sync_all().map_err(Error::Io)?;
+        log::info!(
+            "decrypted {} in place ({} byte filesystem, the device keeps its {} bytes)",
+            info.path.display(),
+            total,
+            device_size
+        );
+    } else {
+        log::info!(
+            "paused after {} of {} bytes; resume with the same command",
+            initial_done - done,
+            initial_done
+        );
+    }
+
+    Ok(DeviceInPlaceOutcome {
+        transformed: initial_done - done,
+        total,
+        data_size: total,
+        device_size,
+        finished,
+    })
+}
+
+/// Wraps a device I/O failure with the offset that failed, so that a refused
+/// raw access is not just "access denied" in the output.
+fn device_io_error(action: &str, offset: u64, error: std::io::Error) -> Error {
+    Error::Io(std::io::Error::new(
+        error.kind(),
+        format!("{action} at offset {offset}: {error}"),
+    ))
 }
 
 fn in_place_state(header: &VolumeHeader) -> Option<InPlaceState> {

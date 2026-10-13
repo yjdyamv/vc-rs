@@ -13,7 +13,8 @@ iSCSI 发起程序，Windows 看到的是一块真实磁盘，于是**用 Window
 格式化并读写（已实测：Windows 在此磁盘上格式化 NTFS 并写入文件，真实 VeraCrypt 挂载同一容器
 能原样读到）。`vcrs format` 还能在卷内直接建 FAT 文件系统（不挂载也能用）。此外还支持
 备份/恢复卷头（`backup-headers`/`restore-headers`，含从主密钥重建）、改密码
-（`change`）、卷扩容、隐藏卷保护、就地加解密、动态卷（`--sparse`，按需分配磁盘空间）、
+（`change`）、卷扩容、隐藏卷保护、就地加解密（文件镜像与**整个 NTFS 分区**，后者即 VeraCrypt 的
+`/encdev`：缩小文件系统、锁定卸载、遮蔽卷首、自顶向下加密）、动态卷（`--sparse`，按需分配磁盘空间）、
 容器时间戳保护（挂载/读写不会暴露容器的修改时间与访问时间）、可复现创建（`--random-source`，
 同一个种子文件生成逐字节相同的容器，用于测试与审计）。系统加密（预启动认证）不在范围内。
 
@@ -33,7 +34,7 @@ iSCSI 发起程序，Windows 看到的是一块真实磁盘，于是**用 Window
 | `crates/vcrs-core` | The format: header serialization/encryption, KDFs, XTS mode, volume create/open, data I/O. No platform dependencies. |
 | `crates/vcrs-mount` | Mount layer: FAT formatting inside the volume, plus an iSCSI target that presents the decrypted data area to Windows as a raw disk (any filesystem Windows supports). |
 | `crates/vcrs-cli` | The `vcrs` command line tool. |
-| `docs/` | Design notes: `mounting-options.md` (why iSCSI, what the alternatives were). |
+| `docs/` | Design notes: `mounting-options.md` (why iSCSI, what the alternatives were), `device-in-place.md` (VeraCrypt's `/encdev` and what Windows plumbing it needs). |
 | `docs/research` | Notes taken while reading the VeraCrypt sources (format layout, keyfiles, Dokan capabilities, Botan API). |
 | `vendor/iscsi-target` | Local fork of the iSCSI target crate with Microsoft-initiator fixes (`PATCHES.md` documents each one). |
 | `scripts/` | Build/cross-verification helpers (`msvc.sh` build wrapper, VeraCrypt round-trip scripts). |
@@ -72,6 +73,9 @@ iSCSI 发起程序，Windows 看到的是一块真实磁盘，于是**用 Window
 | Volume sector size at creation (`--sector-size 512..4096`) | ✅ (verified: real VeraCrypt mounts a 4096-byte-sector container, Windows formatted NTFS inside it with 4096-byte sectors, and that boot sector is what lands in the container — `scripts/vc-sector-size-test.ps1` = `ALL OK`) |
 | In-place encryption of a plaintext image (`vcrs encrypt-in-place`) | ✅ (verified: real VeraCrypt mounts the finished container, reads the filesystem that was encrypted in place, and writes through that mount survive — `scripts/vc-inplace-test.ps1` = `ALL OK`) |
 | Permanent decryption back to a plain image (`vcrs decrypt-in-place`, `--resume` to continue an interrupted run) | ✅ (verified: the plain image is byte-identical to the original filesystem, and re-encrypting it gives a container VeraCrypt mounts and reads again — same script) |
+| In-place encryption of an NTFS **partition** (`vcrs encrypt-in-place V:`, `/encdev`) | ✅ (Windows, elevated: the filesystem is shrunk, locked and dismounted, the volume head is concealed, the data area is encrypted top-down and the primary header group is written last; verified on a throwaway VHD — `scripts/device-inplace-test.ps1` = `ALL OK`, files, SHA-256 and `chkdsk` intact. Real VeraCrypt mounting the finished partition is still unproven: this machine cannot mount anything through VeraCrypt at the moment, see the evidence table) |
+| Reading and inspecting an encrypted partition (`vcrs read V:`, `vcrs info V:`) | ✅ (a device path works everywhere a container path does: `E:`, `\.\HarddiskVolume7`, `\.\Harddisk1\Partition2`; the timestamps of a device are left alone because Windows rejects them for device handles) |
+| Decryption of a partition back to a plain filesystem (`vcrs decrypt-in-place V:`) | ✅ (same VHD round trip: the filesystem is mountable by Windows again and `chkdsk` is clean) |
 | In-place encryption of a *system* partition | ⬜ out of scope |
 
 Run `vcrs test` after a fresh build: it exercises the Botan bindings (checksums,
@@ -182,6 +186,15 @@ vcrs encrypt-in-place plain.img --password pw
 vcrs decrypt-in-place secret.vc --password pw
 vcrs decrypt-in-place secret.vc --password pw --resume    # an interrupted run
 
+# The same thing for a whole NTFS partition (VeraCrypt's "encrypt a non-system
+# partition in place", /encdev). device-info only reads: it prints the geometry, the
+# layout that would be created and whether the shrink is possible. Encrypting needs an
+# elevated shell and --yes, and the partition must be NTFS and mounted while it starts.
+vcrs device-info V:
+vcrs encrypt-in-place V: --password pw --yes
+vcrs info V: --password pw                       # an encrypted partition is just a volume
+vcrs decrypt-in-place V: --password pw --yes     # and back to a plain filesystem
+
 # Mount the outer volume, but refuse any write that would destroy the hidden volume inside:
 vcrs mount both.vc --password outer --protect-hidden --hidden-password inner
 ```
@@ -206,7 +219,8 @@ ticked).
 Compatibility is not asserted, it is tested against a real VeraCrypt 1.26.29 install
 (`scripts/vc-crosscheck.ps1`, `scripts/vc-crosscheck2.ps1`, `scripts/vc-hidden-test.ps1`,
 `scripts/vc-iscsi-e2e.ps1`, `scripts/vc-keyfile-test.ps1`, `scripts/vc-inplace-test.ps1`,
-`scripts/vc-header-test.ps1`, `scripts/vc-sector-size-test.ps1`, `scripts/vc-random-source-test.ps1`; everything that mounts with
+`scripts/vc-header-test.ps1`, `scripts/vc-sector-size-test.ps1`, `scripts/vc-random-source-test.ps1`,
+`scripts/device-inplace-test.ps1`; everything that mounts with
 VeraCrypt needs an elevated shell because VeraCrypt mounts through its kernel driver —
 the iSCSI *target* itself needs no administration, only the initiator does).
 
@@ -236,6 +250,8 @@ the iSCSI *target* itself needs no administration, only the initiator does).
 | In-place encryption, interrupted | Stopping after a quarter of the data area leaves only the backup header valid (VeraCrypt's `TC_HEADER_FLAG_NONSYS_INPLACE_ENC` state); a second run resumes from it and the whole data area comes back byte-identical | ✅ (`crates/vcrs-core/tests/in_place.rs`) |
 | In-place encryption → VeraCrypt | A plain FAT16 image (copied out of a VeraCrypt container) plus 128 KiB of zeroes is encrypted in place by vc-rs; real VeraCrypt mounts the result and reads `fromvc.txt`, Windows writes a new file through that mount, and the file survives a remount plus another `vcrs info` | ✅ (`scripts/vc-inplace-test.ps1`, `RESULT: ALL OK`) |
 | In-place decryption → plain image → VeraCrypt again | `vcrs decrypt-in-place` turns that completed in-place container back into a 10223616-byte plain image whose boot sector is `EB 3C 90 "MSDOS5.0"` / `FAT16   `; re-encrypting it produces a container VeraCrypt mounts again, still reading both `fromvc.txt` and the file Windows wrote through the earlier mount | ✅ (same script) |
+| Partition in-place encryption (vc-rs side) | A 512 MiB VHD partition with an NTFS filesystem and three files (one of them 1 MiB of pseudo-random bytes) is encrypted in place: the filesystem is shrunk to 535490560 bytes, the run takes ~90 s, `vcrs read V:` returns the NTFS boot sector of the finished volume and `vcrs info V:` its header, `vcrs decrypt-in-place` takes ~55 s, and afterwards the files are back with identical SHA-256 and `chkdsk /scan` is clean (the partition keeps its 535756800 bytes throughout) | ✅ (`scripts/device-inplace-test.ps1`, `RESULT: ALL OK`; `crates/vcrs-core/tests/in_place.rs` covers the file-level algorithm) |
+| Partition in-place encryption → VeraCrypt | **Not proven on this machine.** The script attempts it, but VeraCrypt cannot mount *anything* here at the moment — not even `testdata/smoke.vc`, a container it mounted earlier the same day — so its own mount of the encrypted partition cannot be judged. The driver is installed and running (`sc query veracrypt`), and a filesystem minifilter of a security product is loaded (`fltmc filters`, driver `sysdiag`), which is the prime suspect. The vc-rs side of the round trip is verified above | ⚠️ blocked by the environment |
 | Hidden-volume protection | Writes overlapping the hidden volume's data area fail (`HiddenVolumeProtected`) and so does every later write (`HiddenVolumeProtectionActive`); the hidden volume's bytes are unchanged and its own password still opens it | ✅ (`crates/vcrs-core/tests/hidden_protection.rs`, `crates/vcrs-mount/tests/iscsi_device.rs`) |
 | Header backup/restore → VeraCrypt | vc-rs writes a header backup, both header groups of the container are zeroed (unopenable), `vcrs restore-headers --from` puts it back, and real VeraCrypt mounts the container and reads the file inside | ✅ (`scripts/vc-header-test.ps1`, `RESULT: ALL OK`) |
 | Restore from the embedded copy | Only the primary header group is zeroed; `restore-headers --embedded` recovers the volume and VeraCrypt mounts it again | ✅ (same script) |
@@ -257,6 +273,10 @@ header and recovers the volume from the backup copy) and
 read with an assertion that no plaintext appears in the container; and the iSCSI device:
 synthetic MBR, partition type/geometry, `raw` mode, read-only, stable disk signature, and
 that writes into the synthetic prefix never reach the container).
+
+The device/partition side cannot live in `cargo test` (it needs administrator rights and a
+real partition), so it is a tracked script instead: `scripts/device-inplace-test.ps1`
+builds its own VHD and runs the whole round trip on it.
 
 ## Mounting (how and why)
 
@@ -420,6 +440,52 @@ with its own switch, `/zinplace` versus `/resumeinplacedec`):
   back as zeroes, exactly as VeraCrypt zeroes from the volume size to the device end — so
   the result is the plain image the encryption started from (its filesystem byte for byte),
   and `vcrs encrypt-in-place` can be run on it again to get a container back.
+
+### Encrypting a whole partition in place (VeraCrypt's `/encdev`)
+
+The file case above becomes a device case with the same algorithm and a good deal of
+Windows plumbing. A partition of `size` bytes gets the layout a container has: a data area
+of `size - 262144` starting at 131072, a backup header group in the last 128 KiB and a
+primary header group at the front. `vcrs device-info <device>` is read-only and answers
+"what is this, would it work, what would be shrunk"; the encryption and decryption are
+the same commands as for a file, with a device path instead:
+
+```bash
+vcrs device-info V:                                  # no elevation needed to look
+vcrs encrypt-in-place V: --password pw --yes         # elevated
+vcrs decrypt-in-place V: --password pw --yes         # elevated
+```
+
+* **NTFS only.** The filesystem has to give up its last 256 KiB, and on Windows only NTFS
+  can be shrunk in place (`FSCTL_SHRINK_VOLUME`); FAT and exFAT have no resize API at all
+  and ext4 has no Windows driver to mount the result with. VeraCrypt's own message says the
+  same: *"Only partitions that contain an NTFS filesystem can be encrypted in place"*.
+  The crypto itself has nothing to do with NTFS — this restriction comes entirely from the
+  shrink.
+* **Elevated, and mounted when it starts.** Raw access to the sectors the filesystem is
+  about to give up needs `FSCTL_ALLOW_EXTENDED_DASD_IO` (the NTFS driver guards them);
+  vc-rs then locks and dismounts the filesystem for the run, exactly like VeraCrypt.
+* If NTFS keeps data in the bytes it has to give up, the shrink is refused; vc-rs reports
+  that and asks for `defrag <drive> /X` instead of moving those clusters itself the way
+  VeraCrypt's `MoveClustersBeforeThreshold` does.
+* The **head of the volume is concealed** for the duration (the first 8192 bytes are XORed
+  with 0xFF, VeraCrypt's `ConcealNTFS`), so Windows sees an invalid filesystem and leaves
+  the volume alone while its data moves. The last chunk undoes it, and a finished run
+  leaves a normal VeraCrypt volume behind.
+* The partition keeps its size (devices are never truncated); when the run finishes, the
+  area from the end of the data area to the end of the device is zeroed and the primary
+  header group is written into the space the data left behind — with the in-place flag
+  still set, which is how VeraCrypt leaves it too.
+* A *system* partition is out of reach: Windows runs from it, so it can neither be
+  shrunk nor locked/dismounted (and system encryption is out of scope anyway).
+
+`scripts/device-inplace-test.ps1` (elevated) is the proof: it builds a throwaway 512 MiB
+VHD with one NTFS partition, writes files into it, encrypts it in place (≈ 90 s for the
+510 MiB data area), reads the finished volume **through the device path** (`vcrs read V:`
+returns `EB 52 90 "NTFS    "`, `vcrs info V:` the header), decrypts it again (≈ 55 s) and
+checks the files, their SHA-256 and `chkdsk`. The script also attempts VeraCrypt's own
+mount of the encrypted partition, but that is reported as `SKIPPED` while this machine
+cannot mount anything through VeraCrypt (see the evidence table).
 
 ### Header backup, restore and rebuilding
 

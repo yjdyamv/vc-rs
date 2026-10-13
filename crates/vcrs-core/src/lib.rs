@@ -12,6 +12,7 @@
 //! | [`random`] | `src/Main/TextUserInterface.cpp` (`--random-source`) |
 //! | [`cipher`] | `src/Volume/Cipher.cpp`, `src/Volume/EncryptionAlgorithm.cpp` |
 //! | [`keyfile`] | `src/Common/Keyfiles.c` |
+//! | [`device`] | `src/Format/InPlace.c` (partition access) |
 //! | [`xts`] | `src/Volume/EncryptionModeXTS.cpp` |
 //! | [`volume`] | `src/Core/VolumeCreator.cpp`, `src/Volume/Volume.cpp` |
 //!
@@ -37,6 +38,7 @@
 //! [Botan]: https://botan.randombit.net/
 
 pub mod cipher;
+pub mod device;
 pub mod error;
 pub mod header;
 pub mod keyfile;
@@ -47,6 +49,7 @@ pub mod volume;
 pub mod xts;
 
 pub use cipher::{CipherId, EncryptionAlgorithm};
+pub use device::{describe, looks_like_device, Device, DeviceInfo, NtfsData, ShrinkProbe};
 pub use error::{Error, Result};
 pub use header::{crc32, VolumeHeader, VolumeType};
 pub use keyfile::apply_keyfiles;
@@ -54,11 +57,13 @@ pub use layout::VolumeLayout;
 pub use prf::Prf;
 pub use random::RandomSupply;
 pub use volume::{
-    backup_headers, decrypt_in_place, decrypt_in_place_stopping_after, encrypt_in_place,
-    encrypt_in_place_stopping_after, looks_quick_formatted, read_header_area, read_header_group,
-    restore_headers, restore_headers_from_embedded, restore_headers_from_master_key, random_bytes,
-    CreateOptions, DecryptOutcome, InPlaceState, OpenOptions, ProtectedRange, RestoreHeaderOptions,
-    Volume, IN_PLACE_CHUNK_SIZE, IN_PLACE_HEADER_UPDATE_INTERVAL, MIN_IN_PLACE_DATA_SIZE,
+    backup_headers, decrypt_device_in_place, decrypt_in_place, decrypt_in_place_stopping_after,
+    encrypt_device_in_place, encrypt_in_place, encrypt_in_place_stopping_after,
+    looks_quick_formatted, read_header_area, read_header_group, restore_headers,
+    restore_headers_from_embedded, restore_headers_from_master_key, random_bytes, CreateOptions,
+    DecryptOutcome, DeviceInPlaceOptions, DeviceInPlaceOutcome, InPlaceState, OpenOptions,
+    ProtectedRange, RestoreHeaderOptions, Volume, IN_PLACE_CHUNK_SIZE,
+    IN_PLACE_HEADER_UPDATE_INTERVAL, MIN_IN_PLACE_DATA_SIZE,
 };
 
 pub use xts::Xts;

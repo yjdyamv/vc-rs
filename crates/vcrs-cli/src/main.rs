@@ -81,6 +81,11 @@ enum Command {
     /// hash, every encryption algorithm and a header round trip. Useful to
     /// confirm a fresh build (and Botan) works before creating a volume.
     Test(TestArgs),
+    /// Describe a partition or volume and whether it can be encrypted in place
+    /// (VeraCrypt's non-system in-place encryption needs a mounted NTFS volume
+    /// whose filesystem can give up its last 128 KiB). Read-only: nothing is
+    /// written, not even with --probe-shrink.
+    DeviceInfo(DeviceInfoArgs),
 }
 
 #[derive(Args)]
@@ -370,6 +375,13 @@ struct EncryptInPlaceArgs {
     /// first; a partition image usually needs `truncate -s -128K` or zeroed
     /// trailing bytes). If the file already contains a container whose in-place
     /// encryption was interrupted, the run resumes instead.
+    ///
+    /// A partition or volume (`E:`, `\\.\HarddiskVolume22`) is encrypted the way
+    /// VeraCrypt's non-system in-place encryption works: the NTFS filesystem is
+    /// shrunk to make room for the header areas and then moved towards the end of
+    /// the device while it is encrypted. This needs an elevated prompt, a mounted
+    /// NTFS volume, and `--yes`; the volume cannot be mounted again until the run
+    /// finishes (an interrupted run is resumed with `--resume`).
     path: PathBuf,
     /// Encryption algorithm for the new volume.
     #[arg(long, default_value = "AES")]
@@ -377,6 +389,14 @@ struct EncryptInPlaceArgs {
     /// Header key derivation function for the new volume.
     #[arg(long, default_value = "SHA-512")]
     prf: String,
+    /// Read the random bytes that build the volume from this file instead of the
+    /// operating system's generator (VeraCrypt's `--random-source`).
+    #[arg(long)]
+    random_source: Option<PathBuf>,
+    /// Confirm that a partition may be transformed in place. Without it a device
+    /// path is only described, never written to; container files ignore this.
+    #[arg(long)]
+    yes: bool,
     #[command(flatten)]
     password: PasswordArgs,
 }
@@ -394,6 +414,10 @@ struct DecryptInPlaceArgs {
     /// by the switch too: `/resumeinplacedec` vs `/zinplace`).
     #[arg(long)]
     resume: bool,
+    /// Confirm that a partition may be transformed in place (a device path is only
+    /// described without it). Container files ignore this.
+    #[arg(long)]
+    yes: bool,
     #[command(flatten)]
     password: PasswordArgs,
 }
@@ -496,6 +520,22 @@ struct ListArgs {
 /// Run the built-in crypto self-test.
 #[derive(Args)]
 struct TestArgs {}
+
+/// Arguments of `vcrs device-info`.
+#[derive(Args)]
+struct DeviceInfoArgs {
+    /// Partition or volume to describe: a drive letter (`E:`) or a device like
+    /// `\\.\PhysicalDrive1\Partition2`. Reading a device needs an elevated
+    /// prompt.
+    device: PathBuf,
+    /// Also ask NTFS whether it could give up its tail right now (VeraCrypt's
+    /// `FSCTL_SHRINK_VOLUME` in `ShrinkPrepare` mode, immediately undone with
+    /// `ShrinkAbort`). Nothing is written and the filesystem is not resized; it
+    /// answers the question that otherwise only shows up half way through the
+    /// encryption. Leave it off if the volume is in use.
+    #[arg(long)]
+    probe_shrink: bool,
+}
 
 /// Selects which volume of a container to address.
 #[derive(Args, Clone, Copy, Default)]
@@ -861,6 +901,9 @@ fn run() -> Result<()> {
                 .with_context(|| format!("unknown encryption algorithm {:?}", a.ea))?;
             let prf = Prf::from_name(&a.prf)
                 .with_context(|| format!("unknown PRF {:?}", a.prf))?;
+            if vcrs_core::looks_like_device(&a.path) {
+                return encrypt_device(&a, ea, prf);
+            }
             // Build the options once: `--password-stdin` can only be read once.
             let options = a.password.open_options(None, false)?;
             let password = options.effective_password(Some(&a.path))?;
@@ -901,6 +944,9 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::DecryptInPlace(a) => {
+            if vcrs_core::looks_like_device(&a.path) {
+                return decrypt_device(&a);
+            }
             // Build the options once: `--password-stdin` can only be read once.
             let options = a.password.open_options(None, false)?;
             let password = options.effective_password(Some(&a.path))?;
@@ -986,6 +1032,7 @@ fn run() -> Result<()> {
         Command::CreateKeyfile(a) => create_keyfile(&a),
         Command::List(a) => list_mounts(&a),
         Command::Test(_) => self_test(),
+        Command::DeviceInfo(a) => device_info(&a),
         Command::Mount(a) => {
             let options = a.password.open_options(a.kind.volume_type(), false)?;
 
@@ -1034,6 +1081,167 @@ const KEYFILE_SIZE: usize = 128;
 /// The IQN prefix `vcrs mount` uses for the targets it serves.
 #[cfg(any(windows, test))]
 const VCRS_IQN_PREFIX: &str = "iqn.2025-12.io.vcrs:";
+
+/// Prints what an in-place transformation of a partition is about to do (and,
+/// without `--yes`, is all that happens).
+fn describe_device(device: &vcrs_core::Device, action: &str) -> Result<()> {
+    let info = device.info();
+    println!("{action} {}", info.path.display());
+    println!("  size            {} ({} bytes)", human_size(info.size), info.size);
+    println!("  sector size     {}", info.sector_size);
+    match (info.partition_style.as_deref(), info.partition_number) {
+        (Some(style), Some(number)) => println!("  partition       {style} partition {number}"),
+        _ => println!("  partition       (no partition table found)"),
+    }
+    println!(
+        "  filesystem      {}",
+        info.boot_sector_fs.as_deref().unwrap_or("nothing recognisable")
+    );
+    if let Some(ntfs) = &info.ntfs {
+        println!(
+            "  filesystem size {} ({} bytes), {} free",
+            human_size(ntfs.filesystem_size()),
+            ntfs.filesystem_size(),
+            human_size(ntfs.free_bytes())
+        );
+    }
+    println!(
+        "  data area       {} ({} bytes), from offset {} to {}",
+        human_size(info.data_area_size()),
+        info.data_area_size(),
+        vcrs_core::header::VOLUME_HEADER_GROUP_SIZE,
+        info.data_area_size() + vcrs_core::header::VOLUME_HEADER_GROUP_SIZE
+    );
+    println!(
+        "  backup header   at offset {} ({})",
+        info.backup_header_offset(),
+        human_size(info.backup_header_offset())
+    );
+    Ok(())
+}
+
+/// `vcrs encrypt-in-place <partition>`: VeraCrypt's non-system in-place
+/// encryption, driven against a real partition instead of a container file.
+fn encrypt_device(a: &EncryptInPlaceArgs, ea: EncryptionAlgorithm, prf: Prf) -> Result<()> {
+    let device = vcrs_core::Device::open(&a.path, true).with_context(|| {
+        format!(
+            "opening {} (a partition needs an elevated prompt)",
+            a.path.display()
+        )
+    })?;
+    describe_device(&device, "will encrypt")?;
+    let info = device.info().clone();
+    if let Some(reason) = info.blocker() {
+        bail!("cannot encrypt {} in place: {reason}", info.path.display());
+    }
+    if !a.yes {
+        bail!(
+            "pass --yes to encrypt {} in place: this rewrites the partition's filesystem, and the \
+             volume cannot be mounted again until the run finishes (an interrupted run is resumed \
+             by running the same command again)",
+            info.path.display()
+        );
+    }
+    let options = vcrs_core::DeviceInPlaceOptions {
+        password: a.password.read()?,
+        keyfiles: a.password.keyfiles.clone(),
+        pim: a.password.pim,
+        ea,
+        prf,
+        random_source: a.random_source.clone(),
+    };
+    println!(
+        "encrypting {} in place ({} byte data area): the run can be interrupted and resumed",
+        info.path.display(),
+        info.data_area_size()
+    );
+    let started = std::time::Instant::now();
+    let outcome = vcrs_core::encrypt_device_in_place(&device, &options, None)?;
+    let elapsed = started.elapsed();
+    if outcome.finished {
+        println!(
+            "encrypted {} in place in {:.1}s",
+            info.path.display(),
+            elapsed.as_secs_f64()
+        );
+        println!(
+            "  {}: {} byte data area, a VeraCrypt volume on a partition",
+            ea, outcome.data_size
+        );
+        println!(
+            "  mount it with VeraCrypt: `vcrs mount` serves *containers* over iSCSI, a bare \
+             partition needs a filesystem driver"
+        );
+    } else {
+        println!(
+            "paused: {} of {} bytes encrypted ({:.1}%) in {:.1}s",
+            outcome.transformed,
+            outcome.total,
+            outcome.progress() * 100.0,
+            elapsed.as_secs_f64()
+        );
+        println!(
+            "  {} bytes are still plaintext; continue by running the same command again",
+            outcome.total - outcome.transformed
+        );
+    }
+    Ok(())
+}
+
+/// `vcrs decrypt-in-place <partition>`: the mirror of [`encrypt_device`].
+fn decrypt_device(a: &DecryptInPlaceArgs) -> Result<()> {
+    let device = vcrs_core::Device::open(&a.path, true).with_context(|| {
+        format!(
+            "opening {} (a partition needs an elevated prompt)",
+            a.path.display()
+        )
+    })?;
+    describe_device(&device, "will decrypt")?;
+    let info = device.info().clone();
+    if !a.yes {
+        bail!(
+            "pass --yes to decrypt {} in place: this rewrites the partition",
+            info.path.display()
+        );
+    }
+    let options = vcrs_core::DeviceInPlaceOptions {
+        password: a.password.read()?,
+        keyfiles: a.password.keyfiles.clone(),
+        pim: a.password.pim,
+        // Discovered from the volume's own header while it opens.
+        ea: EncryptionAlgorithm::Aes,
+        prf: Prf::Sha512,
+        random_source: None,
+    };
+    let started = std::time::Instant::now();
+    let outcome = vcrs_core::decrypt_device_in_place(&device, &options, a.resume, None)?;
+    let elapsed = started.elapsed();
+    if outcome.finished {
+        println!(
+            "decrypted {} in place in {:.1}s",
+            info.path.display(),
+            elapsed.as_secs_f64()
+        );
+        println!(
+            "  the partition holds a plain {} byte filesystem again (Windows mounts it directly; \
+             the device kept its {} bytes)",
+            outcome.data_size, outcome.device_size
+        );
+    } else {
+        println!(
+            "paused: {} of {} bytes decrypted ({:.1}%) in {:.1}s",
+            outcome.transformed,
+            outcome.total,
+            outcome.progress() * 100.0,
+            elapsed.as_secs_f64()
+        );
+        println!(
+            "  continue with `vcrs decrypt-in-place {} --resume --yes`",
+            info.path.display()
+        );
+    }
+    Ok(())
+}
 
 /// Write a keyfile. The bytes are random (or taken from `--random-source`,
 /// which is what makes keyfile creation reproducible in tests).
@@ -1195,6 +1403,119 @@ fn list_mounts(a: &ListArgs) -> Result<()> {
 /// Exercise everything the crypto backend has to get right, without touching a
 /// volume. The CRC-32 value is VeraCrypt's own self-test value, so a mismatch
 /// means the format's checksums would not be accepted by VeraCrypt either.
+/// `vcrs device-info`: describe a partition or volume and whether VeraCrypt-style
+/// in-place encryption could run on it. Read-only (the optional shrink probe
+/// only asks the filesystem a question and immediately withdraws it).
+fn device_info(a: &DeviceInfoArgs) -> Result<()> {
+    // The shrink probe is a filesystem control code, which needs a handle with
+    // write access; without the probe a read-only handle is enough.
+    let device = vcrs_core::Device::open(&a.device, a.probe_shrink)?;
+    let info = device.info().clone();
+
+    println!("device            {}", info.path.display());
+    if let Some(path) = &info.volume_path {
+        println!("volume path       {}", path.display());
+    }
+    println!("size              {} ({} bytes)", human_size(info.size), info.size);
+    println!("sector size       {}", info.sector_size);
+    match (info.partition_style.as_deref(), info.partition_number) {
+        (Some(style), Some(number)) => println!("partition         {style} partition {number}"),
+        _ => println!("partition         (no partition table found)"),
+    }
+    println!(
+        "service partition {}",
+        if info.is_service_partition { "yes" } else { "no" }
+    );
+    println!(
+        "system volume     {}",
+        if info.is_system_volume { "yes" } else { "no" }
+    );
+    println!(
+        "filesystem        {}",
+        info.boot_sector_fs.as_deref().unwrap_or("nothing recognisable")
+    );
+    if let Some(ntfs) = &info.ntfs {
+        println!("ntfs serial       0x{:08x}", ntfs.serial);
+        println!(
+            "filesystem size   {} ({} bytes)",
+            human_size(ntfs.filesystem_size()),
+            ntfs.filesystem_size()
+        );
+        println!(
+            "cluster size      {} bytes ({} clusters, {} free)",
+            ntfs.bytes_per_cluster,
+            ntfs.total_clusters,
+            ntfs.free_clusters
+        );
+        println!(
+            "free space        {} ({} bytes)",
+            human_size(ntfs.free_bytes()),
+            ntfs.free_bytes()
+        );
+    }
+
+    println!();
+    println!("a VeraCrypt volume covering this device would have");
+    println!(
+        "  data area       {} ({} bytes), from offset {} to {}",
+        human_size(info.data_area_size()),
+        info.data_area_size(),
+        vcrs_core::header::VOLUME_HEADER_GROUP_SIZE,
+        info.data_area_size() + vcrs_core::header::VOLUME_HEADER_GROUP_SIZE
+    );
+    println!(
+        "  primary header  offset 0, backup header group at {} ({})",
+        info.backup_header_offset(),
+        human_size(info.backup_header_offset())
+    );
+    println!(
+        "  minimum size    {} ({} bytes)",
+        human_size(vcrs_core::device::MIN_DEVICE_SIZE),
+        vcrs_core::device::MIN_DEVICE_SIZE
+    );
+
+    println!();
+    match info.blocker() {
+        None => {
+            println!("in-place encryption: possible");
+            let shrink = info.shrink_bytes();
+            if shrink > 0 {
+                println!(
+                    "  the filesystem has to give up its last {} bytes ({}) first",
+                    shrink,
+                    human_size(shrink)
+                );
+            } else {
+                println!("  the filesystem already ends before the header area");
+            }
+        }
+        Some(reason) => {
+            println!("in-place encryption: not possible");
+            println!("  {reason}");
+        }
+    }
+
+    if a.probe_shrink {
+        println!();
+        if info.ntfs.is_none() {
+            println!("shrink probe: skipped (the filesystem is not NTFS)");
+            return Ok(());
+        }
+        match device.probe_shrink(info.data_area_size()) {
+            Ok(vcrs_core::ShrinkProbe::Ready) => println!(
+                "shrink probe: NTFS can give up its tail right now (no clusters would have to move)"
+            ),
+            Ok(vcrs_core::ShrinkProbe::NeedsClusterMove) => println!(
+                "shrink probe: clusters are allocated in the tail; they would have to be moved \
+                 (VeraCrypt does that, or `defrag <drive> /X` before the run)"
+            ),
+            Err(e) => println!("shrink probe: could not be run ({e})"),
+        }
+    }
+
+    Ok(())
+}
+
 fn self_test() -> Result<()> {
     use vcrs_core::prf::{argon2_params, HEADER_KEY_SIZE, SALT_SIZE};
 
