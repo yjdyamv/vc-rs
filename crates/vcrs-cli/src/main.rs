@@ -38,7 +38,8 @@ enum Command {
     Write(WriteArgs),
     /// Create a FAT filesystem inside an existing volume's data area.
     Format(FormatArgs),
-    /// Mount a volume's filesystem at a drive letter (Dokany; needs elevation).
+    /// Mount a volume: as a filesystem at a drive letter (Dokany), or with
+    /// `--raw` as a block device served over a built-in iSCSI target.
     Mount(MountArgs),
     /// Unmount a drive letter mounted with `vcrs mount`.
     Dismount(DismountArgs),
@@ -135,7 +136,19 @@ struct MountArgs {
     path: PathBuf,
     /// Drive letter (e.g. `Z:`) or an empty existing directory.
     #[arg(short, long)]
-    mount_point: String,
+    mount_point: Option<String>,
+    /// Expose the volume as a raw block device through a built-in iSCSI target
+    /// instead of a Dokany filesystem. Optional value: `partition` (default;
+    /// a synthetic MBR, so Windows can mount and format the disk) or `raw`
+    /// (the data area starts at LBA 0).
+    #[arg(long, alias = "iscsi", value_name = "MODE", num_args = 0..=1, default_missing_value = "partition")]
+    raw: Option<String>,
+    /// Address the iSCSI target listens on (default `127.0.0.1:3260`).
+    #[arg(long, value_name = "ADDR")]
+    bind: Option<String>,
+    /// IQN the iSCSI target is published under.
+    #[arg(long, value_name = "IQN")]
+    target_name: Option<String>,
     /// Refuse all writes.
     #[arg(long)]
     read_only: bool,
@@ -148,7 +161,11 @@ struct MountArgs {
 #[derive(Args)]
 struct DismountArgs {
     /// Drive letter or mount point directory used by `vcrs mount`.
-    mount_point: String,
+    mount_point: Option<String>,
+    /// Log out of the iSCSI target started by `vcrs mount --raw` (value: the
+    /// target IQN; defaults to the one `vcrs mount` publishes).
+    #[arg(long, value_name = "IQN", num_args = 0..=1, default_missing_value = "iqn.2025-12.io.vcrs:volume")]
+    iscsi: Option<String>,
 }
 
 /// Selects which volume of a container to address.
@@ -349,6 +366,29 @@ fn run() -> Result<()> {
                 volume_type: a.kind.volume_type(),
                 ..Default::default()
             };
+
+            if let Some(mode) = &a.raw {
+                let disk_mode = vcrs_mount::DiskMode::from_name(mode).with_context(|| {
+                    format!("unknown disk mode {mode:?}; expected `partition` or `raw`")
+                })?;
+                let mut iscsi = vcrs_mount::IscsiMountOptions::for_volume(&a.path);
+                iscsi.disk_mode = disk_mode;
+                iscsi.read_only = a.read_only;
+                if let Some(bind) = &a.bind {
+                    iscsi.bind_addr = bind.clone();
+                }
+                if let Some(name) = &a.target_name {
+                    iscsi.target_name = name.clone();
+                }
+                vcrs_mount::mount_iscsi(&a.path, &options, &iscsi)?;
+                println!("iSCSI target stopped");
+                return Ok(());
+            }
+
+            let mount_point = a
+                .mount_point
+                .as_deref()
+                .context("`--mount-point` is required unless `--raw` (iSCSI) is used")?;
             let mount_options = vcrs_mount::MountOptions {
                 read_only: a.read_only,
                 ..Default::default()
@@ -356,24 +396,108 @@ fn run() -> Result<()> {
             println!(
                 "mounting {} at {}{} — press Ctrl-C or run `vcrs dismount {}` to stop",
                 a.path.display(),
-                a.mount_point,
+                mount_point,
                 if a.read_only { " (read-only)" } else { "" },
-                a.mount_point
+                mount_point
             );
-            vcrs_mount::mount(&a.path, &a.mount_point, &options, &mount_options)?;
-            println!("{} has been unmounted", a.mount_point);
+            vcrs_mount::mount(&a.path, mount_point, &options, &mount_options)?;
+            println!("{mount_point} has been unmounted");
             Ok(())
         }
         Command::Dismount(a) => {
-            vcrs_mount::unmount(&a.mount_point)?;
-            println!("unmounted {}", a.mount_point);
+            if let Some(iqn) = &a.iscsi {
+                iscsi_logout(iqn)?;
+                return Ok(());
+            }
+            let mount_point = a
+                .mount_point
+                .as_deref()
+                .context("`vcrs dismount` needs a mount point, or `--iscsi <IQN>`")?;
+            vcrs_mount::unmount(mount_point)?;
+            println!("unmounted {mount_point}");
             Ok(())
         }
     }
 }
 
-fn open_ro(path: &Path, password: Vec<u8>, pim: i32, volume_type: Option<VolumeType>) -> Result<Volume> {
-    Volume::open(
+/// Detach a target from the Microsoft iSCSI Initiator (needs an elevated prompt).
+///
+/// The initiator identifies a login by its *session id*, not by the target name,
+/// so the session list has to be parsed: `LogoutTarget` only accepts a session
+/// id and `QLogoutTarget` does not exist.  A session whose disk Windows is still
+/// using cannot be logged out at all ("the session cannot be logged out since a
+/// device on that session is currently being used"), so the drive letters are
+/// removed and the disk taken offline first.
+fn iscsi_logout(iqn: &str) -> Result<()> {
+    println!("detaching the iSCSI target {iqn}");
+    #[cfg(windows)]
+    {
+        // 1. release the volume: drop drive letters, then take the disk offline.
+        let release = "Get-Disk | Where-Object { $_.FriendlyName -like '*VeraCrypt volume*' } | ForEach-Object { \
+             Get-Partition -DiskNumber $_.Number -ErrorAction SilentlyContinue | \
+             Where-Object { $_.DriveLetter } | ForEach-Object { \
+                 Remove-PartitionAccessPath -DiskNumber $_.DiskNumber -PartitionNumber $_.PartitionNumber \
+                     -AccessPath ($_.DriveLetter + ':\') -ErrorAction SilentlyContinue }; \
+             Set-Disk -Number $_.Number -IsOffline $true -ErrorAction SilentlyContinue }";
+        run_tool("releasing the disk", "powershell", &["-NoProfile", "-Command", release]);
+
+        // 2. log the session out, then 3. forget the static target.
+        match std::process::Command::new("iscsicli").arg("SessionList").arg("1").output() {
+            Ok(out) => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                match session_id_for_target(&text, iqn) {
+                    Some(id) => run_tool(
+                        "LogoutTarget",
+                        "iscsicli",
+                        &["LogoutTarget", id.as_str()],
+                    ),
+                    None => println!("  no session for {iqn} (already logged out?)"),
+                }
+            }
+            Err(err) => {
+                println!("  iscsicli SessionList: {err}");
+                println!("  (the Microsoft iSCSI Initiator needs an elevated prompt)");
+            }
+        }
+        run_tool("RemoveTarget", "iscsicli", &["RemoveTarget", iqn]);
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = iqn;
+        bail!("the iSCSI initiator is only available on Windows")
+    }
+}
+
+/// Run a helper program and report the outcome without failing the run.
+#[cfg(windows)]
+fn run_tool(what: &str, program: &str, args: &[&str]) {
+    match std::process::Command::new(program).args(args).status() {
+        Ok(status) if status.success() => println!("  {what}: ok"),
+        Ok(status) => println!("  {what}: exited with {status}"),
+        Err(err) => println!("  {what}: {err}"),
+    }
+}
+
+/// Pick the session id that belongs to `iqn` out of `iscsicli SessionList 1`.
+#[cfg(any(windows, test))]
+fn session_id_for_target(list: &str, iqn: &str) -> Option<String> {
+    let mut current: Option<String> = None;
+    for line in list.lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            let key = key.trim();
+            let value = value.trim();
+            if key.eq_ignore_ascii_case("Session Id") && !value.is_empty() {
+                current = Some(value.to_string());
+            } else if key.eq_ignore_ascii_case("Target Name") && value == iqn {
+                return current;
+            }
+        }
+    }
+    None
+}
+
+fn open_ro(path: &Path, password: Vec<u8>, pim: i32, volume_type: Option<VolumeType>) -> Result<Volume> {    Volume::open(
         path,
         &OpenOptions {
             password,
@@ -495,4 +619,27 @@ fn hex(data: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_id_for_target;
+
+    #[test]
+    fn finds_the_session_id_for_a_target() {
+        // Trimmed-down `iscsicli SessionList 1` output from a real run.
+        let list = "Microsoft iSCSI Initiator Version 10.0 Build 26300\n\
+                    Total of 1 sessions\n\
+                    Session Id             : ffffe68332afe010-4000013700000006\n\
+                    Initiator Node Name    : iqn.1991-05.com.microsoft:desktop-985akhr\n\
+                    Target Node Name       : (null)\n\
+                    Target Name            : iqn.2025-12.io.vcrs:probe\n\
+                    ISID                   : 40 00 01 37 00 00\n";
+        assert_eq!(
+            session_id_for_target(list, "iqn.2025-12.io.vcrs:probe").as_deref(),
+            Some("ffffe68332afe010-4000013700000006")
+        );
+        assert_eq!(session_id_for_target(list, "iqn.other:target"), None);
+        assert_eq!(session_id_for_target("", "iqn.2025-12.io.vcrs:probe"), None);
+    }
 }

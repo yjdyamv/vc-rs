@@ -132,3 +132,19 @@ request through a named pipe specified with `-f`”，参考实现是仓库里�
   <https://github.com/LTRData/ImDisk>（`devio/devio.c`）
 * 只读 NTFS 库：<https://github.com/ColinFinck/ntfs>、
   <https://github.com/SecurityRonin/ntfs-forensic>
+
+## 实施状态（更新）
+
+方案 A **已实现并验证**，实现在 `crates/vcrs-mount/src/iscsi.rs`（`vcrs mount --raw`），
+`iscsi-target` 1.0.0 以 `vendor/iscsi-target` 打补丁形式引入（补丁说明见
+`vendor/iscsi-target/PATCHES.md`：补齐 Data-In 的 residual underflow/overflow 标志与
+Residual Count，并把 SCSI response/status 从 `specific[]` 挪到真正的 BHS 字节 2/3）。
+
+验收：`scripts/vc-iscsi-e2e.ps1`（提权）——vc-rs 建卷 → `--raw` 暴露裸盘 →
+Microsoft 发起程序登录（静态目标：`iscsicli AddTarget` + `QLoginTarget`）→ Windows 在
+该磁盘上格式化 NTFS → 写入文本、子目录文件与 1 MiB 随机文件（比对 SHA-256）→ 卸载 →
+真实 VeraCrypt 挂载同一容器并读回全部文件 → `RESULT: ALL OK`。
+
+已知限制：`QAddTargetPortal`（门户扫描）走的是 discovery 会话，上游状态机无法完成
+Microsoft 发起程序的多 PDU 登录，因此必须使用静态目标 + `QLoginTarget`；方案 C（Dokany
+内的用户态 NTFS）仍未实现（NTFS 只有只读库），方案 B（ImDisk proxy）未安装、未验证。

@@ -1,0 +1,742 @@
+//! Present a decrypted volume as a real *block device* over iSCSI.
+//!
+//! Dokany can only ever present a **filesystem**, so the mount layer has to
+//! implement one in user mode (it does: FAT via `fatfs`). That covers FAT
+//! containers, but not the NTFS/exFAT/ReFS containers a VeraCrypt user is most
+//! likely to have.
+//!
+//! iSCSI solves that with no kernel driver of our own: this module serves the
+//! decrypted sectors over a loopback TCP socket and Windows' built-in Microsoft
+//! iSCSI Initiator attaches them as an ordinary disk, so **Windows' own signed
+//! NTFS/exFAT drivers** do the filesystem work. Reading *and* writing NTFS, and
+//! formatting the volume from Disk Management, come for free.
+//!
+//! ```text
+//!   Windows (ntfs.sys / fastfat.sys)
+//!        v
+//!   disk.sys + Microsoft iSCSI Initiator (in-box, signed)
+//!        v   iSCSI over 127.0.0.1:3260
+//!   IscsiServer (iscsi-target crate) -> ScsiVolume (this module)
+//!        v
+//!   DataArea: Volume::read_data / write_data  (XTS decryption)
+//! ```
+//!
+//! # The partition-table problem, and why it is solved with a synthetic MBR
+//!
+//! VeraCrypt file containers do not hold a disk image: the filesystem starts at
+//! the very first byte of the encrypted data area (VeraCrypt presents a
+//! *volume*, not a disk). Windows, however, only mounts a filesystem that sits
+//! inside a **partition** of a fixed disk -- an unpartitioned disk is shown as
+//! "not initialized" and cannot be mounted or formatted.
+//!
+//! [`DiskMode::Partitioned`] (the default) bridges the two: the SCSI device
+//! reports a disk that is one MiB larger than the data area and serves a
+//! **synthetic MBR** at LBA 0 which describes the data area as its single
+//! primary partition. The MBR is generated on the fly and *never written to the
+//! container*, so:
+//!
+//! * Windows sees a normal partitioned disk, finds the filesystem inside the
+//!   partition (or lets the user format one) and uses its own drivers;
+//! * the container keeps the VeraCrypt layout -- a bare filesystem at data
+//!   offset 0 -- so real VeraCrypt mounts exactly the same volume;
+//! * writes into the synthetic MiB (including a disk signature or partition
+//!   table rewrite Windows may attempt) are absorbed in memory, so nothing can
+//!   corrupt the container's header groups or shift the filesystem.
+//!
+//! [`DiskMode::Raw`] exposes the bare data area instead, which is what non
+//! Windows initiators (and tests) want.
+//!
+//! # What the `iscsi-target` crate can and cannot do with the Microsoft initiator
+//!
+//! Verified against Windows 11 (initiator build 26300) with the target side
+//! traced via `RUST_LOG=iscsi_target=debug`:
+//!
+//! * A **static target** works: `iscsicli AddTarget` + `iscsicli QLoginTarget`
+//!   makes Windows perform the full three-PDU login sequence (`Free ->
+//!   SecurityNegotiation -> LoginOperationalNegotiation -> FullFeaturePhase`)
+//!   and then issue SCSI commands. This is the flow [`mount_iscsi`] documents.
+//! * Discovery does **not** work: for `iscsicli QAddTargetPortal` Windows opens a
+//!   `SessionType=Discovery` login, which the crate routes to
+//!   `handle_discovery_session` -- and that function processes only the *first*
+//!   login PDU before waiting for a `SendTargets` text request, so the
+//!   initiator's next login PDU is answered with "Unexpected opcode during
+//!   discovery: 0x03" and the portal scan fails with "Target Error".
+//! * CRC32C digests are half-implemented: the multi-target server negotiates the
+//!   initiator's `HeaderDigest`/`DataDigest` offer, but its write path calls the
+//!   digest-less `write_pdu`, so an initiator that asks for CRC32C (the crate's
+//!   own client does) sees a digest mismatch on the first response. Windows
+//!   offers `None` unless the user turns digests on, and `iscsicli AddTarget ...
+//!   0 0` keeps them off, which is why the static-target flow is unaffected.
+//!
+//! Both are upstream bugs, not ours, and they are why `vcrs-mount`'s tests drive
+//! [`ScsiVolume`]'s SCSI interface directly instead of talking iSCSI to itself.
+
+use std::{
+    fmt, io,
+    net::TcpStream,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+use iscsi_target::{IscsiError, IscsiServer, ScsiBlockDevice, ScsiResult};
+use vcrs_core::volume::{OpenOptions, Volume};
+
+use crate::device::{DataArea, SECTOR_SIZE};
+use crate::{Error, Result};
+
+/// The well-known iSCSI port.
+pub const ISCSI_PORT: u16 = 3260;
+
+/// Default target name (an IQN is required by the initiator).
+pub const DEFAULT_TARGET_NAME: &str = "iqn.2025-12.io.vcrs:volume";
+
+/// Start LBA of the synthetic partition: the conventional 1 MiB alignment, which
+/// keeps every filesystem happy (and matches what Windows itself uses).
+pub const DEFAULT_PARTITION_START_LBA: u64 = 2048;
+
+/// How the volume's data area is presented to the initiator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiskMode {
+    /// Present a synthetic MBR in front of the data area (default, Windows).
+    #[default]
+    Partitioned,
+    /// Present the bare data area; LBA 0 is the container's first data sector.
+    Raw,
+}
+
+impl DiskMode {
+    /// Parse a `--disk-mode` value.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "partition" | "partitioned" | "mbr" | "disk" => Some(DiskMode::Partitioned),
+            "raw" | "superfloppy" | "floppy" => Some(DiskMode::Raw),
+            _ => None,
+        }
+    }
+
+    /// Name as accepted by [`DiskMode::from_name`].
+    pub fn name(self) -> &'static str {
+        match self {
+            DiskMode::Partitioned => "partition",
+            DiskMode::Raw => "raw",
+        }
+    }
+}
+
+/// How [`mount_iscsi`] (and [`IscsiMount::start`]) serve the volume.
+#[derive(Debug, Clone)]
+pub struct IscsiMountOptions {
+    /// Address to listen on. Keep it on the loopback interface: the target has
+    /// no authentication and serves decrypted data.
+    pub bind_addr: String,
+    /// IQN of the served target, as typed into `iscsicli`.
+    pub target_name: String,
+    /// Refuse writes (the initiator sees a write-protected disk).
+    pub read_only: bool,
+    /// See [`DiskMode`].
+    pub disk_mode: DiskMode,
+    /// First LBA of the synthetic partition (1 MiB by default).
+    pub partition_start_lba: u64,
+}
+
+impl Default for IscsiMountOptions {
+    fn default() -> Self {
+        IscsiMountOptions {
+            bind_addr: format!("127.0.0.1:{ISCSI_PORT}"),
+            target_name: DEFAULT_TARGET_NAME.to_string(),
+            read_only: false,
+            disk_mode: DiskMode::default(),
+            partition_start_lba: DEFAULT_PARTITION_START_LBA,
+        }
+    }
+}
+
+impl IscsiMountOptions {
+    /// The default options, with the target name derived from a container path
+    /// so that several volumes can be served at once without name clashes.
+    pub fn for_volume(path: &Path) -> Self {
+        let mut opts = IscsiMountOptions::default();
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            let sanitised: String = stem
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .collect();
+            if !sanitised.is_empty() {
+                opts.target_name = format!("iqn.2025-12.io.vcrs:{sanitised}");
+            }
+        }
+        opts
+    }
+}
+
+/// Turns an iSCSI layer failure into a `vcrs-core` error.
+fn to_core(err: IscsiError) -> Error {
+    Error::Io(io::Error::new(io::ErrorKind::Other, format!("iSCSI: {err}")))
+}
+
+/// Turns a device failure into the error the SCSI layer expects. `read`/`write`
+/// failures are reported to the initiator as a medium error.
+fn dev_err(message: impl fmt::Display) -> IscsiError {
+    IscsiError::Scsi(message.to_string())
+}
+
+/// A SCSI block device backed by a volume's decrypted data area.
+///
+/// All offsets are relative to the **start of the data area**, exactly like
+/// [`DataArea`], so the SCSI layer, the FAT filesystem and future backends all
+/// share one definition of "sector 0".
+pub struct ScsiVolume<A: DataArea = Volume> {
+    area: A,
+    read_only: bool,
+    block_size: u32,
+    /// Synthetic bytes in front of the data area (`DiskMode::Partitioned`), i.e.
+    /// the MBR and the padding up to the first partition. Never persisted.
+    prefix: Vec<u8>,
+    /// Capacity of the presented disk in blocks of `block_size`.
+    capacity: u64,
+    /// Whether a write into the synthetic region has been logged already.
+    warned_prefix_write: bool,
+}
+
+impl ScsiVolume<Volume> {
+    /// Open `path` and serve it according to `opts`.
+    pub fn open(path: &Path, open: &OpenOptions, opts: &IscsiMountOptions) -> Result<Self> {
+        let volume = Volume::open(path, open)?;
+        // A stable, non-zero disk signature: Windows keeps track of disks by it,
+        // and deriving it from the container's header salt means it does not
+        // change between sessions (and differs between containers).
+        let salt = &volume.header.salt;
+        let signature = u32::from_le_bytes([salt[0], salt[1], salt[2], salt[3]]) | 0x8000_0000;
+        Self::with_signature(volume, opts, signature)
+    }
+}
+
+impl<A: DataArea> ScsiVolume<A> {
+    /// Serve an arbitrary data area (used by the tests and by future backends).
+    pub fn with_signature(area: A, opts: &IscsiMountOptions, disk_signature: u32) -> Result<Self> {
+        let block_size = area.sector_size().max(SECTOR_SIZE as u32);
+        if block_size as usize % SECTOR_SIZE != 0 {
+            return Err(Error::InvalidParameter(format!(
+                "the volume's {block_size}-byte sectors are not a multiple of {SECTOR_SIZE}"
+            )));
+        }
+        let data_len = area.len();
+        if data_len % block_size as u64 != 0 {
+            return Err(Error::InvalidParameter(format!(
+                "the data area ({data_len} bytes) is not a multiple of the {block_size}-byte sector size"
+            )));
+        }
+        let blocks = data_len / block_size as u64;
+
+        let (prefix, capacity) = match opts.disk_mode {
+            DiskMode::Raw => (Vec::new(), blocks),
+            DiskMode::Partitioned => {
+                let start = opts.partition_start_lba.max(1);
+                if start > u32::MAX as u64 {
+                    return Err(Error::InvalidParameter(
+                        "the synthetic partition start must fit in an MBR entry".to_string(),
+                    ));
+                }
+                if blocks > u32::MAX as u64 {
+                    return Err(Error::InvalidParameter(format!(
+                        "the data area holds {blocks} sectors; MBR partitioning tops out at {}",
+                        u32::MAX
+                    )));
+                }
+                // What kind of filesystem is inside? It only decides the MBR
+                // partition type byte, which Windows uses as a hint.
+                let mut vbr = vec![0u8; block_size.min(512) as usize];
+                let fs_type = match area.read_at(0, &mut vbr) {
+                    Ok(()) => detect_partition_type(&vbr),
+                    Err(_) => partition_type::NTFS,
+                };
+                let mut prefix = vec![0u8; (start * block_size as u64) as usize];
+                let mbr = build_mbr(fs_type, start, blocks, disk_signature);
+                prefix[..mbr.len()].copy_from_slice(&mbr);
+                (prefix, start + blocks)
+            }
+        };
+
+        Ok(ScsiVolume {
+            area,
+            read_only: opts.read_only,
+            block_size,
+            prefix,
+            capacity,
+            warned_prefix_write: false,
+        })
+    }
+
+    /// Size of the presented disk in bytes.
+    pub fn disk_size(&self) -> u64 {
+        self.capacity * self.block_size as u64
+    }
+
+    /// Length of the encrypted data area in bytes.
+    pub fn data_size(&self) -> u64 {
+        self.area.len()
+    }
+
+    /// First LBA that maps into the container's data area.
+    pub fn data_start_lba(&self) -> u64 {
+        self.prefix.len() as u64 / self.block_size as u64
+    }
+
+    /// Borrow the underlying data area.
+    pub fn area(&self) -> &A {
+        &self.area
+    }
+
+    /// Split `[offset, offset+len)` into the part that lands in the synthetic
+    /// prefix and the part that maps into the data area.
+    fn split(&self, offset: u64, len: usize) -> (usize, u64, usize) {
+        let prefix_len = self.prefix.len() as u64;
+        if offset >= prefix_len {
+            (0, offset - prefix_len, len)
+        } else {
+            let in_prefix = (prefix_len - offset).min(len as u64) as usize;
+            (in_prefix, 0, len - in_prefix)
+        }
+    }
+
+    fn read_into(&self, offset: u64, buf: &mut [u8]) -> ScsiResult<()> {
+        let (prefix_part, data_offset, data_part) = self.split(offset, buf.len());
+        if prefix_part > 0 {
+            let begin = offset as usize;
+            buf[..prefix_part].copy_from_slice(&self.prefix[begin..begin + prefix_part]);
+        }
+        if data_part > 0 {
+            self.area
+                .read_at(data_offset, &mut buf[prefix_part..])
+                .map_err(|err| dev_err(format!("reading {data_part} bytes at offset {data_offset}: {err}")))?;
+        }
+        Ok(())
+    }
+
+    fn write_from(&mut self, offset: u64, data: &[u8]) -> ScsiResult<()> {
+        let (prefix_part, data_offset, data_part) = self.split(offset, data.len());
+        if prefix_part > 0 {
+            // The synthetic region must never reach the container: Windows may
+            // rewrite the disk signature or "initialize" the disk at any time.
+            if !self.warned_prefix_write {
+                self.warned_prefix_write = true;
+                log::warn!(
+                    "ignoring a write to the synthetic partition-table region at disk offset {offset} \
+                     (it is generated on the fly and is not part of the container)"
+                );
+            }
+            let begin = offset as usize;
+            self.prefix[begin..begin + prefix_part].copy_from_slice(&data[..prefix_part]);
+        }
+        if data_part > 0 {
+            self.area
+                .write_at(data_offset, &data[prefix_part..])
+                .map_err(|err| dev_err(format!("writing {data_part} bytes at offset {data_offset}: {err}")))?;
+        }
+        Ok(())
+    }
+}
+
+impl<A: DataArea + Send + Sync> ScsiBlockDevice for ScsiVolume<A> {
+    fn read(&self, lba: u64, blocks: u32, block_size: u32) -> ScsiResult<Vec<u8>> {
+        let len = (blocks as usize)
+            .checked_mul(block_size as usize)
+            .ok_or_else(|| dev_err("block count overflow"))?;
+        let offset = lba
+            .checked_mul(block_size as u64)
+            .ok_or_else(|| dev_err(format!("LBA {lba} overflows")))?;
+        let mut buf = vec![0u8; len];
+        self.read_into(offset, &mut buf)?;
+        Ok(buf)
+    }
+
+    fn write(&mut self, lba: u64, data: &[u8], block_size: u32) -> ScsiResult<()> {
+        if self.read_only {
+            return Err(dev_err("the volume is mounted read-only"));
+        }
+        let offset = lba
+            .checked_mul(block_size as u64)
+            .ok_or_else(|| dev_err(format!("LBA {lba} overflows")))?;
+        self.write_from(offset, data)
+    }
+
+    fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    fn flush(&mut self) -> ScsiResult<()> {
+        self.area
+            .sync()
+            .map_err(|err| dev_err(format!("flushing the container: {err}")))
+    }
+
+    fn vendor_id(&self) -> &str {
+        "vc-rs"
+    }
+
+    fn product_id(&self) -> &str {
+        "VeraCrypt volume"
+    }
+
+    fn product_rev(&self) -> &str {
+        "1.0 "
+    }
+}
+
+impl<A: DataArea + fmt::Debug> fmt::Debug for ScsiVolume<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScsiVolume")
+            .field("data_size", &self.data_size())
+            .field("disk_size", &self.disk_size())
+            .field("block_size", &self.block_size)
+            .field("read_only", &self.read_only)
+            .field("data_start_lba", &self.data_start_lba())
+            .finish()
+    }
+}
+
+/// Standard MBR partition type bytes we use.
+pub mod partition_type {
+    /// NTFS / exFAT / anything Windows should recognise on its own.
+    pub const NTFS: u8 = 0x07;
+    /// FAT32 with LBA addressing.
+    pub const FAT32_LBA: u8 = 0x0C;
+    /// FAT16 with LBA addressing.
+    pub const FAT16_LBA: u8 = 0x0E;
+}
+
+/// Guess the MBR partition type from a volume boot record.
+///
+/// The type byte is only a hint -- Windows identifies the filesystem itself --
+/// but a FAT volume marked as NTFS makes some tools refuse to mount it, so it is
+/// worth reading the boot sector we are already decrypting anyway.
+fn detect_partition_type(vbr: &[u8]) -> u8 {
+    if vbr.len() < 512 {
+        return partition_type::NTFS;
+    }
+    match &vbr[3..11] {
+        b"NTFS    " | b"EXFAT   " => return partition_type::NTFS,
+        _ => {}
+    }
+    if vbr[510] != 0x55 || vbr[511] != 0xAA {
+        // Not a boot sector at all (a freshly created, still unformatted
+        // quick-formatted volume decrypts to noise).
+        return partition_type::NTFS;
+    }
+    if &vbr[0x52..0x5A] == b"FAT32   " {
+        return partition_type::FAT32_LBA;
+    }
+    match &vbr[0x36..0x3E] {
+        b"FAT16   " => partition_type::FAT16_LBA,
+        _ => partition_type::NTFS,
+    }
+}
+
+/// Build the synthetic MBR that makes the data area look like one partition.
+fn build_mbr(fs_type: u8, start_lba: u64, sectors: u64, disk_signature: u32) -> Vec<u8> {
+    let mut mbr = vec![0u8; SECTOR_SIZE];
+    mbr[0x1B8..0x1BC].copy_from_slice(&disk_signature.to_le_bytes());
+    let entry = 0x1BE;
+    mbr[entry] = 0x00; // not bootable: this is a data partition
+    mbr[entry + 1] = 0x20; // start CHS: unused by the OS, but keep it sane
+    mbr[entry + 2] = 0x21;
+    mbr[entry + 3] = 0x00;
+    mbr[entry + 4] = fs_type;
+    mbr[entry + 5] = 0xFE; // end CHS: "too large", i.e. use the LBA fields
+    mbr[entry + 6] = 0xFF;
+    mbr[entry + 7] = 0xFF;
+    mbr[entry + 8..entry + 12].copy_from_slice(&(start_lba as u32).to_le_bytes());
+    mbr[entry + 12..entry + 16].copy_from_slice(&(sectors as u32).to_le_bytes());
+    mbr[510] = 0x55;
+    mbr[511] = 0xAA;
+    mbr
+}
+
+/// A running iSCSI target. Dropping it stops the listener.
+pub struct IscsiMount {
+    server: Arc<IscsiServer>,
+    thread: Option<thread::JoinHandle<()>>,
+    addr: String,
+    target_name: String,
+    read_only: bool,
+}
+
+impl IscsiMount {
+    /// Bind and serve `device` in a background thread.
+    ///
+    /// Served through the crate's *multi-target* server rather than its
+    /// single-target one: only the former implements the discovery session
+    /// (`SessionType=Discovery`, no `TargetName` in the login request), which is
+    /// exactly what the Microsoft initiator opens for `iscsicli
+    /// QAddTargetPortal`. The single-target server answers such a login with
+    /// "Unsupported opcode 0x03 in full feature phase", the initiator times out
+    /// and `QAddTargetPortal` fails with "Target Error".
+    pub fn start(device: ScsiVolume, opts: &IscsiMountOptions) -> Result<Self> {
+        let server = Arc::new(
+            IscsiServer::builder()
+                .bind_addr(&opts.bind_addr)
+                .add_target(
+                    opts.target_name.clone(),
+                    Box::new(device),
+                    Some("vc-rs VeraCrypt volume".to_string()),
+                )
+                .max_connections(8)
+                .build()
+                .map_err(to_core)?,
+        );
+        let running = Arc::clone(&server);
+        let thread = thread::spawn(move || {
+            if let Err(err) = running.run() {
+                log::error!("the iSCSI server stopped: {err}");
+            }
+        });
+        let mount = IscsiMount {
+            server,
+            thread: Some(thread),
+            addr: opts.bind_addr.clone(),
+            target_name: opts.target_name.clone(),
+            read_only: opts.read_only,
+        };
+        mount.wait_until_listening()?;
+        log::info!(
+            "iSCSI target {} listening on {}{}",
+            mount.target_name,
+            mount.addr,
+            if mount.read_only { " (read-only)" } else { "" }
+        );
+        Ok(mount)
+    }
+
+    /// The address the target listens on.
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    /// The IQN an initiator logs into.
+    pub fn target_name(&self) -> &str {
+        &self.target_name
+    }
+
+    /// Number of attached initiator sessions.
+    pub fn session_count(&self) -> usize {
+        self.server.active_session_count()
+    }
+
+    /// Whether the target is still accepting connections.
+    pub fn is_running(&self) -> bool {
+        self.server.is_running()
+    }
+
+    /// Stop accepting connections and shut the listener down.
+    pub fn stop(&self) {
+        if self.server.is_running() {
+            log::info!("stopping the iSCSI target {}", self.target_name);
+        }
+        // `shutdown_gracefully` only rejects *new* logins; `stop` is the one that
+        // makes `IscsiServer::run` leave its accept loop. Without it the serving
+        // thread never returns and joining it (in `Drop`) hangs forever.
+        self.server.shutdown_gracefully();
+        self.server.stop();
+    }
+
+    /// Wait until the listener answers, so that a caller that prints
+    /// `iscsicli` commands cannot race the socket setup.
+    /// Wait until the serving thread has bound the socket *and* is accepting.
+    ///
+    /// `IscsiServer::run` reports a bind failure only by returning, so a plain
+    /// "can I connect?" probe is not enough: if another process (or another
+    /// test) already listens on that port, the probe would succeed against
+    /// *its* listener while our own serving thread is dead. Checking
+    /// `is_running` (set by `run` after a successful bind) tells the two apart.
+    fn wait_until_listening(&self) -> Result<()> {
+        let started = Instant::now();
+        let mut ever_running = false;
+        loop {
+            if self.server.is_running() {
+                ever_running = true;
+                if let Ok(stream) = TcpStream::connect(&self.addr) {
+                    // The probe connection is not a valid iSCSI session; the
+                    // target logs it and drops it.
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    return Ok(());
+                }
+            }
+            // A target that never became running failed to bind (or died) —
+            // report that quickly instead of waiting for the full timeout.
+            let timeout = if ever_running {
+                Duration::from_secs(10)
+            } else {
+                Duration::from_secs(2)
+            };
+            if started.elapsed() >= timeout {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "the iSCSI target did not come up on {} (is another target already \
+                         listening on that port?)",
+                        self.addr
+                    ),
+                )));
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Block until the initiator logs out (or Ctrl-C is pressed).
+    ///
+    /// A logout is not always a dismount (a client may reconnect), so the target
+    /// keeps running for a few seconds after the last session disappears before
+    /// it gives up, and only when at least one session was seen at all.
+    pub fn wait(&self) -> Result<()> {
+        const IDLE_GRACE: Duration = Duration::from_secs(5);
+        let mut seen_session = false;
+        let mut idle_since: Option<Instant> = None;
+        while self.server.is_running() && !shutdown_requested() {
+            let sessions = self.server.active_session_count();
+            if sessions > 0 {
+                seen_session = true;
+                idle_since = None;
+            } else if seen_session {
+                let since = *idle_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= IDLE_GRACE {
+                    log::info!("the initiator logged out; stopping the target");
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        self.stop();
+        Ok(())
+    }
+}
+
+impl Drop for IscsiMount {
+    fn drop(&mut self) {
+        self.stop();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Global "Ctrl-C was pressed" flag, set by the console handler below.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+fn shutdown_requested() -> bool {
+    SHUTDOWN.load(Ordering::SeqCst)
+}
+
+/// Ask a running [`IscsiMount::wait`] to return (used by the console handler).
+pub fn request_shutdown() {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+#[cfg(windows)]
+/// Install a Ctrl-C handler that only sets [`SHUTDOWN`], so that the target can
+/// close its sessions instead of dying mid-request (which would look like a
+/// surprise removal to the initiator).
+fn install_ctrl_handler() {
+    use std::sync::atomic::AtomicBool as Flag;
+    static INSTALLED: Flag = Flag::new(false);
+    if INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    unsafe extern "system" fn handler(_ctrl_type: u32) -> i32 {
+        SHUTDOWN.store(true, Ordering::SeqCst);
+        1 // handled: let the target shut down cleanly
+    }
+    unsafe {
+        winapi::um::consoleapi::SetConsoleCtrlHandler(Some(handler), 1);
+    }
+}
+
+#[cfg(not(windows))]
+fn install_ctrl_handler() {}
+
+/// Serve `volume_path` over iSCSI until the initiator logs out or Ctrl-C.
+///
+/// Prints the two `iscsicli` commands that attach the volume; both need an
+/// elevated prompt (the Microsoft initiator requires administrator rights, just
+/// like mounting with VeraCrypt does).
+pub fn mount_iscsi(volume_path: &Path, open: &OpenOptions, opts: &IscsiMountOptions) -> Result<()> {
+    install_ctrl_handler();
+    let device = ScsiVolume::open(volume_path, open, opts)?;
+    println!(
+        "serving {} ({} bytes of data area, {} byte sectors, {}) as a {} byte disk",
+        volume_path.display(),
+        device.data_size(),
+        device.block_size(),
+        if opts.read_only { "read-only" } else { "read/write" },
+        device.disk_size(),
+    );
+    if opts.disk_mode == DiskMode::Partitioned {
+        println!(
+            "the data area is presented as one partition starting at LBA {} (a synthetic MBR; \
+             the container itself keeps its VeraCrypt layout)",
+            device.data_start_lba(),
+        );
+    }
+    let mount = IscsiMount::start(device, opts)?;
+    println!("iSCSI target ready: {} on {}", mount.target_name(), mount.addr());
+    println!();
+    println!("attach it from an ELEVATED prompt (the Microsoft iSCSI Initiator needs admin):");
+    println!(
+        "    iscsicli AddTarget {} vcrs {} {} 0 0 0 0 0 8 0 0 \"\" \"\" 0 0",
+        mount.target_name(),
+        portal_host(&mount.addr()),
+        portal_port(&mount.addr()),
+    );
+    println!("    iscsicli QLoginTarget {}", mount.target_name());
+    println!();
+    println!("(a *static* target is registered because the target crate cannot complete the");
+    println!(" initiator's multi-PDU login during a portal *scan*; the two empty strings are");
+    println!(" the CHAP user/password and the trailing 0 means 'no authentication')");
+    println!("(both commands must reach iscsicli with those two arguments still empty, which is");
+    println!(" why the `cmd /c` hop with literal \"\" is used in scripts/vc-iscsi-e2e.ps1)");
+    println!();
+    println!("Windows then shows the volume as a partitioned disk: the data area appears as a");
+    println!("single partition (the container itself keeps its VeraCrypt layout).");
+    println!("detach it again with:");
+    println!("    iscsicli QLogoutTarget {}", mount.target_name());
+    println!("    iscsicli LogoutTarget <SessionId>      (see: iscsicli SessionList 1)");
+    println!("    iscsicli RemoveTarget {}", mount.target_name());
+    println!(
+        "    (or: vcrs dismount --iscsi {} -- it also takes the disk offline first,"
+    , mount.target_name());
+    println!("     because Windows refuses to log out a session whose disk is still in use)");
+    println!();
+    println!("this process keeps serving the volume; press Ctrl-C to stop it.");
+    mount.wait()
+}
+
+/// The host part of a `host:port` address, as `iscsicli` expects it.
+fn portal_host(addr: &str) -> &str {
+    match addr.rsplit_once(':') {
+        Some((host, _port)) => host,
+        None => addr,
+    }
+}
+
+/// The port part of a `host:port` address, as `iscsicli AddTarget` expects it.
+fn portal_port(addr: &str) -> &str {
+    match addr.rsplit_once(':') {
+        Some((_host, port)) => port,
+        None => "3260",
+    }
+}
+
+/// Pick a free loopback port (handy for tests, which cannot guess the port).
+pub fn free_loopback_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
+}

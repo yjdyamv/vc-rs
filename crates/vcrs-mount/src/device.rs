@@ -60,6 +60,16 @@ pub trait DataArea {
 
     /// Flush everything written so far to the host file.
     fn sync(&self) -> io::Result<()>;
+
+    /// Logical sector size of the data area.
+    ///
+    /// File-hosted VeraCrypt volumes always use 512-byte sectors, which is what
+    /// both the FAT filesystem and the iSCSI device expect; the header carries
+    /// the value so that a partition-hosted volume (which would declare 4096)
+    /// is still translated correctly if we ever host one.
+    fn sector_size(&self) -> u32 {
+        SECTOR_SIZE as u32
+    }
 }
 
 impl DataArea for Volume {
@@ -77,6 +87,10 @@ impl DataArea for Volume {
 
     fn sync(&self) -> io::Result<()> {
         Volume::flush(self).map_err(to_io)
+    }
+
+    fn sector_size(&self) -> u32 {
+        self.header.sector_size
     }
 }
 

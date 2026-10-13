@@ -10,6 +10,7 @@ vcrs-core = { path = "../vcrs-core" }
 log.workspace = true
 thiserror.workspace = true
 fatfs.workspace = true
+iscsi-target.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 dokan.workspace = true
@@ -19,4 +20,4 @@ dokan.workspace = true
 # dependencies of `dokan` at exactly these versions -- no new crate is added.
 dokan-sys = "0.3.1"
 widestring = "0.4.3"
-winapi = { version = "0.3.9", features = ["minwindef", "ntdef", "ntstatus", "winnt"] }
+winapi = { version = "0.3.9", features = ["consoleapi", "minwindef", "ntdef", "ntstatus", "winnt"] }

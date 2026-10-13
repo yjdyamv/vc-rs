@@ -48,12 +48,19 @@
 mod device;
 mod fat;
 
+/// Present the volume as a raw block device over iSCSI (Windows' own NTFS/exFAT
+/// drivers then mount it; see the module docs for why this exists).
+pub mod iscsi;
+
 #[cfg(windows)]
 mod fs_main;
 
 pub use device::{DataArea, VolumeDevice, SECTOR_SIZE};
 #[cfg(windows)]
 pub use fs_main::{FileContext, VolumeFsHandler};
+pub use iscsi::{
+    mount_iscsi, DiskMode, IscsiMount, IscsiMountOptions, ScsiVolume, ISCSI_PORT,
+};
 
 pub use vcrs_core::error::{Error, Result};
 

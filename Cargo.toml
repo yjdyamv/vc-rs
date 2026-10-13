@@ -18,7 +18,17 @@ zeroize = { version = "1", features = ["derive"] }
 thiserror = "2"
 dokan = "0.3.1"
 fatfs = "0.3"
+# Pure-Rust iSCSI target: exposes the decrypted volume as a *block device* over
+# a loopback TCP socket, so Windows' own signed NTFS/exFAT drivers can mount any
+# filesystem (Dokany can only present filesystems we implement ourselves).
+iscsi-target = "1.0"
 log = "0.4"
+
+# Local fork of `iscsi-target` 1.0.0 (vendor/iscsi-target).  The upstream crate
+# has three interoperability bugs against the Microsoft iSCSI initiator; see
+# vendor/iscsi-target/PATCHES.md.  Kept as a patch so the fixes stay reviewable.
+[patch.crates-io]
+iscsi-target = { path = "vendor/iscsi-target" }
 
 [profile.release]
 opt-level = 3

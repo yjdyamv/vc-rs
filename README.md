@@ -8,18 +8,25 @@ written here.
 **当前状态 (short version):** 三项目标全部完成 —— (1) 格式完全兼容：全部 15 种加密算法组合
 × 6 种 KDF 均通过测试，并与本机真实 VeraCrypt 1.26.29 双向验证（vc-rs 建的卷 VeraCrypt 能挂载，
 VeraCrypt 建的卷 vc-rs 能读能写）；(2) 可创建卷（普通卷、隐藏卷、备份头、`--full` 随机填充）；
-(3) 可挂载卷：`vcrs format` 在卷内建 FAT 文件系统，`vcrs mount` 通过 Dokany 挂成盘符，
-经 Dokany 写入的文件真实 VeraCrypt 能读到，反之亦然。系统加密（预启动认证）不在范围内。
+(3) 可挂载卷：(a) `vcrs format` 在卷内建 FAT 文件系统，`vcrs mount` 通过 Dokany 挂成盘符，
+经 Dokany 写入的文件真实 VeraCrypt 能读到，反之亦然；(b) `vcrs mount --raw` 把解密后的数据区
+以 iSCSI 目标暴露给 Windows 自带的 Microsoft iSCSI 发起程序，Windows 看到的是一块真实磁盘，
+可以用它自己的 NTFS/exFAT 驱动格式化并读写（已实测：Windows 在此磁盘上格式化 NTFS 并写入文件，
+真实 VeraCrypt 挂载同一容器能原样读到）。系统加密（预启动认证）不在范围内。
 
 * Crypto: [Botan](https://botan.randombit.net/) 3.13 via `botan-rs` (vendored static build).
-* Mounting (Windows): [Dokany](https://dokan-dev.github.io/) via `dokan-rs` (`dokan-dev/dokan-rust`).
+* Mounting (Windows): [Dokany](https://dokan-dev.github.io/) via `dokan-rs` (`dokan-dev/dokan-rust`)
+  for FAT volumes, and an iSCSI target (in-box Microsoft Initiator) for raw-block access to any
+  filesystem Windows supports.  The [iscsi-target](https://github.com/lawless-m/iscsi-crate) crate
+  is vendored (patched) under `vendor/iscsi-target`. Device layer: Botan 3.13 through
+  `botan-rs`, statically built from source — no Botan install needed.
 
 ## Contents
 
 | Path | What it is |
 | --- | --- |
 | `crates/vcrs-core` | The format: header serialization/encryption, KDFs, XTS mode, volume create/open, data I/O. No platform dependencies. |
-| `crates/vcrs-mount` | Windows mount layer: a FAT filesystem inside the volume, exposed as a drive letter through Dokany. |
+| `crates/vcrs-mount` | Windows mount layer: a FAT filesystem inside the volume exposed as a drive letter through Dokany, plus an iSCSI target that gives Windows a raw disk (any filesystem) backed by the decrypted data area. |
 | `crates/vcrs-cli` | The `vcrs` command line tool. |
 | `docs/research` | Notes taken while reading the VeraCrypt sources (format layout, keyfiles, Dokan capabilities, Botan API). |
 | `scripts/` | Build/cross-verification helpers (`msvc.sh` build wrapper, VeraCrypt round-trip scripts). |
@@ -40,9 +47,10 @@ VeraCrypt 建的卷 vc-rs 能读能写）；(2) 可创建卷（普通卷、隐�
 | Dump / inspect headers, raw data read/write | ✅ |
 | Backups headers usable for recovery | ✅ (open with `--backup`) |
 | FAT filesystem creation inside the volume + Dokany mount | ✅ (verified end-to-end against VeraCrypt) |
+| Raw disk for Windows over iSCSI (`vcrs mount --raw`), any filesystem Windows supports | ✅ (verified: Windows formatted NTFS through it, VeraCrypt read the files back) |
 | Keyfiles | ⬜ not implemented yet |
 | System (pre-boot) encryption, in-place encryption of a system partition | ⬜ out of scope |
-| Non-FAT filesystems behind the Dokany mount (NTFS) | ⬜ see *Mounting* below |
+| Non-FAT filesystems behind Dokany (NTFS in user mode) | ⬜ not planned; use `--raw` (iSCSI) and let Windows' own NTFS driver do it |
 
 ## Build
 
@@ -72,6 +80,9 @@ vcrs info secret.vc --password "correct horse"
 vcrs format secret.vc --password "correct horse" --label DATA
 vcrs mount  secret.vc --password "correct horse" --mount-point Z:
 vcrs dismount Z:
+
+# Serve the volume as a raw iSCSI disk instead (Windows' own NTFS driver does the work).
+vcrs mount testdata/ours-iscsi.vc -p PwIscsi --raw
 
 # Raw data access without mounting (offsets are inside the data area).
 vcrs read  secret.vc --password "correct horse" --offset 0 --length 4096 --out head.bin
@@ -109,6 +120,8 @@ because VeraCrypt mounts through its kernel driver — the Dokany mounts do not)
 | VeraCrypt → Dokany (hidden) | A file written through VeraCrypt's mount of the hidden volume is listed and read through `vcrs mount --hidden` | ✅ |
 | Dokany → VeraCrypt (hidden) | A file written through the Dokany mount of the hidden volume is read back by VeraCrypt | ✅ (`scripts/vc-hidden-test.ps1`, `HIDDEN ROUND TRIP OK: True`, `FULL HIDDEN CHAIN OK: True`) |
 | Outer + hidden coexist | After the hidden volume was carved in, VeraCrypt still reads the outer FAT16 filesystem and its file | ✅ |
+| Windows NTFS through iSCSI → VeraCrypt | Windows sees the vc-rs data area as a partitioned disk (MBR, 1 MiB synthetic prefix), formats NTFS on it, writes `from-windows.txt`, `sub
+ested.txt` and a 1 MiB random file; real VeraCrypt mounts the same container and reads all three back (SHA-256 match) | ✅ (`scripts/vc-iscsi-e2e.ps1`, `RESULT: ALL OK`) |
 
 Header encodings are also pinned by unit tests for CRC-32 (VeraCrypt's own self-test
 value `0x91267E8A`), the header byte layout and the KDF parameters. Regression suite:
@@ -153,11 +166,56 @@ disk — while the filesystem inside it is implemented in user mode. Consequence
   container when the mount ends.
 
 If a *raw disk* experience is required (any filesystem, including NTFS, using Windows'
-own drivers), the options are: writing a kernel driver, mounting through VHD/VHDX
-(which would require plaintext on disk), or exposing the decrypted sectors over
-**iSCSI to the in-box Microsoft initiator** — a fully user-mode path that gives Windows
-a real disk while nothing is written in the clear. That last option is the intended
-follow-up to the Dokany mount.
+own drivers), `vcrs mount --raw` exposes the decrypted sectors as an **iSCSI LUN** and the
+in-box Microsoft Initiator attaches it — a fully user-mode path (no kernel driver of ours,
+nothing written in the clear):
+
+```text
+Windows' own NTFS/exFAT/FAT driver  ──  SCSI READ(10)/WRITE(10)
+      │
+Microsoft iSCSI Initiator (msiscsi, in-box)  ──  iSCSI over loopback TCP
+      │
+vcrs-mount iSCSI target            (iscsi-target crate, vendored+patched)
+      │  512-byte sectors: LBA n → data offset n*512
+      ▼
+decrypted / re-encrypted volume data area  (vcrs-core)
+```
+
+A VeraCrypt container holds a *bare* filesystem (its data area is one volume, not a
+partitioned disk), while Windows only mounts filesystems that live in a partition of a
+fixed disk. `--raw` therefore presents a disk that is 1 MiB larger than the data area
+and synthesises an MBR in front of it (mode `partition`, the default); the MBR lives only
+in memory — the container keeps its VeraCrypt layout byte for byte. Writes into that
+synthetic prefix are absorbed, so Windows rewriting the partition table cannot corrupt
+the container. `--raw raw` exposes the bare data area instead (LBA 0 = data offset 0).
+
+```powershell
+# terminal 1 (normal rights): serve the volume
+vcrs mount testdata\ours-iscsi.vc -p PwIscsi --raw     # prints the two commands below
+
+# terminal 2 (elevated): attach it — a static target, then a normal login
+iscsicli AddTarget iqn.2025-12.io.vcrs:ours-iscsi vcrs 127.0.0.1 3260 0 0 0 0 0 8 0 0 "" "" 0 0
+iscsicli QLoginTarget iqn.2025-12.io.vcrs:ours-iscsi
+# → a disk "vc-rs VeraCrypt volume" appears; create a volume on it and format NTFS:
+Format-Volume -DriveLetter S -FileSystem NTFS -NewFileSystemLabel VCRS -Confirm:$false
+
+# detach again
+vcrs dismount --iscsi iqn.2025-12.io.vcrs:ours-iscsi
+```
+
+Two things to know: a *freshly created* container has no filesystem inside, so Windows
+offers to format the new disk (and opening the drive letter beforehand fails with
+"the parameter is incorrect" — that is a RAW volume, exactly like a new VeraCrypt
+container); and `QAddTargetPortal` (a portal *scan*) does not work, because the target
+library cannot complete the initiator's multi-PDU login during discovery — hence the
+static `AddTarget` + `QLoginTarget` pair above. Both are documented in
+`vendor/iscsi-target/PATCHES.md`.
+
+The whole chain is covered by `scripts/vc-iscsi-e2e.ps1` (elevated), which creates a
+container, serves it, logs in, checks the disk/MBR/partition geometry, formats NTFS
+through it, writes a text file, a nested file and a 1 MiB random file (SHA-256 compared),
+detaches, and finally has real VeraCrypt mount the same container and read all three files
+back.
 
 ## Notes on passwords
 
