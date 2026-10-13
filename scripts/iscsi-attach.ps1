@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Attach a vc-rs iSCSI volume that is already being served by `vcrs mount --raw`.
+  Attach a vc-rs iSCSI volume that is already being served by `vcrs mount`.
 .DESCRIPTION
   Run `vcrs mount <container> -p <password> --raw` in another (normal) shell first;
   it prints the target name.  This script then registers that target statically and

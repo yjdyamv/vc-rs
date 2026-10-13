@@ -123,6 +123,7 @@ administration, only the initiator does).
 | Windows NTFS through iSCSI → VeraCrypt | Windows sees the vc-rs data area as a partitioned disk (MBR, 1 MiB synthetic prefix), formats NTFS on it, writes `from-windows.txt`, `sub/nested.txt` and a 1 MiB random file; real VeraCrypt mounts the same container and reads all three back (SHA-256 match) | ✅ (`scripts/vc-iscsi-e2e.ps1`, `RESULT: ALL OK`) |
 | Persistence across sessions | Windows writes through the iSCSI disk, the disk is detached, then attached again: the files are still there (they live in the container) | ✅ |
 | Windows NTFS through iSCSI, read by vc-rs | After Windows formatted the disk, `vcrs read` of data offset 0 shows the NTFS boot sector (`EB 52 90 "NTFS    "`) | ✅ |
+| Removable-media reporting (`--removable`) | Windows classifies the disk as removable media (`Win32_DiskDrive.MediaType` = `Removable Media`, vs `Fixed hard disk media` for the internal NVMe disk), which is what makes exFAT show up in its format dialog | ✅ |
 | Dokany-era checks (historical) | With the Dokany filesystem mount (removed since; code in git history): files written through the drive letter were read back by VeraCrypt, a file VeraCrypt wrote into the vc-rs-made FAT was read back through the mount, and the same held for hidden volumes | ✅ (`scripts/vc-dokan-crosscheck.ps1` = `ALL OK`, `scripts/vc-hidden-test.ps1` = `HIDDEN ROUND TRIP OK: True`, `FULL HIDDEN CHAIN OK: True`) |
 
 Header encodings are also pinned by unit tests for CRC-32 (VeraCrypt's own self-test
@@ -198,6 +199,8 @@ Three things to know:
 2. `--removable` sets the SCSI removable-media bit. Windows only offers **exFAT** in its
    format dialogs for removable media, so that flag is how to get exFAT there (the
    container itself is unaffected; `Format-Volume -FileSystem exFAT` works either way).
+   Verified: with the flag Windows reports the disk as `Removable Media`
+   (`Win32_DiskDrive.MediaType`) instead of `Fixed hard disk media`.
 3. `QAddTargetPortal` (a portal *scan*) does not work: the target library cannot finish
    the initiator's multi-PDU login during a discovery session. Use the static `AddTarget`
    + `QLoginTarget` pair above. Documented in `vendor/iscsi-target/PATCHES.md`.
