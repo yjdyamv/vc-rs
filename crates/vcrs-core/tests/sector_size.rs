@@ -30,6 +30,7 @@ fn options(sector_size: u32) -> CreateOptions {
         sector_size,
         full_format: false,
         sparse: false,
+        random_source: None,
     }
 }
 

@@ -69,6 +69,7 @@ fn round_trip(path: &PathBuf, ea: EncryptionAlgorithm, prf: Prf) -> vcrs_core::R
         sector_size: 512,
         full_format: false,
         sparse: false,
+        random_source: None,
     };
     let volume = Volume::create(path, VOLUME_SIZE, &create)?;
 

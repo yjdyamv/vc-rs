@@ -28,6 +28,7 @@ fn options(sparse: bool) -> CreateOptions {
         sector_size: 512,
         full_format: false,
         sparse,
+        random_source: None,
     }
 }
 

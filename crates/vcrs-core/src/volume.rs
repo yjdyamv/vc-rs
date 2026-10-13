@@ -25,6 +25,7 @@ use crate::header::{
     VOLUME_HEADER_GROUP_SIZE, VOLUME_HEADER_SIZE, VOLUME_HEADER_VERSION,
 };
 use crate::layout::{VolumeLayout, HIDDEN_RESERVED_END_AREA};
+use crate::random::RandomSupply;
 use crate::prf::{Prf, HEADER_KEY_SIZE};
 use crate::xts::{Xts, DATA_UNIT_SIZE};
 use crate::{Error, Result};
@@ -110,6 +111,13 @@ pub struct CreateOptions {
     /// format (a full format writes every byte, which would defeat the point),
     /// so the two are mutually exclusive here as well.
     pub sparse: bool,
+    /// Read the random bytes that build the volume from this file instead of
+    /// the operating system's generator, so the same file always produces the
+    /// same container (VeraCrypt's `--random-source` switch, with reproducible
+    /// results rather than extra entropy). Meant for tests and audits: with a
+    /// small source file the container's keys are reproducible, so it must not
+    /// be used for a volume that is supposed to keep a secret.
+    pub random_source: Option<PathBuf>,
 }
 
 impl Default for CreateOptions {
@@ -123,6 +131,7 @@ impl Default for CreateOptions {
             sector_size: MIN_SECTOR_SIZE,
             full_format: true,
             sparse: false,
+            random_source: None,
         }
     }
 }
@@ -260,6 +269,17 @@ impl Volume {
                 "minimum volume size is {MIN_VOLUME_SIZE} bytes, got {host_size}"
             )));
         }
+        if options.sparse && options.full_format {
+            return Err(Error::InvalidParameter(
+                "a sparse (dynamic) container has to be quick-formatted: a full format writes \
+                 every byte of the data area, which is what a sparse file is meant to avoid \
+                 (VeraCrypt only sets the sparse flag for a quick format)"
+                    .into(),
+            ));
+        }
+        // Both of these are checked before the container file is touched, so a bad
+        // request cannot leave a half-created container behind.
+        let mut random = random_supply(options)?;
 
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -268,14 +288,6 @@ impl Volume {
             .truncate(true)
             .open(path)?;
         if options.sparse {
-            if options.full_format {
-                return Err(Error::InvalidParameter(
-                    "a sparse (dynamic) container has to be quick-formatted: a full format writes \
-                     every byte of the data area, which is what a sparse file is meant to avoid \
-                     (VeraCrypt only sets the sparse flag for a quick format)"
-                        .into(),
-                ));
-            }
             // Before the file is extended: everything that is never written then
             // stays unallocated and reads back as zeros, like VeraCrypt's
             // dynamic containers.
@@ -288,7 +300,7 @@ impl Volume {
             .ok_or_else(|| Error::InvalidParameter("host is too small".into()))?;
         let data_offset = layout.creation_data_offset(host_size, volume_size)?;
 
-        let master_key = random_master_key(options.ea)?;
+        let master_key = random_master_key(options.ea, &mut random)?;
         // Keyfiles are mixed into the password *before* any key derivation; the
         // backup header is then derived from the same bytes with a fresh salt.
         let password = options.effective_password(Some(path))?;
@@ -306,7 +318,7 @@ impl Volume {
             sector_size: options.sector_size,
             ea: options.ea,
             prf: options.prf,
-            salt: random_bytes(HEADER_SALT_SIZE)?,
+            salt: random.bytes(HEADER_SALT_SIZE)?,
             master_key,
         };
 
@@ -319,19 +331,26 @@ impl Volume {
             options.pim,
             &header.salt,
         )?;
-        write_fake_hidden_region(&file, HIDDEN_SLOT_OFFSET, host_size, host_size, options)?;
+        write_fake_hidden_region(&file, HIDDEN_SLOT_OFFSET, host_size, host_size, options, &mut random)?;
 
         if options.full_format {
-            randomize_data_area(&file, data_offset, volume_size, options.ea)?;
+            randomize_data_area(&file, data_offset, volume_size, options.ea, &mut random)?;
         }
 
         // Backup header: VeraCrypt encrypts it with a *fresh* random salt (and
         // therefore a freshly derived header key), so the two header copies are
         // independent. Then its own fake hidden header.
         let backup_offset = backup_offset_of(host_size, layout)?;
-        let backup_salt = random_bytes(HEADER_SALT_SIZE)?;
+        let backup_salt = random.bytes(HEADER_SALT_SIZE)?;
         write_header_region(&file, backup_offset, &header, &password, options.pim, &backup_salt)?;
-        write_fake_hidden_region(&file, backup_offset + VOLUME_HEADER_SIZE, host_size, host_size, options)?;
+        write_fake_hidden_region(
+            &file,
+            backup_offset + VOLUME_HEADER_SIZE,
+            host_size,
+            host_size,
+            options,
+            &mut random,
+        )?;
 
         file.sync_all()?;
         Volume::from_parts(file, layout, header, host_size, None)
@@ -344,6 +363,7 @@ impl Volume {
     pub fn create_hidden(path: &Path, hidden_size: u64, options: &CreateOptions) -> Result<Volume> {
         let layout = VolumeLayout::V2Hidden;
         validate_sector_size(options.sector_size)?;
+        let mut random = random_supply(options)?;
         let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
         let host_size = file.metadata()?.len();
 
@@ -385,8 +405,8 @@ impl Volume {
             sector_size: options.sector_size,
             ea: options.ea,
             prf: options.prf,
-            salt: random_bytes(HEADER_SALT_SIZE)?,
-            master_key: random_master_key(options.ea)?,
+            salt: random.bytes(HEADER_SALT_SIZE)?,
+            master_key: random_master_key(options.ea, &mut random)?,
         };
 
         write_header_region(
@@ -398,11 +418,11 @@ impl Volume {
             &header.salt,
         )?;
         let backup_offset = backup_offset_of(host_size, layout)?;
-        let backup_salt = random_bytes(HEADER_SALT_SIZE)?;
+        let backup_salt = random.bytes(HEADER_SALT_SIZE)?;
         write_header_region(&file, backup_offset, &header, &password, options.pim, &backup_salt)?;
 
         if options.full_format {
-            randomize_data_area(&file, data_offset, volume_size, options.ea)?;
+            randomize_data_area(&file, data_offset, volume_size, options.ea, &mut random)?;
         }
 
         file.sync_all()?;
@@ -759,6 +779,7 @@ impl Volume {
             old_host_size,
             new_host_size - old_host_size,
             self.header.ea,
+            &mut RandomSupply::system(),
         )?;
 
         // 3. The new header fields; the master key does not change.
@@ -1073,6 +1094,7 @@ fn write_fake_hidden_region(
     host_size: u64,
     size_for_max: u64,
     options: &CreateOptions,
+    random: &mut RandomSupply,
 ) -> Result<()> {
     let layout = VolumeLayout::V2Hidden;
     let region_size = layout.header_size();
@@ -1096,10 +1118,10 @@ fn write_fake_hidden_region(
         sector_size: options.sector_size,
         ea: options.ea,
         prf: options.prf,
-        salt: random_bytes(HEADER_SALT_SIZE)?,
-        master_key: random_master_key(options.ea)?,
+        salt: random.bytes(HEADER_SALT_SIZE)?,
+        master_key: random_master_key(options.ea, random)?,
     };
-    let header_key = random_bytes(HEADER_KEY_SIZE)?;
+    let header_key = random.bytes(HEADER_KEY_SIZE)?;
     let region = header.encrypt(region_size, &header_key)?;
     write_all_at(file, offset, &region)?;
     Ok(())
@@ -1107,8 +1129,14 @@ fn write_fake_hidden_region(
 
 /// Fill the data area with zeros encrypted under a throwaway key, which is how
 /// VeraCrypt's slow format makes the "empty" part of the volume look random.
-fn randomize_data_area(file: &File, data_offset: u64, data_size: u64, ea: EncryptionAlgorithm) -> Result<()> {
-    let throwaway = random_bytes(ea.key_size() * 2)?;
+fn randomize_data_area(
+    file: &File,
+    data_offset: u64,
+    data_size: u64,
+    ea: EncryptionAlgorithm,
+    random: &mut RandomSupply,
+) -> Result<()> {
+    let throwaway = random.bytes(ea.key_size() * 2)?;
     let xts = Xts::new(ea, &throwaway)?;
     const CHUNK: usize = 1024 * 1024; // must be a multiple of the data unit size
     let mut buf = vec![0u8; CHUNK];
@@ -1203,6 +1231,7 @@ pub fn encrypt_in_place_stopping_after(
         sector_size: DATA_UNIT_SIZE as u32,
         full_format: false,
         sparse: false,
+        random_source: None,
     };
 
     // While a volume is being encrypted in place only its *backup* header is
@@ -1276,7 +1305,7 @@ pub fn encrypt_in_place_stopping_after(
                 ea,
                 prf,
                 salt: salt.clone(),
-                master_key: random_master_key(ea)?,
+                master_key: random_master_key(ea, &mut RandomSupply::system())?,
             };
             write_header_region(&file, backup_offset, &header, password, pim, &salt)?;
             write_fake_hidden_region(
@@ -1285,6 +1314,7 @@ pub fn encrypt_in_place_stopping_after(
                 file_size,
                 file_size,
                 &create_options,
+                &mut RandomSupply::system(),
             )?;
             file.sync_all()?;
             log::info!(
@@ -1372,6 +1402,7 @@ pub fn encrypt_in_place_stopping_after(
             file_size,
             file_size,
             &create_options,
+            &mut RandomSupply::system(),
         )?;
         write_header_region(&file, backup_offset, &header, password, pim, &backup_salt)?;
         write_fake_hidden_region(
@@ -1380,6 +1411,7 @@ pub fn encrypt_in_place_stopping_after(
             file_size,
             file_size,
             &create_options,
+            &mut RandomSupply::system(),
         )?;
         header.salt = primary_salt;
         file.sync_all()?;
@@ -1658,10 +1690,24 @@ fn read_backup_header(
     }
 }
 
-fn random_master_key(ea: EncryptionAlgorithm) -> Result<Vec<u8>> {
+/// The random supply a creation run draws from: the operating system's
+/// generator, or the file named by [`CreateOptions::random_source`].
+fn random_supply(options: &CreateOptions) -> Result<RandomSupply> {
+    let Some(path) = options.random_source.as_deref() else {
+        return Ok(RandomSupply::system());
+    };
+    log::warn!(
+        "reading the volume's random bytes from {}: this container's key material is reproducible \
+         from that file, so it is only safe for tests and audits",
+        path.display()
+    );
+    RandomSupply::from_file(path)
+}
+
+fn random_master_key(ea: EncryptionAlgorithm, random: &mut RandomSupply) -> Result<Vec<u8>> {
     let key_size = ea.key_size();
     loop {
-        let key = random_bytes(key_size * 2)?;
+        let key = random.bytes(key_size * 2)?;
         if key[..key_size] != key[key_size..] {
             return Ok(key);
         }
@@ -2379,10 +2425,18 @@ pub fn restore_headers_from_master_key(
             sector_size: options.sector_size,
             full_format: false,
             sparse: false,
+            random_source: None,
         };
         for offset in [HIDDEN_SLOT_OFFSET, host_size - VOLUME_HEADER_SIZE] {
             if region_is_zero(&file, offset, HEADER_SALT_SIZE)? {
-                write_fake_hidden_region(&file, offset, host_size, host_size, &fake)?;
+                write_fake_hidden_region(
+                    &file,
+                    offset,
+                    host_size,
+                    host_size,
+                    &fake,
+                    &mut RandomSupply::system(),
+                )?;
                 log::info!("wrote a fake hidden header at offset {offset}");
             }
         }

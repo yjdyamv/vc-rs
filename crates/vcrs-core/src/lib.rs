@@ -9,6 +9,7 @@
 //! | [`header`] | `src/Volume/VolumeHeader.cpp` |
 //! | [`layout`] | `src/Volume/VolumeLayout.cpp` |
 //! | [`prf`] | `src/Volume/Pkcs5Kdf.h`, `src/Common/Pkcs5.c` |
+//! | [`random`] | `src/Main/TextUserInterface.cpp` (`--random-source`) |
 //! | [`cipher`] | `src/Volume/Cipher.cpp`, `src/Volume/EncryptionAlgorithm.cpp` |
 //! | [`keyfile`] | `src/Common/Keyfiles.c` |
 //! | [`xts`] | `src/Volume/EncryptionModeXTS.cpp` |
@@ -41,6 +42,7 @@ pub mod header;
 pub mod keyfile;
 pub mod layout;
 pub mod prf;
+pub mod random;
 pub mod volume;
 pub mod xts;
 
@@ -50,6 +52,7 @@ pub use header::{crc32, VolumeHeader, VolumeType};
 pub use keyfile::apply_keyfiles;
 pub use layout::VolumeLayout;
 pub use prf::Prf;
+pub use random::RandomSupply;
 pub use volume::{
     backup_headers, decrypt_in_place, decrypt_in_place_stopping_after, encrypt_in_place,
     encrypt_in_place_stopping_after, looks_quick_formatted, read_header_area, read_header_group,

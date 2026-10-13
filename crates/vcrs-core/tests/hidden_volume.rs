@@ -35,6 +35,7 @@ fn options(password: &str) -> CreateOptions {
         sector_size: 512,
         full_format: false,
         sparse: false,
+        random_source: None,
     }
 }
 

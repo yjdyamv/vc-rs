@@ -113,6 +113,14 @@ struct CreateArgs {
     /// free-space check, like VeraCrypt.
     #[arg(long)]
     sparse: bool,
+    /// Read the volume's random bytes from this file instead of the operating
+    /// system's generator, so the same file always builds the same container
+    /// byte for byte (VeraCrypt's `--random-source` switch, but reproducible
+    /// rather than extra entropy). Meant for tests and audits: the container's
+    /// keys are then reproducible from that file, so never use it for a volume
+    /// that is supposed to keep a secret.
+    #[arg(long, value_name = "FILE")]
+    random_source: Option<PathBuf>,
     /// Volume sector size (512, 1024, 2048 or 4096). VeraCrypt defaults to 512
     /// and uses 4096 for very large volumes; the header records it and the
     /// filesystem inside should match it. XTS data-unit numbering is 512-based
@@ -140,6 +148,9 @@ struct CreateHiddenArgs {
     /// Volume sector size, as for `create`.
     #[arg(long, default_value_t = 512, value_parser = parse_sector_size)]
     sector_size: u32,
+    /// Read the volume's random bytes from this file, as for `create`.
+    #[arg(long, value_name = "FILE")]
+    random_source: Option<PathBuf>,
     /// Print the master key of the new hidden volume (it is masked otherwise).
     #[arg(long)]
     show_master_key: bool,
@@ -696,6 +707,15 @@ fn run() -> Result<()> {
                      formats for an outer volume\n  that is meant to host a hidden volume."
                 );
             }
+            if let Some(source) = &a.random_source {
+                eprintln!(
+                    "warning: --random-source makes {} reproducible from {}: anyone who has that \
+                     file can\n  rebuild the container's keys. Use it for tests and audits, not for \
+                     a real volume.",
+                    a.path.display(),
+                    source.display()
+                );
+            }
             let options = CreateOptions {
                 ea,
                 prf,
@@ -705,6 +725,7 @@ fn run() -> Result<()> {
                 sector_size: a.sector_size,
                 full_format: !quick,
                 sparse: a.sparse,
+                random_source: a.random_source.clone(),
             };
             let started = std::time::Instant::now();
             let volume = Volume::create(&a.path, a.size, &options)?;
@@ -737,6 +758,7 @@ fn run() -> Result<()> {
                 sector_size: a.sector_size,
                 full_format: false,
                 sparse: false,
+                random_source: a.random_source.clone(),
             };
             let started = std::time::Instant::now();
             let volume = Volume::create_hidden(&a.path, a.size, &options)

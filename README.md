@@ -14,7 +14,8 @@ iSCSI 发起程序，Windows 看到的是一块真实磁盘，于是**用 Window
 能原样读到）。`vcrs format` 还能在卷内直接建 FAT 文件系统（不挂载也能用）。此外还支持
 备份/恢复卷头（`backup-headers`/`restore-headers`，含从主密钥重建）、改密码
 （`change`）、卷扩容、隐藏卷保护、就地加解密、动态卷（`--sparse`，按需分配磁盘空间）、
-容器时间戳保护（挂载/读写不会暴露容器的修改时间与访问时间）。系统加密（预启动认证）不在范围内。
+容器时间戳保护（挂载/读写不会暴露容器的修改时间与访问时间）、可复现创建（`--random-source`，
+同一个种子文件生成逐字节相同的容器，用于测试与审计）。系统加密（预启动认证）不在范围内。
 
 * Crypto: [Botan](https://botan.randombit.net/) 3.13 via `botan-rs` (vendored static build).
 * Mounting (Windows): an in-process **iSCSI target**; the in-box Microsoft iSCSI Initiator
@@ -50,6 +51,7 @@ iSCSI 发起程序，Windows 看到的是一块真实磁盘，于是**用 Window
 | Argon2id (default and PIM-derived costs) | ✅ |
 | Data area read/write, randomized **full format** by default (`--quick` skips it) | ✅ |
 | Sparse (VeraCrypt's "dynamic") containers (`--sparse`) | ✅ (full length, only written parts allocate: a 200 MiB container is 256 KiB on disk; implies a quick format, like VeraCrypt) |
+| Reproducible container creation (`--random-source FILE`) | ✅ (VeraCrypt's `--random-source` switch, but the file *is* the stream instead of extra entropy, so the same file builds the same container byte for byte — meant for tests and audits; real VeraCrypt mounts such a container like any other, `scripts/vc-random-source-test.ps1` = `ALL OK`) |
 | Container timestamps are preserved (`--no-preserve-timestamp` on `mount` disables it) | ✅ (VeraCrypt's *Preserve modification timestamp of file containers*, on by default: opening, changing or mounting a container leaves its modification and access times alone) |
 | Hidden volumes (read/write both layouts, `create_hidden`) | ✅ |
 | Dump / inspect headers, raw data read/write | ✅ |
@@ -114,6 +116,13 @@ vcrs create dynamic.vc --size 100G --password pw --sparse
 # the file says when it was last used. Pass --no-preserve-timestamp to mount if you want
 # the operating system's normal behaviour instead.
 vcrs mount secret.vc --password "correct horse" --no-preserve-timestamp
+
+# Reproducible creation: VeraCrypt has --random-source to fill its entropy pool without
+# asking the user to type random characters; ours uses the file as the actual source, so
+# the container is a byte-for-byte copy of the one built from the same file. That is what
+# makes an audit or a bug report reproducible -- and it means the container's keys are
+# reproducible too, so never use it for a volume that is supposed to keep a secret.
+vcrs create reproducible.vc --size 10M --password pw --random-source seed.bin
 
 # Volume sector size: 512 by default. VeraCrypt's own format wizard only ever uses a
 # non-512 size for device-backed volumes (its file containers are always 512), but the
@@ -197,7 +206,7 @@ ticked).
 Compatibility is not asserted, it is tested against a real VeraCrypt 1.26.29 install
 (`scripts/vc-crosscheck.ps1`, `scripts/vc-crosscheck2.ps1`, `scripts/vc-hidden-test.ps1`,
 `scripts/vc-iscsi-e2e.ps1`, `scripts/vc-keyfile-test.ps1`, `scripts/vc-inplace-test.ps1`,
-`scripts/vc-header-test.ps1`; everything that mounts with
+`scripts/vc-header-test.ps1`, `scripts/vc-sector-size-test.ps1`, `scripts/vc-random-source-test.ps1`; everything that mounts with
 VeraCrypt needs an elevated shell because VeraCrypt mounts through its kernel driver —
 the iSCSI *target* itself needs no administration, only the initiator does).
 
@@ -236,11 +245,12 @@ the iSCSI *target* itself needs no administration, only the initiator does).
 | Sparse (dynamic) container | A 4 MiB `--sparse` container round-trips data, really occupies less than a quarter of that on disk (`GetCompressedFileSize`), and a full format is refused | ✅ (`crates/vcrs-core/tests/sparse.rs`) |
 | iSCSI target lifetime | The target stops by itself once the initiator has logged out and stayed away for the idle timeout, and `--idle-timeout 0` keeps it serving without one | ✅ (`crates/vcrs-mount/tests/iscsi_device.rs`; `scripts/vc-iscsi-e2e.ps1` waits for the process to exit: `target-exited`) |
 | Container timestamps | A container whose times are set 30 days back keeps **both** its modification and access time through `vcrs info`, `read`, `write` and `expand`, and while it is served over iSCSI; a control test shows a write *does* move the time when the freeze is off | ✅ (`crates/vcrs-core/tests/timestamps.rs`, `crates/vcrs-mount/tests/iscsi_device.rs`) |
+| Reproducible creation (`--random-source`) | Two containers built from the same seed file are byte-identical, a different seed gives different bytes, and real VeraCrypt mounts the deterministic container and reads the `fromvc.txt` inside the VeraCrypt-made FAT16 image it holds (`MSDOS5.0` boot sector) | ✅ (`scripts/vc-random-source-test.ps1` = `RESULT: ALL OK`, `crates/vcrs-core/tests/random_source.rs`) |
 | Dokany-era checks (historical) | With the Dokany filesystem mount (removed since; code in git history): files written through the drive letter were read back by VeraCrypt, a file VeraCrypt wrote into the vc-rs-made FAT was read back through the mount, and the same held for hidden volumes | ✅ (`scripts/vc-dokan-crosscheck.ps1` = `ALL OK`, `scripts/vc-hidden-test.ps1` = `HIDDEN ROUND TRIP OK: True`, `FULL HIDDEN CHAIN OK: True`) |
 
 Header encodings are also pinned by unit tests for CRC-32 (VeraCrypt's own self-test
 value `0x91267E8A`), the header byte layout and the KDF parameters. Regression suite:
-`crates/vcrs-core/tests/{ea_prf_matrix,hidden_volume,backup_header,header_restore,xts_kat,in_place,sparse,sector_size,timestamps}.rs` (the matrix
+`crates/vcrs-core/tests/{ea_prf_matrix,hidden_volume,backup_header,header_restore,xts_kat,in_place,sparse,sector_size,timestamps,random_source}.rs` (the matrix
 test covers all 15 ciphers × 6 KDFs = 90 combinations, the backup test destroys the primary
 header and recovers the volume from the backup copy) and
 `crates/vcrs-mount/tests/{fat_in_volume,iscsi_device}.rs` (FAT format → write → reopen →

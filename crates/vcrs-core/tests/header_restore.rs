@@ -42,6 +42,7 @@ fn create_options(password: &[u8]) -> CreateOptions {
         // data area, and a full format would only make them slow.
         full_format: false,
         sparse: false,
+        random_source: None,
     }
 }
 
