@@ -90,10 +90,10 @@ struct CreateArgs {
     /// Volume size, e.g. `100M`, `4G`, or a byte count.
     #[arg(short, long, value_parser = parse_size)]
     size: u64,    /// Encryption algorithm, e.g. `AES`, `Serpent-AES`, `AES-Twofish-Serpent`.
-    #[arg(short, long, default_value = "AES")]
+    #[arg(short, long, visible_alias = "encryption", default_value = "AES")]
     ea: String,
     /// Header key derivation function, e.g. `SHA-512`, `Blake2s`, `Argon2`.
-    #[arg(long, default_value = "SHA-512")]
+    #[arg(long, visible_alias = "hash", default_value = "SHA-512")]
     prf: String,
     /// Quick format: leave the data area as the host filesystem reports it
     /// instead of writing random-looking data over it. Faster, but the
@@ -513,16 +513,26 @@ struct HiddenProtectionArgs {
     #[arg(long)]
     protect_hidden: bool,
     /// Password of the hidden volume.
-    #[arg(long = "hidden-password", env = "VCRS_HIDDEN_PASSWORD", hide_env_values = true)]
+    #[arg(
+        long = "hidden-password",
+        visible_alias = "protection-password",
+        env = "VCRS_HIDDEN_PASSWORD",
+        hide_env_values = true
+    )]
     hidden_password: Option<String>,
     /// Read the hidden volume's password from stdin (raw bytes).
     #[arg(long = "hidden-password-stdin", conflicts_with = "hidden_password")]
     hidden_password_stdin: bool,
     /// PIM of the hidden volume.
-    #[arg(long = "hidden-pim", default_value_t = 0)]
+    #[arg(long = "hidden-pim", visible_alias = "protection-pim", default_value_t = 0)]
     hidden_pim: i32,
     /// Keyfile of the hidden volume (repeatable).
-    #[arg(long = "hidden-keyfile", value_name = "PATH", action = clap::ArgAction::Append)]
+    #[arg(
+        long = "hidden-keyfile",
+        visible_alias = "protection-keyfile",
+        value_name = "PATH",
+        action = clap::ArgAction::Append
+    )]
     hidden_keyfiles: Vec<PathBuf>,
 }
 

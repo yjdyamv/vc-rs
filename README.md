@@ -179,6 +179,9 @@ vcrs mount both.vc --password outer --protect-hidden --hidden-password inner
 
 `--password-stdin` (raw bytes) and `$VCRS_PASSWORD` are supported; prefer those over
 `--password` for anything real, since command lines are visible to other processes.
+VeraCrypt's own switch names work too, for muscle memory: `--encryption` for `--ea`,
+`--hash` for `--prf`, and `--protection-password` / `--protection-pim` /
+`--protection-keyfile` for `--hidden-password` / `--hidden-pim` / `--hidden-keyfile`.
 `-k/--keyfile` may be repeated, and accepts a file or a directory of keyfiles; the
 keyfile pool is mixed into the password exactly as VeraCrypt does (64-byte legacy pool
 for passwords up to 64 bytes, 128-byte pool above that).
