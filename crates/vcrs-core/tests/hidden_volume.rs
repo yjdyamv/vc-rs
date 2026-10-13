@@ -31,6 +31,7 @@ fn options(password: &str) -> CreateOptions {
         prf: Prf::Sha512,
         password: password.as_bytes().to_vec(),
         pim: 0,
+        keyfiles: Vec::new(),
         sector_size: 512,
         full_format: false,
     }

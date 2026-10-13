@@ -53,7 +53,7 @@ iSCSI 发起程序，Windows 看到的是一块真实磁盘，于是**用 Window
 | FAT filesystem creation inside the volume (`vcrs format`) | ✅ |
 | Raw disk for Windows over iSCSI (`vcrs mount`): any filesystem Windows supports | ✅ (verified: Windows formatted NTFS through it, VeraCrypt read the files back) |
 | Read-only disks, hidden volumes, `--disk-mode raw`, removable-media reporting | ✅ |
-| Keyfiles (password + keyfile pool, files or a directory) | ✅ (VeraCrypt-made keyfile containers open; reverse direction checked by `scripts/vc-keyfile-test.ps1`) |
+| Keyfiles (password + keyfile pool, file or directory, repeatable) | ✅ (verified against VeraCrypt both ways, incl. a 102-byte password and directories: `scripts/vc-keyfile-test.ps1` = `ALL OK`) |
 | System (pre-boot) encryption, in-place encryption of a system partition | ⬜ out of scope |
 
 ## Build
@@ -134,7 +134,8 @@ the iSCSI *target* itself needs no administration, only the initiator does).
 | Removable-media reporting (`--removable`) | Windows classifies the disk as removable media (`Win32_DiskDrive.MediaType` = `Removable Media`, vs `Fixed hard disk media` for the internal NVMe disk), which is what makes exFAT show up in its format dialog | ✅ |
 | VeraCrypt → vc-rs (keyfile) | VeraCrypt creates a container with `/keyfile`; `vcrs info -k` opens it and decrypts its FAT16 boot sector, while the same password without `-k` is rejected | ✅ |
 | VeraCrypt → vc-rs (keyfile + 102-byte password) | Same with a password longer than 64 bytes, i.e. VeraCrypt's 128-byte keyfile pool layout | ✅ |
-| vc-rs → VeraCrypt (keyfile) | `vcrs create -k` makes a container holding a VeraCrypt-created FAT16 image; VeraCrypt mounts it with `/keyfile` and reads `fromvc.txt` | ✅ (`scripts/vc-keyfile-test.ps1`) |
+| vc-rs → VeraCrypt (keyfile) | `vcrs create -k` makes a container holding a VeraCrypt-created FAT16 image; VeraCrypt mounts it with `/keyfile` and reads `fromvc.txt`; without `-k` VeraCrypt refuses the volume | ✅ (`scripts/vc-keyfile-test.ps1`, `RESULT: ALL OK`) |
+| Directory of keyfiles | `-k <dir>` means "all files in it" for both sides: vc-rs opens VeraCrypt's directory-keyfile container and VeraCrypt mounts vc-rs's one, reading the file back | ✅ (`scripts/vc-keyfile-test.ps1`) |
 | Dokany-era checks (historical) | With the Dokany filesystem mount (removed since; code in git history): files written through the drive letter were read back by VeraCrypt, a file VeraCrypt wrote into the vc-rs-made FAT was read back through the mount, and the same held for hidden volumes | ✅ (`scripts/vc-dokan-crosscheck.ps1` = `ALL OK`, `scripts/vc-hidden-test.ps1` = `HIDDEN ROUND TRIP OK: True`, `FULL HIDDEN CHAIN OK: True`) |
 
 Header encodings are also pinned by unit tests for CRC-32 (VeraCrypt's own self-test
@@ -215,6 +216,9 @@ Three things to know:
 3. `QAddTargetPortal` (a portal *scan*) does not work: the target library cannot finish
    the initiator's multi-PDU login during a discovery session. Use the static `AddTarget`
    + `QLoginTarget` pair above. Documented in `vendor/iscsi-target/PATCHES.md`.
+4. A mounted container is held **exclusively** — VeraCrypt locks the file (so does
+   `vcrs mount`) — so `vcrs info`/`read`/`write` on that same file fail with a sharing
+   violation or "access is denied" until it is dismounted. Work on one side at a time.
 
 The whole chain is covered by `scripts/vc-iscsi-e2e.ps1` (elevated), which creates a
 container, serves it, logs in, checks the disk/MBR/partition geometry, formats NTFS

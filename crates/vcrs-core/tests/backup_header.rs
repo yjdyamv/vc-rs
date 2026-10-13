@@ -17,6 +17,7 @@ fn options() -> CreateOptions {
         prf: Prf::Sha512,
         password: b"backup-password".to_vec(),
         pim: 0,
+        keyfiles: Vec::new(),
         sector_size: 512,
         full_format: false,
     }

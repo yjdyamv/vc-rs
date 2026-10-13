@@ -65,6 +65,7 @@ fn round_trip(path: &PathBuf, ea: EncryptionAlgorithm, prf: Prf) -> vcrs_core::R
         prf,
         password: PASSWORD.to_vec(),
         pim: PIM,
+        keyfiles: Vec::new(),
         sector_size: 512,
         full_format: false,
     };
