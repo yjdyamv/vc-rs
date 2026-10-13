@@ -1,9 +1,10 @@
 //! Present a decrypted volume as a real *block device* over iSCSI.
 //!
-//! Dokany can only ever present a **filesystem**, so the mount layer has to
-//! implement one in user mode (it does: FAT via `fatfs`). That covers FAT
-//! containers, but not the NTFS/exFAT/ReFS containers a VeraCrypt user is most
-//! likely to have.
+//! A filesystem framework (Dokany, WinFsp) can only ever present a
+//! **filesystem**, so using one meant implementing the filesystem in user mode
+//! (we did: FAT via `fatfs`). That covers FAT containers, but not the
+//! NTFS/exFAT/ReFS containers a VeraCrypt user is most likely to have -- which
+//! is why the mount layer now exposes a block device instead.
 //!
 //! iSCSI solves that with no kernel driver of our own: this module serves the
 //! decrypted sectors over a loopback TCP socket and Windows' built-in Microsoft
@@ -137,6 +138,12 @@ pub struct IscsiMountOptions {
     pub target_name: String,
     /// Refuse writes (the initiator sees a write-protected disk).
     pub read_only: bool,
+    /// Report the disk as removable media (the INQUIRY RMB bit).
+    ///
+    /// Windows only offers exFAT in its format dialogs for removable media, so
+    /// this is the way to get exFAT into that list. The container on disk is
+    /// unaffected: the bit is purely cosmetic to the initiator.
+    pub removable: bool,
     /// See [`DiskMode`].
     pub disk_mode: DiskMode,
     /// First LBA of the synthetic partition (1 MiB by default).
@@ -149,6 +156,7 @@ impl Default for IscsiMountOptions {
             bind_addr: format!("127.0.0.1:{ISCSI_PORT}"),
             target_name: DEFAULT_TARGET_NAME.to_string(),
             read_only: false,
+            removable: false,
             disk_mode: DiskMode::default(),
             partition_start_lba: DEFAULT_PARTITION_START_LBA,
         }
@@ -192,6 +200,7 @@ fn dev_err(message: impl fmt::Display) -> IscsiError {
 pub struct ScsiVolume<A: DataArea = Volume> {
     area: A,
     read_only: bool,
+    removable: bool,
     block_size: u32,
     /// Synthetic bytes in front of the data area (`DiskMode::Partitioned`), i.e.
     /// the MBR and the padding up to the first partition. Never persisted.
@@ -264,6 +273,7 @@ impl<A: DataArea> ScsiVolume<A> {
         Ok(ScsiVolume {
             area,
             read_only: opts.read_only,
+            removable: opts.removable,
             block_size,
             prefix,
             capacity,
@@ -370,6 +380,10 @@ impl<A: DataArea + Send + Sync> ScsiBlockDevice for ScsiVolume<A> {
 
     fn block_size(&self) -> u32 {
         self.block_size
+    }
+
+    fn removable(&self) -> bool {
+        self.removable
     }
 
     fn flush(&mut self) -> ScsiResult<()> {

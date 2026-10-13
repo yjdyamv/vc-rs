@@ -1,9 +1,9 @@
-//! Integration test for the block device glue behind the Dokany mount.
+//! Integration test for the block device glue behind the mount layer.
 //!
-//! It never talks to Dokany (which would need an elevated shell and the Dokan
-//! driver): instead it drives `fatfs` directly over a [`VolumeDevice`] backed by
-//! a real, encrypted VeraCrypt-compatible container and checks that the bytes
-//! survive the round trip through format -> write -> reopen -> read.
+//! It never talks to a filesystem framework (which would need an elevated shell
+//! and a driver): instead it drives `fatfs` directly over a [`VolumeDevice`]
+//! backed by a real, encrypted VeraCrypt-compatible container and checks that
+//! the bytes survive the round trip through format -> write -> reopen -> read.
 
 use std::{
     fs::{self, File},
@@ -14,7 +14,7 @@ use std::{
 
 use fatfs::{FatType, FileSystem, FsOptions};
 use vcrs_core::volume::{CreateOptions, OpenOptions, Volume};
-use vcrs_mount::{format_volume, FatKind, MountOptions, VolumeDevice, SECTOR_SIZE};
+use vcrs_mount::{format_volume, FatKind, VolumeDevice, SECTOR_SIZE};
 
 const PASSWORD: &[u8] = b"test-password";
 const MARKER: &[u8] = b"VC-RS-FAT-ROUNDTRIP";
@@ -73,7 +73,7 @@ fn open_options() -> OpenOptions {
     OpenOptions { password: PASSWORD.to_vec(), ..OpenOptions::default() }
 }
 
-/// The Dokany handler reports free space from the same numbers.
+/// The same numbers a mount handler would report as free space.
 fn free_bytes(filesystem: &FileSystem<VolumeDevice<Volume>>) -> u64 {
     let stats = filesystem.stats().expect("stats");
     u64::from(stats.cluster_size()) * u64::from(stats.free_clusters())
@@ -265,14 +265,6 @@ fn labels_are_sanitised() {
     );
     drop(filesystem);
     device.sync().expect("sync the device");
-}
-
-/// `MountOptions` keeps the stub's defaults.
-#[test]
-fn mount_options_default_to_removable_and_writable() {
-    let options = MountOptions::default();
-    assert!(!options.read_only);
-    assert!(options.removable);
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {

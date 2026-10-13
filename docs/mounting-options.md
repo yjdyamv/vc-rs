@@ -1,10 +1,11 @@
 # Mounting non-FAT filesystems — design options
 
-**中文要点 (short version):** Dokany 只能实现“文件系统”，实现不了“裸磁盘”，所以今天挂载层
-必须在用户态自己解析卷内文件系统 —— 目前只实现了 FAT。要让 NTFS / exFAT / ReFS 等
+**中文要点 (short version):** Dokany 只能实现“文件系统”，实现不了“裸磁盘”，所以挂载层
+必须在用户态自己解析卷内文件系统 —— 这条路最终只实现了 FAT。要让 NTFS / exFAT / ReFS 等
 Windows 原生文件系统也能用（包括挂载 VeraCrypt 建的 NTFS 卷），有下面四条路，
-**推荐 A（iSCSI + Windows 内置发起程序）**，B 作为不写网络栈的备选，
-C 是最省事但只读的方案，D 不建议。
+我们**采用了 A（iSCSI + Windows 内置发起程序）并已端到端验证**，本文保留当初的选型分析。
+A 落地后 Dokany 那条路（方案 C 的 FAT 部分）已从代码里移除，仅保留 `vcrs format`
+（在卷内建 FAT 文件系统，不需要挂载）。
 
 | | 方案 | 卷内文件系统 | 额外内核驱动 | 需要管理员 | 需要写的代码 | 风险 |
 |---|---|---|---|---|---|---|
@@ -110,18 +111,20 @@ request through a named pipe specified with `-f`”，参考实现是仓库里�
 ## 推荐的落地顺序
 
 1. **统一块设备层**（小改动，收益长期）：`crates/vcrs-mount` 里已经有
-   `DataArea`/`VolumeDevice`（带 512 字节缓存与写回），让 Dokany 文件系统、
-   SCSI 设备、将来的 ImDisk 服务端都复用它，保证扇区语义只有一处实现。
+   `DataArea`/`VolumeDevice`（带 512 字节缓存与写回），让 SCSI 设备、
+   将来的 ImDisk 服务端都复用它，保证扇区语义只有一处实现。**已完成。**
 2. **方案 A 原型**：`iscsi-target` + `ScsiBlockDevice for Volume`，
    先用只读挂载一个已有的 NTFS/exFAT 卷验证 Windows 发起程序能认；
-   通过后补齐 `vcrs mount --raw`、`iscsicli` 登录/登出、`vcrs dismount`。
+   通过后补齐 `vcrs mount`、`iscsicli` 登录/登出、`vcrs dismount`。**已完成。**
 3. **验证链**（沿用现在的交叉验证套路）：
-   * vc-rs 建卷 → `vcrs mount --raw` → Windows `format Z: /FS:NTFS` + 写文件 →
+   * vc-rs 建卷 → `vcrs mount` → Windows `format Z: /FS:NTFS` + 写文件 →
      卸载 → 真实 VeraCrypt 挂载同一容器，读到这些文件；
-   * 反向：VeraCrypt（或 Windows）建的 NTFS 容器 → `vcrs mount --raw` → 用资源管理器读写。
+   * 反向：VeraCrypt（或 Windows）建的 NTFS 容器 → `vcrs mount` → 用资源管理器读写。
+   **已完成**（`scripts/vc-iscsi-e2e.ps1`，`RESULT: ALL OK`；反向读写也用同一容器验证过）。
 4. **方案 C 的 NTFS 只读**（可选，独立小需求）：给不想装驱动/要管理员的人一条路。
+   **未做**，且不建议再投入：Dokany 依赖已移除，且 NTFS 只读对使用价值有限。
 5. **方案 B** 作为备选后端：若 A 的 Windows 互操作受阻，就把同一块设备接到
-   ImDisk 管道协议上（前端替换，设备层不变）。
+   ImDisk 管道协议上（前端替换，设备层不变）。**未做**（A 已验证可用，无需备选）。
 
 ## 参考
 
@@ -135,16 +138,29 @@ request through a named pipe specified with `-f`”，参考实现是仓库里�
 
 ## 实施状态（更新）
 
-方案 A **已实现并验证**，实现在 `crates/vcrs-mount/src/iscsi.rs`（`vcrs mount --raw`），
+方案 A **已实现并验证，是唯一的挂载后端**，实现在 `crates/vcrs-mount/src/iscsi.rs`
+（CLI：`vcrs mount` / `vcrs dismount --iscsi <iqn>`）。
 `iscsi-target` 1.0.0 以 `vendor/iscsi-target` 打补丁形式引入（补丁说明见
-`vendor/iscsi-target/PATCHES.md`：补齐 Data-In 的 residual underflow/overflow 标志与
-Residual Count，并把 SCSI response/status 从 `specific[]` 挪到真正的 BHS 字节 2/3）。
+`vendor/iscsi-target/PATCHES.md`）：
 
-验收：`scripts/vc-iscsi-e2e.ps1`（提权）——vc-rs 建卷 → `--raw` 暴露裸盘 →
+1. 补齐最后一块 Data-In 上的 residual underflow/overflow 标志与 Residual Count
+   （RFC 7143 §11.4.5.2；否则 Microsoft 发起程序在“返回字节少于请求长度”的命令上
+   直接重置连接，例如 INQUIRY VPD page 0：请求 255、实际 8）；
+2. 把 SCSI response/status 从 `specific[]` 挪到真正的 BHS 字节 2/3，并把 Residual Count
+   挪到 `specific[24..28]`（原来与状态字节重叠）；
+3. INQUIRY 的 RMB（可移动介质）位改为设备可控（`ScsiBlockDevice::removable()`，
+   `vcrs mount --removable`）——Windows 的格式化对话框只对可移动介质提供 exFAT。
+
+方案 C（Dokany）**已移除**：`crates/vcrs-mount/src/fs_main.rs`、`dokan`/`dokan-sys`/
+`widestring` 依赖、`MountOptions` 与相关脚本都已删除，FAT 实现只剩 `vcrs format`
+（在卷内建 FAT 文件系统，不依赖 Dokany）。历史验证记录见 README 的“Compatibility
+evidence”表与 git 历史（`dd330e2`、`7a19eb8`）。
+
+验收：`scripts/vc-iscsi-e2e.ps1`（提权）——vc-rs 建卷 → `vcrs mount` 暴露磁盘 →
 Microsoft 发起程序登录（静态目标：`iscsicli AddTarget` + `QLoginTarget`）→ Windows 在
 该磁盘上格式化 NTFS → 写入文本、子目录文件与 1 MiB 随机文件（比对 SHA-256）→ 卸载 →
 真实 VeraCrypt 挂载同一容器并读回全部文件 → `RESULT: ALL OK`。
 
 已知限制：`QAddTargetPortal`（门户扫描）走的是 discovery 会话，上游状态机无法完成
-Microsoft 发起程序的多 PDU 登录，因此必须使用静态目标 + `QLoginTarget`；方案 C（Dokany
-内的用户态 NTFS）仍未实现（NTFS 只有只读库），方案 B（ImDisk proxy）未安装、未验证。
+Microsoft 发起程序的多 PDU 登录，因此必须使用静态目标 + `QLoginTarget`；方案 B（ImDisk
+proxy）未安装、未验证。

@@ -16,11 +16,11 @@ botan = { version = "0.14", default-features = false, features = ["std", "vendor
 botan-sys = "1"
 zeroize = { version = "1", features = ["derive"] }
 thiserror = "2"
-dokan = "0.3.1"
 fatfs = "0.3"
 # Pure-Rust iSCSI target: exposes the decrypted volume as a *block device* over
 # a loopback TCP socket, so Windows' own signed NTFS/exFAT drivers can mount any
-# filesystem (Dokany can only present filesystems we implement ourselves).
+# filesystem.  (A filesystem framework such as Dokany could only ever present
+# filesystems we implement ourselves; its use was dropped for that reason.)
 iscsi-target = "1.0"
 log = "0.4"
 

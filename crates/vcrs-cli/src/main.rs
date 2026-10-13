@@ -38,10 +38,11 @@ enum Command {
     Write(WriteArgs),
     /// Create a FAT filesystem inside an existing volume's data area.
     Format(FormatArgs),
-    /// Mount a volume: as a filesystem at a drive letter (Dokany), or with
-    /// `--raw` as a block device served over a built-in iSCSI target.
+    /// Mount a volume: expose its data area as a raw block device over iSCSI,
+    /// so the initiator's own drivers mount (and can format) the filesystem
+    /// inside it. Needs an elevated prompt to log the target in.
     Mount(MountArgs),
-    /// Unmount a drive letter mounted with `vcrs mount`.
+    /// Detach a volume mounted with `vcrs mount` from the iSCSI initiator.
     Dismount(DismountArgs),
 }
 
@@ -134,15 +135,24 @@ struct FormatArgs {
 struct MountArgs {
     /// Volume file to mount.
     path: PathBuf,
-    /// Drive letter (e.g. `Z:`) or an empty existing directory.
-    #[arg(short, long)]
-    mount_point: Option<String>,
-    /// Expose the volume as a raw block device through a built-in iSCSI target
-    /// instead of a Dokany filesystem. Optional value: `partition` (default;
-    /// a synthetic MBR, so Windows can mount and format the disk) or `raw`
-    /// (the data area starts at LBA 0).
-    #[arg(long, alias = "iscsi", value_name = "MODE", num_args = 0..=1, default_missing_value = "partition")]
-    raw: Option<String>,
+    /// How the disk is presented to the initiator: `partition` (default; the
+    /// data area is exposed as one partition behind a synthetic in-memory MBR,
+    /// which is what Windows needs to format it) or `raw` (the data area starts
+    /// at LBA 0, i.e. a partitionless "super floppy").
+    #[arg(
+        long,
+        aliases = ["iscsi", "raw"],
+        value_name = "MODE",
+        num_args = 0..=1,
+        default_missing_value = "partition"
+    )]
+    disk_mode: Option<String>,
+    /// Report the disk as removable media (the INQUIRY RMB bit).
+    ///
+    /// Windows only offers exFAT in its format dialogs for removable media, so
+    /// this is how to get exFAT into that list.
+    #[arg(long)]
+    removable: bool,
     /// Address the iSCSI target listens on (default `127.0.0.1:3260`).
     #[arg(long, value_name = "ADDR")]
     bind: Option<String>,
@@ -160,11 +170,14 @@ struct MountArgs {
 
 #[derive(Args)]
 struct DismountArgs {
-    /// Drive letter or mount point directory used by `vcrs mount`.
-    mount_point: Option<String>,
-    /// Log out of the iSCSI target started by `vcrs mount --raw` (value: the
-    /// target IQN; defaults to the one `vcrs mount` publishes).
-    #[arg(long, value_name = "IQN", num_args = 0..=1, default_missing_value = "iqn.2025-12.io.vcrs:volume")]
+    /// IQN of the target started by `vcrs mount` (list the attached ones with
+    /// `iscsicli SessionList 1`).
+    #[arg(
+        long,
+        value_name = "IQN",
+        num_args = 0..=1,
+        default_missing_value = "iqn.2025-12.io.vcrs:volume"
+    )]
     iscsi: Option<String>,
 }
 
@@ -367,54 +380,32 @@ fn run() -> Result<()> {
                 ..Default::default()
             };
 
-            if let Some(mode) = &a.raw {
-                let disk_mode = vcrs_mount::DiskMode::from_name(mode).with_context(|| {
+            let disk_mode = match a.disk_mode.as_deref() {
+                None => vcrs_mount::DiskMode::default(),
+                Some(mode) => vcrs_mount::DiskMode::from_name(mode).with_context(|| {
                     format!("unknown disk mode {mode:?}; expected `partition` or `raw`")
-                })?;
-                let mut iscsi = vcrs_mount::IscsiMountOptions::for_volume(&a.path);
-                iscsi.disk_mode = disk_mode;
-                iscsi.read_only = a.read_only;
-                if let Some(bind) = &a.bind {
-                    iscsi.bind_addr = bind.clone();
-                }
-                if let Some(name) = &a.target_name {
-                    iscsi.target_name = name.clone();
-                }
-                vcrs_mount::mount_iscsi(&a.path, &options, &iscsi)?;
-                println!("iSCSI target stopped");
-                return Ok(());
-            }
-
-            let mount_point = a
-                .mount_point
-                .as_deref()
-                .context("`--mount-point` is required unless `--raw` (iSCSI) is used")?;
-            let mount_options = vcrs_mount::MountOptions {
-                read_only: a.read_only,
-                ..Default::default()
+                })?,
             };
-            println!(
-                "mounting {} at {}{} — press Ctrl-C or run `vcrs dismount {}` to stop",
-                a.path.display(),
-                mount_point,
-                if a.read_only { " (read-only)" } else { "" },
-                mount_point
-            );
-            vcrs_mount::mount(&a.path, mount_point, &options, &mount_options)?;
-            println!("{mount_point} has been unmounted");
+            let mut iscsi = vcrs_mount::IscsiMountOptions::for_volume(&a.path);
+            iscsi.disk_mode = disk_mode;
+            iscsi.read_only = a.read_only;
+            iscsi.removable = a.removable;
+            if let Some(bind) = &a.bind {
+                iscsi.bind_addr = bind.clone();
+            }
+            if let Some(name) = &a.target_name {
+                iscsi.target_name = name.clone();
+            }
+            vcrs_mount::mount_iscsi(&a.path, &options, &iscsi)?;
+            println!("iSCSI target stopped");
             Ok(())
         }
         Command::Dismount(a) => {
-            if let Some(iqn) = &a.iscsi {
-                iscsi_logout(iqn)?;
-                return Ok(());
-            }
-            let mount_point = a
-                .mount_point
-                .as_deref()
-                .context("`vcrs dismount` needs a mount point, or `--iscsi <IQN>`")?;
-            vcrs_mount::unmount(mount_point)?;
-            println!("unmounted {mount_point}");
+            let iqn = a.iscsi.as_deref().context(
+                "`vcrs dismount` detaches an iSCSI target: pass `--iscsi <IQN>` \
+                 (the target name printed by `vcrs mount`; `iscsicli SessionList 1` lists them)",
+            )?;
+            iscsi_logout(iqn)?;
             Ok(())
         }
     }

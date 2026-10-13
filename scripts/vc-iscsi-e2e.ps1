@@ -1,6 +1,6 @@
 # Elevated end-to-end acceptance test for the iSCSI ("option A") mount path:
 #
-#   vc-rs container -> vcrs mount --raw (iSCSI target) -> Microsoft Initiator
+#   vc-rs container -> vcrs mount --disk-mode partition (iSCSI target) -> Microsoft Initiator
 #   -> Windows formats NTFS on the disk -> files written by Windows
 #   -> container detached -> real VeraCrypt mounts the SAME container and reads
 #      those files back.
@@ -118,7 +118,7 @@ Remove-Item $Vol -Force -ErrorAction SilentlyContinue
 Check 'container-created' (Test-Path $Vol)
 
 Say '--- 2. serve it as an iSCSI disk'
-$script:proc = Start-Process -FilePath $Vcrs -ArgumentList @('mount', $Vol, '-p', $Pw, '--raw') `
+$script:proc = Start-Process -FilePath $Vcrs -ArgumentList @('mount', $Vol, '-p', $Pw, '--disk-mode partition') `
     -PassThru -NoNewWindow `
     -RedirectStandardOutput (Join-Path $Repo '.logs\vcrs-iscsi.out') `
     -RedirectStandardError (Join-Path $Repo '.logs\vcrs-iscsi.err')

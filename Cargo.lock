@@ -305,29 +305,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dokan"
-version = "0.3.1+dokan206"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2559899e13c4d1c2ad38fa09be2daf9cde88ff4b70495a70ce4aa371b3b3b1a"
-dependencies = [
- "bitflags",
- "dokan-sys",
- "widestring",
- "winapi",
-]
-
-[[package]]
-name = "dokan-sys"
-version = "0.3.1+dokan206"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb7e49e8ac8b6867cd04fc1869a54d4bb32b680180ff2f86d695ef1955534668"
-dependencies = [
- "cc",
- "libc",
- "winapi",
-]
-
-[[package]]
 name = "env_filter"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -876,14 +853,10 @@ dependencies = [
 name = "vcrs-mount"
 version = "0.1.0"
 dependencies = [
- "dokan",
- "dokan-sys",
  "fatfs",
  "iscsi-target",
  "log",
- "thiserror 2.0.21",
  "vcrs-core",
- "widestring",
  "winapi",
 ]
 
@@ -943,12 +916,6 @@ checksum = "23f0c9c52aa7cd7d77769a4cfe2a9adb1b331f489a41d912ce14513d5ab995c6"
 dependencies = [
  "unicode-ident",
 ]
-
-[[package]]
-name = "widestring"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c168940144dd21fd8046987c16a46a33d5fc84eec29ef9dcddc2ac9e31526b7c"
 
 [[package]]
 name = "winapi"

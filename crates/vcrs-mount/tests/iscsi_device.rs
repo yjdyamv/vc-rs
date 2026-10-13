@@ -11,7 +11,7 @@
 //! crate's multi-target server negotiates it, but then writes its PDUs without
 //! the digest (it calls `write_pdu` instead of `write_pdu_digest`), so those two
 //! halves of the crate cannot talk to each other. Real initiators offer `None`
-//! by default -- which is what `scripts/vc-iscsi-test.ps1` proves end to end
+//! by default -- which is what `scripts/vc-iscsi-e2e.ps1` proves end to end
 //! against the Microsoft initiator -- so this is an upstream bug we avoid rather
 //! than paper over. See the module docs of `vcrs_mount::iscsi`.
 //!
@@ -261,6 +261,26 @@ fn the_disk_signature_is_stable_across_sessions() {
     // "initialize this disk?" dialog.
     let again = ScsiVolume::open(&target.path, &target.open, &target.opts).expect("re-open");
     assert_eq!(read_signature(&again), signature);
+}
+
+#[test]
+fn the_removable_bit_is_configurable() {
+    let mut target = Fixture::new("removable", DiskMode::Partitioned, false);
+    assert!(
+        !target.device().removable(),
+        "disks default to fixed media (VeraCrypt's own driver does the same)"
+    );
+
+    // Windows only offers exFAT in its format dialogs for removable media, so
+    // the flag is the way to get exFAT into that list. It has to reach the
+    // device, whose `removable()` the patched INQUIRY turns into the RMB bit of
+    // response byte 1.
+    target.device = None;
+    target.opts.removable = true;
+    target.device = Some(
+        ScsiVolume::open(&target.path, &target.open, &target.opts).expect("re-open as removable"),
+    );
+    assert!(target.device().removable());
 }
 
 #[test]

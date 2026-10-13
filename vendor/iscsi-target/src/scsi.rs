@@ -56,6 +56,16 @@ pub trait ScsiBlockDevice: Send + Sync {
     fn product_rev(&self) -> &str {
         "1.0 "
     }
+
+    /// Whether the device reports itself as removable media, i.e. the RMB bit of
+    /// the standard INQUIRY response.
+    ///
+    /// This only changes how the *initiator's* operating system classifies the
+    /// disk (Windows, for example, only offers exFAT in its format dialogs for
+    /// removable media).  The device itself works identically either way.
+    fn removable(&self) -> bool {
+        false
+    }
 }
 
 /// SCSI command opcodes (subset needed for basic block storage)
@@ -342,8 +352,9 @@ impl ScsiHandler {
         // Peripheral device type: 0x00 = Direct access block device (disk)
         data[0] = 0x00;
 
-        // RMB (Removable media bit) = 0 (not removable)
-        data[1] = 0x00;
+        // RMB (Removable media bit); the initiator's OS uses it to classify the
+        // disk (Windows hides exFAT in format dialogs for fixed disks).
+        data[1] = if device.removable() { 0x80 } else { 0x00 };
 
         // Version: 0x05 = SPC-3
         data[2] = 0x05;
