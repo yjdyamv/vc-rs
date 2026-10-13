@@ -92,6 +92,10 @@ struct PasswordArgs {
     /// Personal iterations multiplier (0 = VeraCrypt default).
     #[arg(long, default_value_t = 0)]
     pim: i32,
+    /// Keyfile, or a directory whose files are used as keyfiles.  Repeatable;
+    /// the keyfile pool is mixed into the password exactly like VeraCrypt does.
+    #[arg(short = 'k', long = "keyfile", value_name = "PATH", action = clap::ArgAction::Append)]
+    keyfiles: Vec<PathBuf>,
 }
 
 impl PasswordArgs {
@@ -112,6 +116,16 @@ impl PasswordArgs {
             .clone()
             .context("no password given (use --password, $VCRS_PASSWORD or --password-stdin)")?;
         Ok(p.into_bytes())
+    }
+    fn open_options(&self, volume_type: Option<VolumeType>, use_backup_header: bool) -> Result<OpenOptions> {
+        Ok(OpenOptions {
+            password: self.read()?,
+            keyfiles: self.keyfiles.clone(),
+            pim: self.pim,
+            volume_type,
+            use_backup_header,
+            ..Default::default()
+        })
     }
 }
 
@@ -278,6 +292,7 @@ fn run() -> Result<()> {
                 ea,
                 prf,
                 password: a.password.read()?,
+                keyfiles: a.password.keyfiles.clone(),
                 pim: a.password.pim,
                 sector_size: 512,
                 full_format: a.full,
@@ -299,6 +314,7 @@ fn run() -> Result<()> {
                 ea: parse_ea(&a.ea)?,
                 prf: parse_prf(&a.prf)?,
                 password: a.password.read()?,
+                keyfiles: a.password.keyfiles.clone(),
                 pim: a.password.pim,
                 sector_size: 512,
                 full_format: false,
@@ -316,21 +332,14 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::Info(a) => {
-            let options = OpenOptions {
-                password: a.password.read()?,
-                pim: a.password.pim,
-                volume_type: a.kind.volume_type(),
-                use_backup_header: a.backup,
-                ..Default::default()
-            };
+            let options = a.password.open_options(a.kind.volume_type(), a.backup)?;
             let volume = Volume::open(&a.path, &options)?;
             print_header(&volume);
             Ok(())
         }
         Command::Header(a) => dump_header_region(&a),
         Command::Read(a) => {
-            let password = a.password.read()?;
-            let volume = open_ro(&a.path, password, a.password.pim, a.kind.volume_type())?;
+            let volume = open_ro(&a.path, &a.password, a.kind.volume_type())?;
             let mut buf = vec![0u8; a.length as usize];
             volume.read_data(a.offset, &mut buf)?;
             if let Some(out) = a.out {
@@ -347,8 +356,7 @@ fn run() -> Result<()> {
                 (None, Some(p)) => std::fs::read(p)?,
                 (None, None) => bail!("pass --hex or --from"),
             };
-            let password = a.password.read()?;
-            let volume = open_rw(&a.path, password, a.password.pim, a.kind.volume_type())?;
+            let volume = open_rw(&a.path, &a.password, a.kind.volume_type())?;
             volume.write_data(a.offset, &data)?;
             volume.flush()?;
             println!("wrote {} bytes at data offset {}", data.len(), a.offset);
@@ -360,8 +368,7 @@ fn run() -> Result<()> {
                 "fat32" => vcrs_mount::FatKind::Fat32,
                 _ => vcrs_mount::FatKind::Auto,
             };
-            let password = a.password.read()?;
-            let mut volume = open_rw(&a.path, password, a.password.pim, a.kind.volume_type())?;
+            let mut volume = open_rw(&a.path, &a.password, a.kind.volume_type())?;
             vcrs_mount::format_volume(&mut volume, kind, &a.label)?;
             volume.flush()?;
             println!(
@@ -369,16 +376,11 @@ fn run() -> Result<()> {
                 a.label,
                 a.path.display()
             );
-            println!("mount it with: vcrs mount {} --mount-point Z:", a.path.display());
+            println!("expose it to Windows with: vcrs mount {}", a.path.display());
             Ok(())
         }
         Command::Mount(a) => {
-            let options = OpenOptions {
-                password: a.password.read()?,
-                pim: a.password.pim,
-                volume_type: a.kind.volume_type(),
-                ..Default::default()
-            };
+            let options = a.password.open_options(a.kind.volume_type(), false)?;
 
             let disk_mode = match a.disk_mode.as_deref() {
                 None => vcrs_mount::DiskMode::default(),
@@ -488,20 +490,12 @@ fn session_id_for_target(list: &str, iqn: &str) -> Option<String> {
     None
 }
 
-fn open_ro(path: &Path, password: Vec<u8>, pim: i32, volume_type: Option<VolumeType>) -> Result<Volume> {    Volume::open(
-        path,
-        &OpenOptions {
-            password,
-            pim,
-            volume_type,
-            ..Default::default()
-        },
-    )
-    .map_err(Into::into)
+fn open_ro(path: &Path, creds: &PasswordArgs, volume_type: Option<VolumeType>) -> Result<Volume> {
+    Volume::open(path, &creds.open_options(volume_type, false)?).map_err(Into::into)
 }
 
-fn open_rw(path: &Path, password: Vec<u8>, pim: i32, volume_type: Option<VolumeType>) -> Result<Volume> {
-    open_ro(path, password, pim, volume_type)
+fn open_rw(path: &Path, creds: &PasswordArgs, volume_type: Option<VolumeType>) -> Result<Volume> {
+    open_ro(path, creds, volume_type)
 }
 
 fn parse_ea(s: &str) -> Result<EncryptionAlgorithm> {

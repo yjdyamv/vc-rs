@@ -10,6 +10,7 @@
 //! | [`layout`] | `src/Volume/VolumeLayout.cpp` |
 //! | [`prf`] | `src/Volume/Pkcs5Kdf.h`, `src/Common/Pkcs5.c` |
 //! | [`cipher`] | `src/Volume/Cipher.cpp`, `src/Volume/EncryptionAlgorithm.cpp` |
+//! | [`keyfile`] | `src/Common/Keyfiles.c` |
 //! | [`xts`] | `src/Volume/EncryptionModeXTS.cpp` |
 //! | [`volume`] | `src/Core/VolumeCreator.cpp`, `src/Volume/Volume.cpp` |
 //!
@@ -37,6 +38,7 @@
 pub mod cipher;
 pub mod error;
 pub mod header;
+pub mod keyfile;
 pub mod layout;
 pub mod prf;
 pub mod volume;
@@ -45,6 +47,7 @@ pub mod xts;
 pub use cipher::{CipherId, EncryptionAlgorithm};
 pub use error::{Error, Result};
 pub use header::{VolumeHeader, VolumeType};
+pub use keyfile::apply_keyfiles;
 pub use layout::VolumeLayout;
 pub use prf::Prf;
 pub use volume::{CreateOptions, OpenOptions, Volume};

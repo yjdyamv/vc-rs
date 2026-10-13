@@ -53,7 +53,7 @@ iSCSI 发起程序，Windows 看到的是一块真实磁盘，于是**用 Window
 | FAT filesystem creation inside the volume (`vcrs format`) | ✅ |
 | Raw disk for Windows over iSCSI (`vcrs mount`): any filesystem Windows supports | ✅ (verified: Windows formatted NTFS through it, VeraCrypt read the files back) |
 | Read-only disks, hidden volumes, `--disk-mode raw`, removable-media reporting | ✅ |
-| Keyfiles | ⬜ not implemented yet |
+| Keyfiles (password + keyfile pool, files or a directory) | ✅ (VeraCrypt-made keyfile containers open; reverse direction checked by `scripts/vc-keyfile-test.ps1`) |
 | System (pre-boot) encryption, in-place encryption of a system partition | ⬜ out of scope |
 
 ## Build
@@ -92,21 +92,29 @@ vcrs dismount --iscsi iqn.2025-12.io.vcrs:secret
 vcrs read  secret.vc --password "correct horse" --offset 0 --length 4096 --out head.bin
 vcrs write secret.vc --password "correct horse" --offset 0 --from head.bin
 
+# Keyfiles (`-k` is repeatable; a directory means "all files in it", like VeraCrypt):
+vcrs create secret.vc --size 100M --password "correct horse" -k usb.key
+vcrs info   secret.vc --password "correct horse" -k usb.key
+vcrs info   secret.vc --password "correct horse" -k "D:\keyfiles"
+
 # Cascades, other KDFs and PIM work too:
 vcrs create paranoia.vc --size 200M --password pw --ea AES-Twofish-Serpent --prf Whirlpool --pim 30
 ```
 
 `--password-stdin` (raw bytes) and `$VCRS_PASSWORD` are supported; prefer those over
 `--password` for anything real, since command lines are visible to other processes.
+`-k/--keyfile` may be repeated, and accepts a file or a directory of keyfiles; the
+keyfile pool is mixed into the password exactly as VeraCrypt does (64-byte legacy pool
+for passwords up to 64 bytes, 128-byte pool above that).
 `RUST_LOG=debug` prints the trial-decryption details (which layout/PRF/EA matched).
 
 ## Compatibility evidence
 
 Compatibility is not asserted, it is tested against a real VeraCrypt 1.26.29 install
 (`scripts/vc-crosscheck.ps1`, `scripts/vc-crosscheck2.ps1`, `scripts/vc-hidden-test.ps1`,
-`scripts/vc-iscsi-e2e.ps1`; everything that mounts with VeraCrypt needs an elevated shell
-because VeraCrypt mounts through its kernel driver — the iSCSI *target* itself needs no
-administration, only the initiator does).
+`scripts/vc-iscsi-e2e.ps1`, `scripts/vc-keyfile-test.ps1`; everything that mounts with
+VeraCrypt needs an elevated shell because VeraCrypt mounts through its kernel driver —
+the iSCSI *target* itself needs no administration, only the initiator does).
 
 | Direction | Test | Result |
 | --- | --- | --- |
@@ -124,6 +132,9 @@ administration, only the initiator does).
 | Persistence across sessions | Windows writes through the iSCSI disk, the disk is detached, then attached again: the files are still there (they live in the container) | ✅ |
 | Windows NTFS through iSCSI, read by vc-rs | After Windows formatted the disk, `vcrs read` of data offset 0 shows the NTFS boot sector (`EB 52 90 "NTFS    "`) | ✅ |
 | Removable-media reporting (`--removable`) | Windows classifies the disk as removable media (`Win32_DiskDrive.MediaType` = `Removable Media`, vs `Fixed hard disk media` for the internal NVMe disk), which is what makes exFAT show up in its format dialog | ✅ |
+| VeraCrypt → vc-rs (keyfile) | VeraCrypt creates a container with `/keyfile`; `vcrs info -k` opens it and decrypts its FAT16 boot sector, while the same password without `-k` is rejected | ✅ |
+| VeraCrypt → vc-rs (keyfile + 102-byte password) | Same with a password longer than 64 bytes, i.e. VeraCrypt's 128-byte keyfile pool layout | ✅ |
+| vc-rs → VeraCrypt (keyfile) | `vcrs create -k` makes a container holding a VeraCrypt-created FAT16 image; VeraCrypt mounts it with `/keyfile` and reads `fromvc.txt` | ✅ (`scripts/vc-keyfile-test.ps1`) |
 | Dokany-era checks (historical) | With the Dokany filesystem mount (removed since; code in git history): files written through the drive letter were read back by VeraCrypt, a file VeraCrypt wrote into the vc-rs-made FAT was read back through the mount, and the same held for hidden volumes | ✅ (`scripts/vc-dokan-crosscheck.ps1` = `ALL OK`, `scripts/vc-hidden-test.ps1` = `HIDDEN ROUND TRIP OK: True`, `FULL HIDDEN CHAIN OK: True`) |
 
 Header encodings are also pinned by unit tests for CRC-32 (VeraCrypt's own self-test

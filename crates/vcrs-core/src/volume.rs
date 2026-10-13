@@ -13,9 +13,10 @@
 
 use std::fs::File;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::cipher::EncryptionAlgorithm;
+use crate::keyfile::apply_keyfiles;
 use crate::header::{
     VolumeHeader, VolumeType, HEADER_SALT_SIZE, MAX_SECTOR_SIZE, MIN_SECTOR_SIZE,
     TOTAL_VOLUME_HEADERS_SIZE, TC_VOLUME_MIN_REQUIRED_PROGRAM_VERSION, VOLUME_HEADER_SIZE,
@@ -43,6 +44,8 @@ pub struct CreateOptions {
     pub prf: Prf,
     /// Password bytes (VeraCrypt uses the UTF-8 encoding of the password).
     pub password: Vec<u8>,
+    /// Keyfiles (files or directories) whose pool is mixed into the password.
+    pub keyfiles: Vec<PathBuf>,
     /// Personal Iterations Multiplier; 0 means the default iteration count.
     pub pim: i32,
     pub sector_size: u32,
@@ -59,6 +62,7 @@ impl Default for CreateOptions {
             ea: EncryptionAlgorithm::Aes,
             prf: Prf::Sha512,
             password: Vec::new(),
+            keyfiles: Vec::new(),
             pim: 0,
             sector_size: MIN_SECTOR_SIZE,
             full_format: false,
@@ -66,10 +70,19 @@ impl Default for CreateOptions {
     }
 }
 
+impl CreateOptions {
+    /// The password bytes the KDF sees, i.e. with the keyfile pool mixed in.
+    pub fn effective_password(&self, volume: Option<&Path>) -> Result<Vec<u8>> {
+        apply_keyfiles(&self.password, &self.keyfiles, volume)
+    }
+}
+
 /// How to open a volume.
 #[derive(Debug, Clone, Default)]
 pub struct OpenOptions {
     pub password: Vec<u8>,
+    /// Keyfiles (files or directories) whose pool is mixed into the password.
+    pub keyfiles: Vec<PathBuf>,
     pub pim: i32,
     /// If known, only this PRF is tried (saves one KDF per PRF).
     pub prf: Option<Prf>,
@@ -79,6 +92,13 @@ pub struct OpenOptions {
     pub volume_type: Option<VolumeType>,
     /// Read the backup header instead of the primary one.
     pub use_backup_header: bool,
+}
+
+impl OpenOptions {
+    /// The password bytes the KDF sees, i.e. with the keyfile pool mixed in.
+    pub fn effective_password(&self, volume: Option<&Path>) -> Result<Vec<u8>> {
+        apply_keyfiles(&self.password, &self.keyfiles, volume)
+    }
 }
 
 /// An opened VeraCrypt volume.
@@ -128,6 +148,9 @@ impl Volume {
         let data_offset = layout.creation_data_offset(host_size, volume_size)?;
 
         let master_key = random_master_key(options.ea)?;
+        // Keyfiles are mixed into the password *before* any key derivation; the
+        // backup header is then derived from the same bytes with a fresh salt.
+        let password = options.effective_password(Some(path))?;
         let header = VolumeHeader {
             version: VOLUME_HEADER_VERSION,
             required_min_version: TC_VOLUME_MIN_REQUIRED_PROGRAM_VERSION,
@@ -151,7 +174,7 @@ impl Volume {
             &file,
             layout.header_offset(),
             &header,
-            &options.password,
+            &password,
             options.pim,
             &header.salt,
         )?;
@@ -166,7 +189,7 @@ impl Volume {
         // independent. Then its own fake hidden header.
         let backup_offset = backup_offset_of(host_size, layout)?;
         let backup_salt = random_bytes(HEADER_SALT_SIZE)?;
-        write_header_region(&file, backup_offset, &header, &options.password, options.pim, &backup_salt)?;
+        write_header_region(&file, backup_offset, &header, &password, options.pim, &backup_salt)?;
         write_fake_hidden_region(&file, backup_offset + VOLUME_HEADER_SIZE, host_size, host_size, options)?;
 
         file.sync_all()?;
@@ -205,6 +228,7 @@ impl Volume {
             .max_data_size(hidden_size)
             .ok_or_else(|| Error::InvalidParameter("hidden size too small".into()))?;
         let data_offset = layout.creation_data_offset(host_size, hidden_size)?;
+        let password = options.effective_password(Some(path))?;
 
         let header = VolumeHeader {
             version: VOLUME_HEADER_VERSION,
@@ -228,13 +252,13 @@ impl Volume {
             &file,
             layout.header_offset(),
             &header,
-            &options.password,
+            &password,
             options.pim,
             &header.salt,
         )?;
         let backup_offset = backup_offset_of(host_size, layout)?;
         let backup_salt = random_bytes(HEADER_SALT_SIZE)?;
-        write_header_region(&file, backup_offset, &header, &options.password, options.pim, &backup_salt)?;
+        write_header_region(&file, backup_offset, &header, &password, options.pim, &backup_salt)?;
 
         if options.full_format {
             randomize_data_area(&file, data_offset, volume_size, options.ea)?;
@@ -249,6 +273,8 @@ impl Volume {
     pub fn open(path: &Path, options: &OpenOptions) -> Result<Volume> {
         let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
         let host_size = file.metadata()?.len();
+        // The keyfile pool is mixed in once; every trial below derives from it.
+        let password = options.effective_password(Some(path))?;
 
         let mut layouts: Vec<VolumeLayout> = Vec::new();
         match options.volume_type {
@@ -285,7 +311,7 @@ impl Volume {
 
             for prf in &prfs {
                 let mut header_key = vec![0u8; HEADER_KEY_SIZE];
-                prf.derive(&options.password, &region[..HEADER_SALT_SIZE], options.pim, &mut header_key)?;
+                prf.derive(&password, &region[..HEADER_SALT_SIZE], options.pim, &mut header_key)?;
 
                 // One 192-byte derived key serves every encryption algorithm
                 // (each EA consumes only its own prefix), so the cheap magic
