@@ -832,9 +832,11 @@ dependencies = [
  "anyhow",
  "clap",
  "env_logger",
+ "libc",
  "log",
  "vcrs-core",
  "vcrs-mount",
+ "winapi",
 ]
 
 [[package]]

@@ -97,10 +97,12 @@ pub struct CreateOptions {
     /// Personal Iterations Multiplier; 0 means the default iteration count.
     pub pim: i32,
     pub sector_size: u32,
-    /// When false (the default, like VeraCrypt's "quick format") the data area
-    /// is left as whatever the file system reports as free/empty space. When
-    /// true the whole data area is filled with zeros encrypted under a
-    /// throwaway key, exactly like VeraCrypt's slow format.
+    /// When false (VeraCrypt's "quick format") the data area is left as
+    /// whatever the file system reports as free/empty space, which means the
+    /// untouched part of the volume stays zero bytes on disk and is therefore
+    /// recognisable as a region nobody ever wrote to. When true (the default,
+    /// as in VeraCrypt) the whole data area is filled with zeros encrypted
+    /// under a throwaway key, exactly like VeraCrypt's slow format.
     pub full_format: bool,
 }
 
@@ -113,7 +115,7 @@ impl Default for CreateOptions {
             keyfiles: Vec::new(),
             pim: 0,
             sector_size: MIN_SECTOR_SIZE,
-            full_format: false,
+            full_format: true,
         }
     }
 }
@@ -721,6 +723,75 @@ impl Volume {
         Ok(())
     }
 
+    /// Change the credentials of this volume's header (VeraCrypt's "Change
+    /// Volume Password").
+    ///
+    /// Both the primary and the backup copy of the header are rewritten, each
+    /// with a *fresh* random salt, encrypted under a key derived from
+    /// `new_password`; the master key -- and with it the whole data area -- is
+    /// not touched, so this is instant even for a huge container. The other
+    /// header slot of the host file (the hidden volume's, or the fake hidden
+    /// header of an ordinary container) is left alone.
+    ///
+    /// `new_password` is the password as the KDF sees it, i.e. with the keyfile
+    /// pool already mixed in (see [`OpenOptions::effective_password`]).
+    /// `new_prf` of `None` keeps the header key derivation function the volume
+    /// already uses. The PIM is not stored in the header, so the caller has to
+    /// remember the new one.
+    pub fn change_credentials(
+        &mut self,
+        new_password: &[u8],
+        new_pim: i32,
+        new_prf: Option<Prf>,
+    ) -> Result<()> {
+        if matches!(self.layout, VolumeLayout::V1Normal) {
+            return Err(Error::Unsupported(
+                "changing the credentials of a legacy V1 volume is not supported".into(),
+            ));
+        }
+        if self.in_place.is_some() {
+            return Err(Error::Unsupported(
+                "the credentials of a volume whose in-place encryption is unfinished cannot be \
+                 changed; finish (or resume) that first"
+                    .into(),
+            ));
+        }
+
+        let mut header = self.header.clone();
+        header.prf = new_prf.unwrap_or(header.prf);
+
+        // VeraCrypt derives one key per copy from a salt generated for that copy
+        // (`VolumeCreator::CreateVolumeHeaderInMemory`).
+        let primary_salt = random_bytes(HEADER_SALT_SIZE)?;
+        write_header_region_verified(
+            &self.file,
+            self.layout.header_offset(),
+            &header,
+            new_password,
+            new_pim,
+            &primary_salt,
+        )?;
+        let backup_salt = random_bytes(HEADER_SALT_SIZE)?;
+        write_header_region_verified(
+            &self.file,
+            backup_offset_of(self.host_size, self.layout)?,
+            &header,
+            new_password,
+            new_pim,
+            &backup_salt,
+        )?;
+
+        let previous_prf = self.header.prf;
+        header.salt = primary_salt;
+        self.file.sync_all()?;
+        self.header = header;
+        log::info!(
+            "changed the header credentials: {previous_prf} -> {} with PIM {new_pim}",
+            self.header.prf
+        );
+        Ok(())
+    }
+
     fn check_protection(&self, host_offset: u64, len: u64) -> Result<()> {
         let Some(range) = self.protected.get().copied() else {
             return Ok(());
@@ -873,11 +944,43 @@ fn write_header_region(
     pim: i32,
     salt: &[u8],
 ) -> Result<()> {
-    let mut header_key = vec![0u8; HEADER_KEY_SIZE];
-    header.prf.derive(password, salt, pim, &mut header_key)?;
-    let region = header.encrypt_with_salt(VOLUME_HEADER_SIZE as usize, &header_key, salt)?;
+    let region = build_header_region(header, password, pim, salt)?;
     write_all_at(file, offset, &region)?;
     Ok(())
+}
+
+/// Like [`write_header_region`], but read the region back and compare it, so a
+/// header that was only partially written (or written to the wrong place) is
+/// noticed before the old one is gone for good.
+fn write_header_region_verified(
+    file: &File,
+    offset: u64,
+    header: &VolumeHeader,
+    password: &[u8],
+    pim: i32,
+    salt: &[u8],
+) -> Result<()> {
+    let region = build_header_region(header, password, pim, salt)?;
+    write_all_at(file, offset, &region)?;
+    let mut read_back = vec![0u8; region.len()];
+    read_exact_at(file, offset, &mut read_back)?;
+    if read_back != region {
+        return Err(Error::InvalidHeader(format!(
+            "the header written at offset {offset} did not read back unchanged"
+        )));
+    }
+    Ok(())
+}
+
+fn build_header_region(
+    header: &VolumeHeader,
+    password: &[u8],
+    pim: i32,
+    salt: &[u8],
+) -> Result<Vec<u8>> {
+    let mut header_key = vec![0u8; HEADER_KEY_SIZE];
+    header.prf.derive(password, salt, pim, &mut header_key)?;
+    header.encrypt_with_salt(VOLUME_HEADER_SIZE as usize, &header_key, salt)
 }
 
 /// VeraCrypt writes a *fake* hidden-volume header into every hidden header slot
@@ -1364,6 +1467,468 @@ impl std::fmt::Debug for Volume {
             .field("data_size", &self.data_size)
             .finish()
     }
+}
+
+/// The whole header area of a container: the primary group (the ordinary
+/// header at offset 0, the hidden header at 64 KiB) followed by the backup
+/// group (the same two copies at the end of the file) -- 256 KiB.
+pub fn read_header_area(path: &Path) -> Result<Vec<u8>> {
+    read_region(path, 0, TOTAL_VOLUME_HEADERS_SIZE as usize)
+}
+
+/// The primary header group of a container: the ordinary header at offset 0 and
+/// the hidden one at 64 KiB -- 128 KiB.
+///
+/// This is byte for byte what VeraCrypt's "Backup Volume Header" saves to a
+/// `.hc` file (`TC_VOLUME_HEADER_GROUP_SIZE`) and what its restore reads back.
+pub fn read_header_group(path: &Path) -> Result<Vec<u8>> {
+    read_region(path, 0, VOLUME_HEADER_GROUP_SIZE as usize)
+}
+
+/// Write a backup copy of a container's header to `out` (VeraCrypt's "Backup
+/// Volume Header").
+///
+/// The file holds the container's primary header group: the ordinary volume
+/// header and, at 64 KiB, the hidden volume header -- or, for a container
+/// without one, the random bytes that stand in for it. That is the size
+/// VeraCrypt's restore insists on, so a file written here can be restored by
+/// VeraCrypt, and VeraCrypt's own backups can be restored from here. Together
+/// with the password such a copy is enough to open a container whose headers
+/// were destroyed -- so whoever has this file needs the password and nothing
+/// else.
+///
+/// Returns the number of bytes written.
+pub fn backup_headers(path: &Path, out: &Path) -> Result<u64> {
+    let group = read_header_group(path)?;
+    std::fs::write(out, &group)?;
+    Ok(group.len() as u64)
+}
+
+/// Restore a container's header from a backup file (VeraCrypt's "Restore Volume
+/// Header").
+///
+/// The file has to be a 128 KiB header group; VeraCrypt rejects anything else,
+/// and so does this. Only the slots belonging to `volume_type` are written, and
+/// the backup copy always goes to the *current* end of the container, so
+/// restoring an old backup into a container that has grown since then does not
+/// scribble over the data area -- and restoring an outer volume's header leaves
+/// a hidden volume inside it intact.
+///
+/// With a password both copies are re-encrypted under a fresh salt, exactly as
+/// VeraCrypt's restore does, and the result has to open; if it does not (say
+/// the file belongs to a different volume) the previous header is put back and
+/// an error is returned, so a wrong file cannot brick a container that was
+/// still fine. Without a password the bytes are copied as they are and nothing
+/// can be verified. The opened volume is returned so the caller can report what
+/// was restored.
+pub fn restore_headers(
+    path: &Path,
+    from: &Path,
+    volume_type: VolumeType,
+    verify: Option<&OpenOptions>,
+) -> Result<Option<Volume>> {
+    let group = std::fs::read(from)?;
+    if group.len() != VOLUME_HEADER_GROUP_SIZE as usize {
+        return Err(Error::InvalidParameter(format!(
+            "{} holds {} bytes; a header backup is {VOLUME_HEADER_GROUP_SIZE} bytes",
+            from.display(),
+            group.len()
+        )));
+    }
+    let region = header_region_in_group(&group, volume_type)?;
+    restore_header_region(path, region, volume_type, verify, &from.display().to_string())
+}
+
+/// Restore a container's header from the copy embedded in the container itself
+/// (the backup header group at the end of the file).
+///
+/// The primary group is preferred and the embedded copy is used when the
+/// primary one does not open with the given password -- which is the case this
+/// exists for: a destroyed primary header.
+pub fn restore_headers_from_embedded(
+    path: &Path,
+    volume_type: VolumeType,
+    verify: Option<&OpenOptions>,
+) -> Result<Option<Volume>> {
+    let layout = volume_type.creation_layout();
+    let size = layout.header_size() as usize;
+    let slot = layout.header_offset();
+    let host_size = std::fs::metadata(path)?.len();
+    let primary = read_region(path, slot, size)?;
+    let embedded = read_region(path, backup_offset_of(host_size, layout)? + slot, size)?;
+    let region = match verify {
+        // Without a password there is no way to tell which copy is the good one;
+        // take the primary one, the same choice a plain copy makes.
+        None => primary,
+        Some(options) => {
+            let password = options.effective_password(Some(path))?;
+            if decrypt_header_region(&primary, &password, options, volume_type).is_some() {
+                primary
+            } else {
+                embedded
+            }
+        }
+    };
+    restore_header_region(path, &region, volume_type, verify, "the embedded backup header")
+}
+
+/// The `volume_type` header of a 128 KiB header group: the ordinary one first,
+/// the hidden one second (VeraCrypt reads a hidden layout's header at
+/// `GetHeaderSize()` and every other layout's at 0).
+fn header_region_in_group(group: &[u8], volume_type: VolumeType) -> Result<&[u8]> {
+    let layout = volume_type.creation_layout();
+    let offset = layout.header_offset() as usize;
+    let size = layout.header_size() as usize;
+    group.get(offset..offset + size).ok_or_else(|| {
+        Error::InvalidParameter(format!(
+            "a header group is {VOLUME_HEADER_GROUP_SIZE} bytes, got {}",
+            group.len()
+        ))
+    })
+}
+
+/// Put `region` (a 64 KiB header as stored on disk, salt included) into both
+/// slots of `volume_type`, either verbatim (no password: nothing can be
+/// re-encrypted or checked) or re-encrypted under fresh salts like VeraCrypt's
+/// restore does.
+fn restore_header_region(
+    path: &Path,
+    region: &[u8],
+    volume_type: VolumeType,
+    verify: Option<&OpenOptions>,
+    source: &str,
+) -> Result<Option<Volume>> {
+    let layout = volume_type.creation_layout();
+    let size = layout.header_size() as usize;
+    if region.len() != size {
+        return Err(Error::InvalidParameter(format!(
+            "{source} holds a {} byte header, expected {size}",
+            region.len()
+        )));
+    }
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let host_size = file.metadata()?.len();
+    let primary = layout.header_offset();
+    let backup = backup_offset_of(host_size, layout)?;
+    let previous_primary = read_region(path, primary, size)?;
+    let previous_backup = read_region(path, backup, size)?;
+
+    let Some(options) = verify else {
+        write_all_at(&file, primary, region)?;
+        write_all_at(&file, backup, region)?;
+        file.sync_all()?;
+        log::warn!(
+            "restored the {} header from {source} without verifying it (no password was given)",
+            volume_type.name()
+        );
+        return Ok(None);
+    };
+
+    let password = options.effective_password(Some(path))?;
+    let Some(header) = decrypt_header_region(region, &password, options, volume_type) else {
+        return Err(Error::InvalidHeader(format!(
+            "the header from {source} does not open with those credentials (it is not a {} volume's \
+             header, or it is damaged)",
+            volume_type.name()
+        )));
+    };
+
+    let primary_salt = random_bytes(HEADER_SALT_SIZE)?;
+    let backup_salt = random_bytes(HEADER_SALT_SIZE)?;
+    write_header_region_verified(&file, primary, &header, &password, options.pim, &primary_salt)?;
+    write_header_region_verified(&file, backup, &header, &password, options.pim, &backup_salt)?;
+    file.sync_all()?;
+
+    let mut pinned = options.clone();
+    pinned.volume_type = Some(volume_type);
+    pinned.use_backup_header = false;
+    match Volume::open(path, &pinned) {
+        Ok(volume) => {
+            log::info!(
+                "restored the {} header from {source} (data area {} bytes, backup header at \
+                 {backup})",
+                volume_type.name(),
+                volume.data_size
+            );
+            Ok(Some(volume))
+        }
+        Err(e) => {
+            write_all_at(&file, primary, &previous_primary)?;
+            write_all_at(&file, backup, &previous_backup)?;
+            file.sync_all()?;
+            Err(Error::InvalidHeader(format!(
+                "the header from {source} does not open after being restored ({e}); the previous \
+                 header is unchanged"
+            )))
+        }
+    }
+}
+
+/// Decrypt a header region with the credentials of `options`, trying all the
+/// KDFs and algorithms when they are not pinned, and return the header when it
+/// is one for `volume_type`.
+fn decrypt_header_region(
+    region: &[u8],
+    password: &[u8],
+    options: &OpenOptions,
+    volume_type: VolumeType,
+) -> Option<VolumeHeader> {
+    if region.len() < VOLUME_HEADER_SIZE as usize {
+        return None;
+    }
+    let prfs: Vec<Prf> = match options.prf {
+        Some(prf) => vec![prf],
+        None => Prf::ALL.to_vec(),
+    };
+    let eas: Vec<EncryptionAlgorithm> = match options.ea {
+        Some(ea) => vec![ea],
+        None => EncryptionAlgorithm::ALL.to_vec(),
+    };
+    for prf in prfs {
+        let mut header_key = vec![0u8; HEADER_KEY_SIZE];
+        if prf
+            .derive(password, &region[..HEADER_SALT_SIZE], options.pim, &mut header_key)
+            .is_err()
+        {
+            continue;
+        }
+        for ea in &eas {
+            if !VolumeHeader::region_has_magic(region, &header_key, *ea).unwrap_or(false) {
+                continue;
+            }
+            if let Ok(header) = VolumeHeader::decrypt(region, &header_key, *ea, prf) {
+                if header.volume_type == volume_type {
+                    return Some(header);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// How to rebuild a header from a bare master key
+/// ([`restore_headers_from_master_key`]).
+#[derive(Debug, Clone)]
+pub struct RestoreHeaderOptions {
+    /// Password for the *new* header, as the KDF sees it: with the keyfile pool
+    /// already mixed in, see [`Self::effective_password`].
+    pub password: Vec<u8>,
+    /// Keyfiles to mix into [`Self::password`].
+    pub keyfiles: Vec<PathBuf>,
+    /// PIM of the new header.
+    pub pim: i32,
+    /// The encryption algorithm the master key belongs to.
+    ///
+    /// The key's length narrows this down but cannot identify it (cascades of
+    /// the same length look alike), so the caller has to say which one it is.
+    pub ea: EncryptionAlgorithm,
+    /// Header key derivation function for the new header.
+    pub prf: Prf,
+    /// Sector size the volume was created with (512 unless it was changed).
+    pub sector_size: u32,
+    /// Which header to rebuild.
+    pub volume_type: VolumeType,
+    /// Size of the volume's data area in bytes: `host_size - 262144` for an
+    /// ordinary volume, the hidden volume's data size for a hidden one.
+    pub data_size: u64,
+}
+
+impl RestoreHeaderOptions {
+    /// The password bytes the KDF sees, i.e. with the keyfile pool mixed in.
+    pub fn effective_password(&self, volume: Option<&Path>) -> Result<Vec<u8>> {
+        apply_keyfiles(&self.password, &self.keyfiles, volume)
+    }
+}
+
+/// Rebuild a container's header from its master key: VeraCrypt's "Restore
+/// Volume Header" for the case where every header copy is gone.
+///
+/// The master key is what decrypts the data area, and the data area is not
+/// touched by this -- only the two header slots of `options.volume_type` are
+/// written, so the result is an ordinary container that opens with
+/// `options.password`/`pim`/`prf` and still holds all the data. Without the
+/// master key the data area itself cannot be recovered, so this is the last
+/// resort.
+pub fn restore_headers_from_master_key(
+    path: &Path,
+    master_key: &[u8],
+    options: &RestoreHeaderOptions,
+) -> Result<Volume> {
+    validate_sector_size(options.sector_size)?;
+    let layout = options.volume_type.creation_layout();
+    let expected_key_len = options.ea.key_size() * 2;
+    if master_key.len() != expected_key_len {
+        return Err(Error::InvalidParameter(format!(
+            "a {} master key is {expected_key_len} bytes, got {}",
+            options.ea,
+            master_key.len()
+        )));
+    }
+    let unit = DATA_UNIT_SIZE as u64;
+    if options.data_size == 0 || options.data_size % unit != 0 {
+        return Err(Error::InvalidParameter(format!(
+            "the data area size must be a non-zero multiple of {DATA_UNIT_SIZE}, got {}",
+            options.data_size
+        )));
+    }
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let host_size = file.metadata()?.len();
+    let data_offset = layout.creation_data_offset(host_size, options.data_size)?;
+    if data_offset + options.data_size > host_size {
+        return Err(Error::InvalidParameter(format!(
+            "a {} data area of {} bytes does not fit in a {host_size} byte container",
+            layout_var_name(options.volume_type),
+            options.data_size
+        )));
+    }
+    if options.volume_type == VolumeType::Normal {
+        if let Some(natural) = layout.max_data_size(host_size) {
+            if natural != options.data_size {
+                log::warn!(
+                    "an ordinary volume in a {host_size} byte container normally has a \
+                     {natural} byte data area; building a {} byte one as requested",
+                    options.data_size
+                );
+            }
+        }
+    }
+
+    let header = VolumeHeader {
+        version: VOLUME_HEADER_VERSION,
+        required_min_version: TC_VOLUME_MIN_REQUIRED_PROGRAM_VERSION,
+        volume_type: options.volume_type,
+        creation_time: 0,
+        modification_time: 0,
+        hidden_volume_data_size: match options.volume_type {
+            VolumeType::Hidden => options.data_size,
+            VolumeType::Normal => 0,
+        },
+        volume_data_size: options.data_size,
+        encrypted_area_start: data_offset,
+        encrypted_area_length: options.data_size,
+        flags: 0,
+        sector_size: options.sector_size,
+        ea: options.ea,
+        prf: options.prf,
+        salt: Vec::new(),
+        master_key: master_key.to_vec(),
+    };
+    let password = options.effective_password(Some(path))?;
+    let primary_salt = random_bytes(HEADER_SALT_SIZE)?;
+    write_header_region_verified(
+        &file,
+        layout.header_offset(),
+        &header,
+        &password,
+        options.pim,
+        &primary_salt,
+    )?;
+    let backup_salt = random_bytes(HEADER_SALT_SIZE)?;
+    write_header_region_verified(
+        &file,
+        backup_offset_of(host_size, layout)?,
+        &header,
+        &password,
+        options.pim,
+        &backup_salt,
+    )?;
+    // Every container VeraCrypt creates has random bytes in the hidden header
+    // slots of a normal volume; rebuild those too when the slots are zeroes
+    // (say a bare image that was never a container before).
+    if options.volume_type == VolumeType::Normal {
+        let fake = CreateOptions {
+            ea: options.ea,
+            prf: options.prf,
+            password: options.password.clone(),
+            keyfiles: options.keyfiles.clone(),
+            pim: options.pim,
+            sector_size: options.sector_size,
+            full_format: false,
+        };
+        for offset in [HIDDEN_SLOT_OFFSET, host_size - VOLUME_HEADER_SIZE] {
+            if region_is_zero(&file, offset, HEADER_SALT_SIZE)? {
+                write_fake_hidden_region(&file, offset, host_size, host_size, &fake)?;
+                log::info!("wrote a fake hidden header at offset {offset}");
+            }
+        }
+    }
+    file.sync_all()?;
+
+    // Prove the result is a header a user can actually open.
+    let volume = Volume::open(
+        path,
+        &OpenOptions {
+            password: options.password.clone(),
+            keyfiles: options.keyfiles.clone(),
+            pim: options.pim,
+            prf: Some(options.prf),
+            ea: Some(options.ea),
+            volume_type: Some(options.volume_type),
+            use_backup_header: false,
+        },
+    )?;
+    log::info!(
+        "rebuilt the {} header of {} from its master key ({}, {} byte data area)",
+        layout_var_name(options.volume_type),
+        path.display(),
+        options.ea,
+        options.data_size
+    );
+    Ok(volume)
+}
+
+fn layout_var_name(volume_type: VolumeType) -> &'static str {
+    match volume_type {
+        VolumeType::Normal => "normal volume's",
+        VolumeType::Hidden => "hidden volume's",
+    }
+}
+
+fn region_is_zero(file: &File, offset: u64, len: usize) -> Result<bool> {
+    let mut buf = vec![0u8; len];
+    read_exact_at(file, offset, &mut buf)?;
+    Ok(buf.iter().all(|b| *b == 0))
+}
+
+/// Heuristic: does this container's data area look like it was never written
+/// to?
+///
+/// VeraCrypt's quick format leaves the data area the way the host filesystem
+/// reported it (zero bytes on NTFS/ext4), while a full format -- VeraCrypt's
+/// default, and vcrs's -- fills it with ciphertext that has nothing to do with
+/// zero bytes. A container whose unused space is still zeroes is recognisable
+/// as a container, which is why VeraCrypt refuses to put a hidden volume into a
+/// quickly formatted outer volume. Sampling the raw *ciphertext* needs no
+/// password.
+pub fn looks_quick_formatted(path: &Path) -> Result<bool> {
+    const SAMPLES: u64 = 64;
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let start = VOLUME_HEADER_GROUP_SIZE;
+    let end = match len.checked_sub(VOLUME_HEADER_GROUP_SIZE) {
+        Some(end) => end,
+        None => return Ok(false),
+    };
+    let unit = DATA_UNIT_SIZE as u64;
+    if end <= start + unit {
+        return Ok(false);
+    }
+    let span = end - start;
+    let mut sector = vec![0u8; DATA_UNIT_SIZE];
+    let mut zero = 0u64;
+    let mut seen = 0u64;
+    for i in 0..SAMPLES {
+        let offset = (start + span * i / SAMPLES) & !(unit - 1);
+        if offset + unit > end {
+            continue;
+        }
+        read_exact_at(&file, offset, &mut sector)?;
+        seen += 1;
+        if sector.iter().all(|b| *b == 0) {
+            zero += 1;
+        }
+    }
+    Ok(seen > 0 && zero * 2 >= seen)
 }
 
 /// Read raw host bytes without decrypting them (diagnostics, tests, CLI).

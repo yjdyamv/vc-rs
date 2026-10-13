@@ -227,7 +227,12 @@ impl VolumeHeader {
     /// (`VolumeCreator::CreateVolume`, `backupHeaderSalt`), so the backup region
     /// is not just a copy of the primary one.
     pub fn encrypt_with_salt(&self, header_size: usize, header_key: &[u8], salt: &[u8]) -> Result<Vec<u8>> {
-        let mut region = self.serialize(header_size)?;
+        // The region carries `salt`, not whatever the header struct happens to
+        // hold, so a caller that has not filled `self.salt` in yet (a header
+        // being rebuilt from a master key, say) does not have to.
+        let mut header = self.clone();
+        header.salt = salt.to_vec();
+        let mut region = header.serialize(header_size)?;
         region[..HEADER_SALT_SIZE].copy_from_slice(salt);
         let xts = Xts::new(self.ea, header_key)?;
         xts.encrypt(&mut region[HEADER_ENCRYPTED_DATA_OFFSET..], 0)?;

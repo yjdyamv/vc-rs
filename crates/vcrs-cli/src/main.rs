@@ -12,7 +12,7 @@ use clap::{Args, Parser, Subcommand};
 use vcrs_core::header::{
     HEADER_ENCRYPTED_DATA_OFFSET, MASTER_KEY_AREA_OFFSET, VOLUME_HEADER_SIZE, VOLUME_HEADER_SIZE_LEGACY,
 };
-use vcrs_core::volume::{CreateOptions, OpenOptions, ProtectedRange, Volume};
+use vcrs_core::volume::{CreateOptions, OpenOptions, ProtectedRange, RestoreHeaderOptions, Volume};
 use vcrs_core::{EncryptionAlgorithm, Prf, VolumeLayout, VolumeType};
 
 #[derive(Parser)]
@@ -53,6 +53,18 @@ enum Command {
     /// a non-system partition in place"), or resume an interrupted run: the image
     /// becomes a normal container without needing a second copy of the data.
     EncryptInPlace(EncryptInPlaceArgs),
+    /// Save a copy of a volume's header area (VeraCrypt's "Backup Volume
+    /// Header"), so a damaged header can be restored later without the data
+    /// area being needed.
+    BackupHeaders(BackupHeadersArgs),
+    /// Restore a volume's header (VeraCrypt's "Restore Volume Header"): from a
+    /// header backup file, from the copy embedded in the container itself, or
+    /// rebuilt from a master key when every header copy is gone.
+    RestoreHeaders(RestoreHeadersArgs),
+    /// Change a volume's password, keyfiles, PIM and/or header hash (VeraCrypt's
+    /// "Change Volume Password"). Only the header is rewritten -- the data area
+    /// is not re-encrypted, so it is instant.
+    Change(ChangeArgs),
 }
 
 #[derive(Args)]
@@ -68,9 +80,18 @@ struct CreateArgs {
     /// Header key derivation function, e.g. `SHA-512`, `Blake2s`, `Argon2`.
     #[arg(long, default_value = "SHA-512")]
     prf: String,
-    /// Write random-looking data over the whole data area (VeraCrypt "full" format).
+    /// Quick format: leave the data area as the host filesystem reports it
+    /// instead of writing random-looking data over it. Faster, but the
+    /// untouched part of the volume then stays zero bytes on disk, which gives
+    /// the container away as a container (VeraCrypt uses a full format by
+    /// default for exactly this reason, and refuses a quick format for an outer
+    /// volume that is meant to host a hidden volume).
     #[arg(long)]
-    full: bool,
+    quick: bool,
+    /// Create the container even when it is larger than the free space on the
+    /// filesystem (VeraCrypt refuses that too).
+    #[arg(long)]
+    no_size_check: bool,
     /// Print the master key of the new volume (it is masked otherwise).
     #[arg(long)]
     show_master_key: bool,
@@ -115,22 +136,17 @@ struct PasswordArgs {
 
 impl PasswordArgs {
     fn read(&self) -> Result<Vec<u8>> {
-        if self.password_stdin {
-            let mut buf = Vec::new();
-            std::io::stdin().read_to_end(&mut buf)?;
-            if buf.last() == Some(&b'\n') {
-                buf.pop();
-                if buf.last() == Some(&b'\r') {
-                    buf.pop();
-                }
-            }
-            return Ok(buf);
-        }
-        let p = self
-            .password
-            .clone()
-            .context("no password given (use --password, $VCRS_PASSWORD or --password-stdin)")?;
-        Ok(p.into_bytes())
+        read_password(
+            self.password.as_deref(),
+            self.password_stdin,
+            "no password given (use --password, $VCRS_PASSWORD or --password-stdin)",
+        )
+    }
+
+    /// True when a credential was supplied, so a volume can be opened without
+    /// having to ask.
+    fn is_given(&self) -> bool {
+        self.password.is_some() || self.password_stdin || !self.keyfiles.is_empty()
     }
     fn open_options(&self, volume_type: Option<VolumeType>, use_backup_header: bool) -> Result<OpenOptions> {
         Ok(OpenOptions {
@@ -141,6 +157,68 @@ impl PasswordArgs {
             use_backup_header,
             ..Default::default()
         })
+    }
+}
+
+/// Read a password the way every command does: raw bytes from stdin (with one
+/// trailing newline trimmed) or the UTF-8 bytes of the string that was given.
+fn read_password(value: Option<&str>, from_stdin: bool, missing: &str) -> Result<Vec<u8>> {
+    if from_stdin {
+        let mut buf = Vec::new();
+        std::io::stdin().read_to_end(&mut buf)?;
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+        }
+        return Ok(buf);
+    }
+    match value {
+        Some(password) => Ok(password.as_bytes().to_vec()),
+        None => bail!("{missing}"),
+    }
+}
+
+/// The credentials to put into a header, for `vcrs change`. VeraCrypt's
+/// change-password dialog asks for the same fields.
+#[derive(Args, Clone)]
+struct NewPasswordArgs {
+    /// New password.
+    #[arg(long = "new-password", env = "VCRS_NEW_PASSWORD", hide_env_values = true)]
+    new_password: Option<String>,
+    /// Read the new password from stdin (raw bytes, one trailing newline trimmed).
+    #[arg(long = "new-password-stdin", conflicts_with = "new_password")]
+    new_password_stdin: bool,
+    /// New keyfile (repeatable); replaces the volume's current keyfiles.
+    #[arg(long = "new-keyfile", value_name = "PATH", action = clap::ArgAction::Append)]
+    new_keyfiles: Vec<PathBuf>,
+    /// New PIM. Defaults to the PIM the volume is opened with, so that changing
+    /// only the password cannot silently weaken the key derivation.
+    #[arg(long = "new-pim", value_name = "N")]
+    new_pim: Option<i32>,
+    /// New header hash algorithm; defaults to the one the volume already uses.
+    #[arg(long = "new-hash", value_name = "PRF")]
+    new_prf: Option<String>,
+}
+
+impl NewPasswordArgs {
+    fn read(&self) -> Result<Vec<u8>> {
+        read_password(
+            self.new_password.as_deref(),
+            self.new_password_stdin,
+            "no new password given (use --new-password, $VCRS_NEW_PASSWORD or \
+             --new-password-stdin)",
+        )
+    }
+
+    /// The password bytes the KDF sees, i.e. with the keyfile pool mixed in.
+    fn effective_password(&self, volume: &Path) -> Result<Vec<u8>> {
+        Ok(vcrs_core::apply_keyfiles(
+            &self.read()?,
+            &self.new_keyfiles,
+            Some(volume),
+        )?)
     }
 }
 
@@ -246,6 +324,78 @@ struct EncryptInPlaceArgs {
     prf: String,
     #[command(flatten)]
     password: PasswordArgs,
+}
+
+/// Saves a header backup.
+#[derive(Args)]
+struct BackupHeadersArgs {
+    /// Volume file whose header area is saved.
+    path: PathBuf,
+    /// Where to write the backup (default: `<volume>.hc`).
+    #[arg(long, value_name = "FILE")]
+    out: Option<PathBuf>,
+}
+
+/// Restores a header from one of the three sources.
+#[derive(Args)]
+#[command(group = clap::ArgGroup::new("source").required(true).args(["from", "embedded", "master_key"]))]
+struct RestoreHeadersArgs {
+    /// Volume file whose header is restored.
+    path: PathBuf,
+    /// Restore from a header backup written by `vcrs backup-headers`.
+    #[arg(long, value_name = "FILE")]
+    from: Option<PathBuf>,
+    /// Restore from the backup header embedded in the container itself (the
+    /// copy at the end of the file), without needing a backup file.
+    #[arg(long)]
+    embedded: bool,
+    /// Rebuild the header from the volume's master key, in hex, for when every
+    /// header copy is lost. The data area itself is untouched.
+    #[arg(long, value_name = "HEX")]
+    master_key: Option<String>,
+    /// Size of the volume's data area when rebuilding from a master key. An
+    /// ordinary volume's data area is `container size - 262144` and is computed
+    /// automatically; a hidden volume's has to be given here.
+    #[arg(long, value_name = "SIZE", value_parser = parse_size, requires = "master_key")]
+    data_size: Option<u64>,
+    /// Encryption algorithm the master key belongs to.
+    #[arg(long, default_value = "AES")]
+    ea: String,
+    /// Header hash algorithm for the rebuilt header.
+    #[arg(long, default_value = "SHA-512")]
+    prf: String,
+    /// Sector size the volume was created with.
+    #[arg(long, default_value_t = 512)]
+    sector_size: u32,
+    /// Which header to restore: the hidden volume's instead of the outer one.
+    #[command(flatten)]
+    kind: VolumeKindArgs,
+    /// The volume's password (or, when rebuilding from a master key, the
+    /// password the rebuilt header should use). Without one the restored header
+    /// is written but not verified.
+    #[command(flatten)]
+    password: PasswordArgs,
+}
+
+/// `vcrs change` arguments.
+#[derive(Args)]
+struct ChangeArgs {
+    /// Volume whose header is rewritten.
+    path: PathBuf,
+    /// Open the volume's *backup* header first (for a volume whose primary
+    /// header is damaged).
+    #[arg(long)]
+    backup: bool,
+    /// Which volume to change: the hidden volume's header instead of the outer
+    /// one.
+    #[command(flatten)]
+    kind: VolumeKindArgs,
+    /// The volume's current credentials.
+    #[command(flatten)]
+    password: PasswordArgs,
+    /// The credentials to put into the header.
+    #[command(flatten)]
+    new: NewPasswordArgs,
 }
 
 /// Selects which volume of a container to address.
@@ -421,6 +571,17 @@ fn run() -> Result<()> {
         Command::Create(a) => {
             let ea = parse_ea(&a.ea)?;
             let prf = parse_prf(&a.prf)?;
+            if !a.no_size_check {
+                check_free_space(&a.path, a.size)?;
+            }
+            if a.quick {
+                eprintln!(
+                    "warning: --quick leaves the unused part of the data area empty on disk (zero \
+                     bytes on\n  NTFS/ext4), so it is recognisable as a region nobody wrote to. \
+                     VeraCrypt uses a\n  full format by default for that reason, and refuses quick \
+                     formats for an outer volume\n  that is meant to host a hidden volume."
+                );
+            }
             let options = CreateOptions {
                 ea,
                 prf,
@@ -428,7 +589,7 @@ fn run() -> Result<()> {
                 keyfiles: a.password.keyfiles.clone(),
                 pim: a.password.pim,
                 sector_size: 512,
-                full_format: a.full,
+                full_format: !a.quick,
             };
             let started = std::time::Instant::now();
             let volume = Volume::create(&a.path, a.size, &options)?;
@@ -443,6 +604,15 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::CreateHidden(a) => {
+            if vcrs_core::looks_quick_formatted(&a.path)? {
+                eprintln!(
+                    "warning: {} looks like it was created with a quick format (its unused space is\n  \
+                     still zero bytes on disk), so a hidden volume inside it can be detected. \
+                     VeraCrypt\n  refuses to put a hidden volume into a quickly formatted outer \
+                     volume.",
+                    a.path.display()
+                );
+            }
             let options = CreateOptions {
                 ea: parse_ea(&a.ea)?,
                 prf: parse_prf(&a.prf)?,
@@ -590,6 +760,47 @@ fn run() -> Result<()> {
                     );
                 }
             }
+            Ok(())
+        }
+        Command::BackupHeaders(a) => {
+            let out = a
+                .out
+                .clone()
+                .unwrap_or_else(|| default_header_backup_path(&a.path));
+            let written = vcrs_core::backup_headers(&a.path, &out)?;
+            println!("wrote a {written} byte header backup to {}", out.display());
+            println!(
+                "  keep it away from the container: with this file and the password, a container \
+                 whose\n  headers were destroyed can be restored without touching the data area"
+            );
+            Ok(())
+        }
+        Command::RestoreHeaders(a) => restore_headers(&a),
+        Command::Change(a) => {
+            let options = a.password.open_options(a.kind.volume_type(), a.backup)?;
+            let mut volume = Volume::open(&a.path, &options)?;
+            let new_password = a.new.effective_password(&a.path)?;
+            // A PIM is not stored in the header, so "no --new-pim" means "keep
+            // using the PIM this volume was opened with" rather than silently
+            // dropping back to the default iteration count.
+            let new_pim = a.new.new_pim.unwrap_or(a.password.pim);
+            let new_prf = match &a.new.new_prf {
+                Some(name) => Some(parse_prf(name)?),
+                None => None,
+            };
+            let old_prf = volume.header.prf;
+            volume.change_credentials(&new_password, new_pim, new_prf)?;
+            println!(
+                "changed the {} header of {}: hash {} -> {}, PIM {} -> {}",
+                if a.kind.hidden { "hidden" } else { "ordinary" },
+                a.path.display(),
+                old_prf,
+                volume.header.prf,
+                a.password.pim,
+                new_pim
+            );
+            println!("  the data area was not touched (the master key is unchanged)");
+            print_header(&volume, false);
             Ok(())
         }
         Command::Mount(a) => {
@@ -832,9 +1043,206 @@ fn hex(data: &[u8]) -> String {
     s
 }
 
+/// Default name for a header backup: `<volume>.hc`.
+fn default_header_backup_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".hc");
+    PathBuf::from(name)
+}
+
+/// `vcrs restore-headers`: put a header back from a backup file, from the
+/// container's own embedded copy, or -- when every copy is gone -- from a
+/// master key.
+fn restore_headers(a: &RestoreHeadersArgs) -> Result<()> {
+    let volume_type = a.kind.volume_type().unwrap_or(VolumeType::Normal);
+
+    if let Some(key) = &a.master_key {
+        let master_key = parse_hex(key)?;
+        let host_size = std::fs::metadata(&a.path)
+            .with_context(|| format!("reading {}", a.path.display()))?
+            .len();
+        let data_size = match (a.data_size, volume_type) {
+            (Some(size), _) => size,
+            (None, VolumeType::Normal) => VolumeLayout::V2Normal
+                .max_data_size(host_size)
+                .with_context(|| {
+                    format!("{} is too small to hold a volume", a.path.display())
+                })?,
+            (None, VolumeType::Hidden) => bail!(
+                "rebuilding a hidden volume's header needs --data-size: its data area does not sit \
+                 where an ordinary volume's would"
+            ),
+        };
+        let options = RestoreHeaderOptions {
+            password: a.password.read()?,
+            keyfiles: a.password.keyfiles.clone(),
+            pim: a.password.pim,
+            ea: parse_ea(&a.ea)?,
+            prf: parse_prf(&a.prf)?,
+            sector_size: a.sector_size,
+            volume_type,
+            data_size,
+        };
+        let volume = vcrs_core::restore_headers_from_master_key(&a.path, &master_key, &options)?;
+        println!(
+            "rebuilt the {} header of {} from its master key",
+            volume_name(volume_type),
+            a.path.display()
+        );
+        print_header(&volume, false);
+        return Ok(());
+    }
+
+    // Writing a header does not need a password, but without one the result
+    // cannot be checked -- and a backup taken from another volume would leave
+    // this container unopenable.
+    let verify = if a.password.is_given() {
+        Some(a.password.open_options(a.kind.volume_type(), false)?)
+    } else {
+        None
+    };
+    let volume = if let Some(from) = &a.from {
+        vcrs_core::restore_headers(&a.path, from, volume_type, verify.as_ref())?
+    } else if a.embedded {
+        vcrs_core::restore_headers_from_embedded(&a.path, volume_type, verify.as_ref())?
+    } else {
+        bail!("pass --from <FILE>, --embedded or --master-key <HEX>")
+    };
+
+    match volume {
+        Some(volume) => {
+            println!(
+                "restored the {} header of {} and opened it with the password given",
+                volume_name(volume_type),
+                a.path.display()
+            );
+            print_header(&volume, false);
+        }
+        None => {
+            println!(
+                "restored the {} header of {}",
+                volume_name(volume_type),
+                a.path.display()
+            );
+            eprintln!(
+                "warning: no password was given, so the restored header was not checked; if it came\n  \
+                 from another volume, this container can no longer be opened"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn volume_name(volume_type: VolumeType) -> &'static str {
+    match volume_type {
+        VolumeType::Normal => "ordinary",
+        VolumeType::Hidden => "hidden",
+    }
+}
+
+/// Refuse to create a container larger than the free space on the filesystem it
+/// is created on (VeraCrypt's "not enough free space" check), unless
+/// `--no-size-check` was passed.
+fn check_free_space(path: &Path, host_size: u64) -> Result<()> {
+    let Some(free) = available_space(path) else {
+        return Ok(());
+    };
+    if host_size > free {
+        bail!(
+            "the container ({}) does not fit in the {} free on {}: pass --no-size-check to create \
+             it anyway (the format would then fail part-way through)",
+            human_size(host_size),
+            human_size(free),
+            existing_dir(path).display()
+        );
+    }
+    Ok(())
+}
+
+/// The closest existing directory, i.e. the filesystem the container will live
+/// on.
+fn existing_dir(path: &Path) -> PathBuf {
+    let mut candidate = path.parent().map(Path::to_path_buf);
+    while let Some(dir) = candidate {
+        if dir.as_os_str().is_empty() {
+            break;
+        }
+        if dir.is_dir() {
+            return dir;
+        }
+        candidate = dir.parent().map(Path::to_path_buf);
+    }
+    PathBuf::from(".")
+}
+
+/// Bytes available to the user on the filesystem that holds `path`.
+#[cfg(windows)]
+fn available_space(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use winapi::um::fileapi::GetDiskFreeSpaceExW;
+    use winapi::um::winnt::ULARGE_INTEGER;
+
+    let dir = existing_dir(path);
+    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let mut free: ULARGE_INTEGER = unsafe { std::mem::zeroed() };
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path and `free` is a valid,
+    // initialised ULARGE_INTEGER of ours.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        None
+    } else {
+        // SAFETY: the call succeeded, so the union holds the free byte count.
+        Some(unsafe { *free.QuadPart() })
+    }
+}
+
+/// Bytes available to the user on the filesystem that holds `path`.
+#[cfg(unix)]
+fn available_space(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = existing_dir(path);
+    let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is a valid NUL-terminated C string and `stat` is ours.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn available_space(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// A byte count as `12.34 MiB`, for messages a person reads.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 4] = [
+        ("TiB", 1 << 40),
+        ("GiB", 1 << 30),
+        ("MiB", 1 << 20),
+        ("KiB", 1 << 10),
+    ];
+    for (unit, factor) in UNITS {
+        if bytes >= factor {
+            return format!("{:.2} {unit}", bytes as f64 / factor as f64);
+        }
+    }
+    format!("{bytes} B")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{format_master_key, session_id_for_target};
+    use super::{format_master_key, human_size, session_id_for_target};
 
     #[test]
     fn finds_the_session_id_for_a_target() {
@@ -852,6 +1260,15 @@ mod tests {
         );
         assert_eq!(session_id_for_target(list, "iqn.other:target"), None);
         assert_eq!(session_id_for_target("", "iqn.2025-12.io.vcrs:probe"), None);
+    }
+
+    #[test]
+    fn sizes_are_readable() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(1024), "1.00 KiB");
+        assert_eq!(human_size(20 * 1024 * 1024), "20.00 MiB");
+        assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.00 GiB");
     }
 
     #[test]

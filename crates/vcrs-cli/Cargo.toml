@@ -16,3 +16,9 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 log.workspace = true
 env_logger = "0.11"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["fileapi", "winnt"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
