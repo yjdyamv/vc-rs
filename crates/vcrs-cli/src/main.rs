@@ -53,6 +53,10 @@ enum Command {
     /// a non-system partition in place"), or resume an interrupted run: the image
     /// becomes a normal container without needing a second copy of the data.
     EncryptInPlace(EncryptInPlaceArgs),
+    /// Permanently decrypt a container that was encrypted in place (VeraCrypt's
+    /// "Permanently decrypt a non-system partition/volume"): the data is moved
+    /// back down and the file becomes the plaintext image it was made from.
+    DecryptInPlace(DecryptInPlaceArgs),
     /// Save a copy of a volume's header area (VeraCrypt's "Backup Volume
     /// Header"), so a damaged header can be restored later without the data
     /// area being needed.
@@ -322,6 +326,23 @@ struct EncryptInPlaceArgs {
     /// Header key derivation function for the new volume.
     #[arg(long, default_value = "SHA-512")]
     prf: String,
+    #[command(flatten)]
+    password: PasswordArgs,
+}
+
+#[derive(Args)]
+struct DecryptInPlaceArgs {
+    /// Container made by `vcrs encrypt-in-place` (or by VeraCrypt's in-place
+    /// encryption). It must hold a *completed* in-place volume; the run moves the
+    /// data back down and truncates the file to the plaintext image it was made
+    /// from.
+    path: PathBuf,
+    /// Continue an interrupted in-place *decryption*. Without it a run only starts
+    /// from a completed in-place volume, because a half decrypted and a half
+    /// encrypted container look identical in the header (VeraCrypt tells them apart
+    /// by the switch too: `/resumeinplacedec` vs `/zinplace`).
+    #[arg(long)]
+    resume: bool,
     #[command(flatten)]
     password: PasswordArgs,
 }
@@ -759,6 +780,48 @@ fn run() -> Result<()> {
                         volume.data_size
                     );
                 }
+            }
+            Ok(())
+        }
+        Command::DecryptInPlace(a) => {
+            // Build the options once: `--password-stdin` can only be read once.
+            let options = a.password.open_options(None, false)?;
+            let password = options.effective_password(Some(&a.path))?;
+            let started = std::time::Instant::now();
+            let outcome =
+                vcrs_core::decrypt_in_place_stopping_after(
+                    &a.path,
+                    &password,
+                    a.password.pim,
+                    a.resume,
+                    None,
+                )?;
+            let elapsed = started.elapsed();
+            if outcome.finished {
+                println!(
+                    "decrypted {} in place in {:.1}s",
+                    a.path.display(),
+                    elapsed.as_secs_f64()
+                );
+                println!(
+                    "  the file is a {} byte plaintext image again (the filesystem followed by \
+                     {} zero bytes)",
+                    outcome.data_size + 131072,
+                    131072
+                );
+            } else {
+                let left = outcome.data_size - outcome.decrypted;
+                println!(
+                    "paused: {} of {} bytes decrypted ({:.1}%) in {:.1}s",
+                    outcome.decrypted,
+                    outcome.data_size,
+                    outcome.decrypted as f64 * 100.0 / outcome.data_size.max(1) as f64,
+                    elapsed.as_secs_f64()
+                );
+                println!(
+                    "  {left} bytes are still encrypted; continue with \
+                     `vcrs decrypt-in-place --resume`"
+                );
             }
             Ok(())
         }

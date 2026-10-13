@@ -61,6 +61,7 @@ iSCSI 发起程序，Windows 看到的是一块真实磁盘，于是**用 Window
 | Container expansion (`vcrs expand`): bigger data area, both headers rewritten with fresh salts, master key and data untouched | ✅ (verified: Windows' own tools extend the filesystem into the new space through the iSCSI disk, files survive, VeraCrypt reads the grown container — `scripts/vc-expand-test.ps1` = `ALL OK`) |
 | Hidden-volume protection while writing to the outer volume (`--protect-hidden`) | ✅ (a write that would land in the hidden volume is refused, and every later write too, exactly like VeraCrypt; the hidden volume stays byte-identical) |
 | In-place encryption of a plaintext image (`vcrs encrypt-in-place`) | ✅ (verified: real VeraCrypt mounts the finished container, reads the filesystem that was encrypted in place, and writes through that mount survive — `scripts/vc-inplace-test.ps1` = `ALL OK`) |
+| Permanent decryption back to a plain image (`vcrs decrypt-in-place`, `--resume` to continue an interrupted run) | ✅ (verified: the plain image is byte-identical to the original filesystem, and re-encrypting it gives a container VeraCrypt mounts and reads again — same script) |
 | In-place encryption of a *system* partition | ⬜ out of scope |
 
 ## Build
@@ -131,6 +132,12 @@ vcrs change secret.vc --password old --new-password new --new-hash SHA-256 --new
 # run can be resumed.
 vcrs encrypt-in-place plain.img --password pw
 
+# ... and permanently decrypt it again (VeraCrypt's "permanently decrypt a non-system
+# partition"): the data moves back down, the file becomes the plain image it came from,
+# with the 128 KiB the encryption had consumed zeroed and truncated away.
+vcrs decrypt-in-place secret.vc --password pw
+vcrs decrypt-in-place secret.vc --password pw --resume    # an interrupted run
+
 # Mount the outer volume, but refuse any write that would destroy the hidden volume inside:
 vcrs mount both.vc --password outer --protect-hidden --hidden-password inner
 ```
@@ -180,6 +187,7 @@ the iSCSI *target* itself needs no administration, only the initiator does).
 | Expansion (FAT) | An expanded container whose FAT filesystem is smaller than the data area is still fully VeraCrypt-readable after the expansion | ✅ (same script, part 2) |
 | In-place encryption, interrupted | Stopping after a quarter of the data area leaves only the backup header valid (VeraCrypt's `TC_HEADER_FLAG_NONSYS_INPLACE_ENC` state); a second run resumes from it and the whole data area comes back byte-identical | ✅ (`crates/vcrs-core/tests/in_place.rs`) |
 | In-place encryption → VeraCrypt | A plain FAT16 image (copied out of a VeraCrypt container) plus 128 KiB of zeroes is encrypted in place by vc-rs; real VeraCrypt mounts the result and reads `fromvc.txt`, Windows writes a new file through that mount, and the file survives a remount plus another `vcrs info` | ✅ (`scripts/vc-inplace-test.ps1`, `RESULT: ALL OK`) |
+| In-place decryption → plain image → VeraCrypt again | `vcrs decrypt-in-place` turns that completed in-place container back into a 10223616-byte plain image whose boot sector is `EB 3C 90 "MSDOS5.0"` / `FAT16   `; re-encrypting it produces a container VeraCrypt mounts again, still reading both `fromvc.txt` and the file Windows wrote through the earlier mount | ✅ (same script) |
 | Hidden-volume protection | Writes overlapping the hidden volume's data area fail (`HiddenVolumeProtected`) and so does every later write (`HiddenVolumeProtectionActive`); the hidden volume's bytes are unchanged and its own password still opens it | ✅ (`crates/vcrs-core/tests/hidden_protection.rs`, `crates/vcrs-mount/tests/iscsi_device.rs`) |
 | Header backup/restore → VeraCrypt | vc-rs writes a header backup, both header groups of the container are zeroed (unopenable), `vcrs restore-headers --from` puts it back, and real VeraCrypt mounts the container and reads the file inside | ✅ (`scripts/vc-header-test.ps1`, `RESULT: ALL OK`) |
 | Restore from the embedded copy | Only the primary header group is zeroed; `restore-headers --embedded` recovers the volume and VeraCrypt mounts it again | ✅ (same script) |
@@ -338,6 +346,23 @@ done so far). VeraCrypt refuses to mount such a volume (`ERR_NONSYS_INPLACE_ENC_
 refusal to overwrite a non-zero tail (a plain image's last 128 KiB must be free space, and
 vc-rs checks rather than clobbers). `scripts/vc-inplace-test.ps1` (elevated) proves the
 result is a real VeraCrypt volume.
+
+`vcrs decrypt-in-place` is the mirror image — VeraCrypt's "permanently decrypt a non-system
+partition". It needs a *completed* in-place container; `--resume` continues an interrupted
+**decryption** and is required for a partial one, because a half-decrypted and a
+half-encrypted container are indistinguishable in the header (VeraCrypt tells them apart
+with its own switch, `/zinplace` versus `/resumeinplacedec`):
+
+* the chunks move back **down** 128 KiB at a time, again from the top of the data area, and
+  each chunk is decrypted with the data-unit number of the offset it is *written to*,
+* `EncryptedAreaStart` walks up and `EncryptedAreaLength` walks down as it goes, so an
+  interrupted decryption resumes from the backup header exactly like an interrupted
+  encryption; the primary header group is gone for good (the first chunk lands on it),
+* when the last chunk is in place, everything from the end of the data area to the end of
+  the file is zeroed and the file is truncated to the image size — the freed 128 KiB comes
+  back as zeroes, exactly as VeraCrypt zeroes from the volume size to the device end — so
+  the result is the plain image the encryption started from (its filesystem byte for byte),
+  and `vcrs encrypt-in-place` can be run on it again to get a container back.
 
 ### Header backup, restore and rebuilding
 

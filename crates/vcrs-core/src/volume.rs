@@ -1341,6 +1341,190 @@ pub fn encrypt_in_place(
 }
 
 /// The state of an unfinished in-place encryption, when the header describes one.
+/// Overwrite `len` bytes at `offset` with zeros.
+fn zero_region(file: &File, offset: u64, len: u64) -> Result<()> {
+    const CHUNK: usize = 1024 * 1024;
+    let buf = vec![0u8; CHUNK];
+    let mut written = 0u64;
+    while written < len {
+        let n = std::cmp::min(CHUNK as u64, len - written) as usize;
+        write_all_at(file, offset + written, &buf[..n])?;
+        written += n as u64;
+    }
+    Ok(())
+}
+
+/// How far an in-place decryption run got. `finished` means the file is a
+/// plaintext image again; otherwise the volume is a partially decrypted
+/// container and another run with `resume = true` continues it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecryptOutcome {
+    /// Bytes decrypted by this run.
+    pub decrypted: u64,
+    /// Size of the volume's data area (all of which ends up decrypted).
+    pub data_size: u64,
+    /// Whether the whole data area is plaintext again.
+    pub finished: bool,
+}
+
+/// Undo [`encrypt_in_place`]: turn a completed in-place volume back into the
+/// plaintext image it was made from (the filesystem followed by
+/// `VOLUME_HEADER_GROUP_SIZE` zero bytes), the way VeraCrypt's "Permanently
+/// decrypt a non-system partition/volume" undoes in-place encryption
+/// (`DecryptPartitionInPlace`, `src/Format/InPlace.c`).
+///
+/// The work runs from the *bottom* of the ciphertext upwards -- VeraCrypt moves
+/// `EncryptedAreaStart` up and `EncryptedAreaLength` down while decrypting, so a
+/// container left half decrypted carries exactly the pair of values a resumed run
+/// needs -- reading each chunk before writing the plaintext
+/// `VOLUME_HEADER_GROUP_SIZE` bytes below it. The first chunk overwrites the
+/// primary header group, so only the backup header is live during the run; at the
+/// end everything from the data area's end to the end of the file (that header and
+/// the leftover ciphertext) is zeroed and the file is truncated to the image size.
+///
+/// A half *encrypted* and a half *decrypted* container are indistinguishable from
+/// their header fields alone (VeraCrypt has the same problem and resolves it with
+/// the command line switch: `/zinplace` resumes encryption, `/resumeinplacedec`
+/// decryption), so a run that does not start from a complete in-place volume has to
+/// be asked for with `resume = true`.
+///
+/// When `stop_after` is `Some(n)` the run stops once `n` bytes have been decrypted
+/// in this call, which leaves the container in the partially decrypted state.
+pub fn decrypt_in_place_stopping_after(
+    path: &Path,
+    password: &[u8],
+    pim: i32,
+    resume: bool,
+    stop_after: Option<u64>,
+) -> Result<DecryptOutcome> {
+    let volume = Volume::open(
+        path,
+        &OpenOptions {
+            password: password.to_vec(),
+            keyfiles: Vec::new(),
+            pim,
+            prf: None,
+            ea: None,
+            volume_type: Some(VolumeType::Normal),
+            // A resumed run has already overwritten the primary header group.
+            use_backup_header: true,
+        },
+    )?;
+    if volume.header.flags & HEADER_FLAG_NONSYS_INPLACE_ENC == 0 {
+        return Err(Error::Unsupported(format!(
+            "{} was not encrypted in place (its header has no in-place encryption flag), so there \
+             is nothing to decrypt",
+            path.display()
+        )));
+    }
+    let mut header = volume.header.clone();
+    let data_size = header.volume_data_size;
+    let mut start = header.encrypted_area_start;
+    let mut remaining = header.encrypted_area_length;
+    let image_size = data_size + VOLUME_HEADER_GROUP_SIZE;
+    if remaining > data_size || start < VOLUME_HEADER_GROUP_SIZE || start + remaining != image_size {
+        return Err(Error::InvalidParameter(format!(
+            "{} reports an inconsistent in-place encrypted area (start {start}, length {remaining}, \
+             data area {data_size})",
+            path.display()
+        )));
+    }
+    if !(start == VOLUME_HEADER_GROUP_SIZE && remaining == data_size) && !resume {
+        return Err(Error::Unsupported(format!(
+            "{} holds an unfinished in-place transformation ({remaining} of {data_size} bytes left \
+             in the encrypted area); only a completed in-place volume can be decrypted from scratch, \
+             and continuing an interrupted decryption has to be asked for explicitly",
+            path.display()
+        )));
+    }
+
+    let file = &volume.file;
+    let xts = &volume.xts;
+    let file_size = volume.host_size;
+    let backup_offset = backup_offset_of(file_size, VolumeLayout::V2Normal)?;
+    let mut backup_salt = vec![0u8; HEADER_SALT_SIZE];
+    read_exact_at(file, backup_offset, &mut backup_salt)?;
+
+    let mut processed = 0u64;
+    let mut since_update = 0u64;
+    while remaining > 0 {
+        let mut chunk = std::cmp::min(remaining, IN_PLACE_CHUNK_SIZE);
+        if let Some(limit) = stop_after {
+            let left = limit.saturating_sub(processed);
+            if left == 0 {
+                break;
+            }
+            chunk = std::cmp::min(chunk, left);
+        }
+        chunk -= chunk % DATA_UNIT_SIZE as u64;
+        if chunk == 0 {
+            break;
+        }
+        // The ciphertext still sits where the plaintext will have been moved to,
+        // so the XTS data unit number comes from the source offset -- the same
+        // numbering the encryption used, since it keyed on its destination.
+        let mut buf = vec![0u8; chunk as usize];
+        read_exact_at(file, start, &mut buf)?;
+        xts.decrypt(&mut buf, start / DATA_UNIT_SIZE as u64)?;
+        write_all_at(file, start - VOLUME_HEADER_GROUP_SIZE, &buf)?;
+
+        start += chunk;
+        remaining -= chunk;
+        processed += chunk;
+        since_update += chunk;
+        header.encrypted_area_start = start;
+        header.encrypted_area_length = remaining;
+
+        if since_update >= IN_PLACE_HEADER_UPDATE_INTERVAL || remaining == 0 {
+            // VeraCrypt's FastVolumeHeaderUpdate: same salt and key, new lengths.
+            write_header_region(file, backup_offset, &header, password, pim, &backup_salt)?;
+            file.sync_all()?;
+            since_update = 0;
+            log::info!(
+                "in-place decryption of {}: {} bytes left ({:.1}%)",
+                path.display(),
+                remaining,
+                (data_size - remaining) as f64 * 100.0 / data_size as f64
+            );
+        }
+    }
+
+    let finished = remaining == 0;
+    if !finished && since_update > 0 {
+        write_header_region(file, backup_offset, &header, password, pim, &backup_salt)?;
+        file.sync_all()?;
+    }
+    if finished {
+        // VeraCrypt zeroes everything from the end of the data area to the end of
+        // the volume (the backup header and the remaining ciphertext). For a file
+        // that is also where the image ends, so the plaintext image is exactly what
+        // the container was made from.
+        zero_region(file, data_size, file_size - data_size)?;
+        file.set_len(image_size)?;
+        file.sync_all()?;
+        log::info!(
+            "in-place decryption of {} finished: the file is a {image_size} byte plaintext image \
+             again",
+            path.display()
+        );
+    } else {
+        log::info!(
+            "in-place decryption of {} paused: {remaining} of {data_size} bytes left to decrypt",
+            path.display()
+        );
+    }
+    Ok(DecryptOutcome {
+        decrypted: processed,
+        data_size,
+        finished,
+    })
+}
+
+/// [`decrypt_in_place_stopping_after`] with no early stop and no resume.
+pub fn decrypt_in_place(path: &Path, password: &[u8], pim: i32) -> Result<DecryptOutcome> {
+    decrypt_in_place_stopping_after(path, password, pim, false, None)
+}
+
 fn in_place_state(header: &VolumeHeader) -> Option<InPlaceState> {
     if header.flags & HEADER_FLAG_NONSYS_INPLACE_ENC == 0
         || header.encrypted_area_length >= header.volume_data_size

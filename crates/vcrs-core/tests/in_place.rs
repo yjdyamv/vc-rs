@@ -10,7 +10,10 @@
 use std::path::PathBuf;
 
 use vcrs_core::header::HEADER_FLAG_NONSYS_INPLACE_ENC;
-use vcrs_core::{encrypt_in_place, encrypt_in_place_stopping_after, EncryptionAlgorithm, OpenOptions, Prf, Volume};
+use vcrs_core::{
+    decrypt_in_place, decrypt_in_place_stopping_after, encrypt_in_place,
+    encrypt_in_place_stopping_after, EncryptionAlgorithm, OpenOptions, Prf, Volume,
+};
 
 const PASSWORD: &[u8] = b"in-place-password";
 const PIM: i32 = 1;
@@ -52,6 +55,25 @@ fn open_options() -> OpenOptions {
         use_backup_header: false,
         ..Default::default()
     }
+}
+
+/// What a finished in-place container decrypts back to: the filesystem (`DATA_SIZE`
+/// bytes that the run moved, unchanged) followed by the 128 KiB that were freed for
+/// the encryption -- VeraCrypt zeroes everything from the end of the data area
+/// onwards, so those come back as zeros, not as the bytes they held before.
+fn decrypted_image(image: &[u8]) -> Vec<u8> {
+    let mut expected = image[..DATA_SIZE as usize].to_vec();
+    expected.resize(PLAINTEXT_SIZE as usize, 0);
+    expected
+}
+
+/// Index of the first differing byte, or `None` when the slices are equal (used
+/// instead of `assert_eq!` on whole megabyte-sized images).
+fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+    if a.len() != b.len() {
+        return Some(usize::MAX);
+    }
+    a.iter().zip(b).position(|(x, y)| x != y)
 }
 
 #[test]
@@ -146,6 +168,99 @@ fn an_interrupted_run_resumes_where_it_stopped() {
     assert_eq!(finished.header.volume_data_size, DATA_SIZE);
     assert_eq!(finished.header.encrypted_area_length, DATA_SIZE);
 
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
+fn a_plain_image_is_not_decrypted() {
+    let (path, image) = plain_image("vcrs-inplace-not.hc", 6);
+    let err = decrypt_in_place(&path, PASSWORD, PIM).expect_err("there is nothing to decrypt");
+    assert!(
+        err.to_string().contains("not a VeraCrypt volume"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), image);
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
+fn a_container_survives_a_decryption_round_trip() {
+    let (path, image) = plain_image("vcrs-inplace-roundtrip.hc", 7);
+    encrypt_in_place(&path, PASSWORD, PIM, EncryptionAlgorithm::Aes, Prf::Sha512).unwrap();
+
+    let outcome = decrypt_in_place(&path, PASSWORD, PIM).unwrap();
+    assert!(outcome.finished);
+    assert_eq!(outcome.decrypted, DATA_SIZE);
+    assert_eq!(outcome.data_size, DATA_SIZE);
+
+    // The file is the plaintext image it was made from -- and it has no header left
+    // at all (VeraCrypt zeroes the tail and there is nothing to keep).
+    let restored = std::fs::read(&path).unwrap();
+    assert_eq!(restored.len() as u64, PLAINTEXT_SIZE);
+    let expected = decrypted_image(&image);
+    assert_eq!(
+        first_difference(&restored, &expected),
+        None,
+        "the decrypted image differs from the original"
+    );
+    assert!(
+        restored[PLAINTEXT_SIZE as usize - HEADER_GROUP as usize..]
+            .iter()
+            .all(|b| *b == 0),
+        "the freed tail has to be zeros again"
+    );
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
+fn an_interrupted_decryption_resumes() {
+    let (path, image) = plain_image("vcrs-inplace-dec-resume.hc", 8);
+    encrypt_in_place(&path, PASSWORD, PIM, EncryptionAlgorithm::Aes, Prf::Sha512).unwrap();
+
+    // A quarter of the data area, decrypted from the bottom up.
+    let partial =
+        decrypt_in_place_stopping_after(&path, PASSWORD, PIM, false, Some(DATA_SIZE / 4)).unwrap();
+    assert!(!partial.finished);
+    assert_eq!(partial.decrypted, DATA_SIZE / 4);
+    assert_eq!(partial.data_size, DATA_SIZE);
+
+    // VeraCrypt moves EncryptedAreaStart up and EncryptedAreaLength down while
+    // decrypting, and the backup header carries that state (the primary header
+    // group is gone -- the first chunk was written over it).
+    let state = Volume::open(
+        &path,
+        &OpenOptions {
+            use_backup_header: true,
+            ..open_options()
+        },
+    )
+    .unwrap();
+    assert_eq!(state.header.encrypted_area_start, HEADER_GROUP + DATA_SIZE / 4);
+    assert_eq!(state.header.encrypted_area_length, DATA_SIZE - DATA_SIZE / 4);
+
+    // The bottom quarter of the image is back where it was ...
+    let on_disk = std::fs::read(&path).unwrap();
+    assert_eq!(&on_disk[..(DATA_SIZE / 4) as usize], &image[..(DATA_SIZE / 4) as usize]);
+
+    // ... and a fresh (non-resumed) run is refused, because a half decrypted and a
+    // half encrypted container look the same in the header: the caller has to say
+    // which direction to continue in, exactly like VeraCrypt's switch does.
+    let err = decrypt_in_place(&path, PASSWORD, PIM)
+        .expect_err("only an explicit resume may continue a partial transformation");
+    assert!(
+        err.to_string().contains("unfinished in-place transformation"),
+        "unexpected error: {err}"
+    );
+
+    let finished = decrypt_in_place_stopping_after(&path, PASSWORD, PIM, true, None).unwrap();
+    assert!(finished.finished);
+    assert_eq!(finished.decrypted, DATA_SIZE - DATA_SIZE / 4);
+    let restored = std::fs::read(&path).unwrap();
+    assert_eq!(
+        first_difference(&restored, &decrypted_image(&image)),
+        None,
+        "the resumed decryption has to rebuild the whole image"
+    );
     std::fs::remove_file(path).ok();
 }
 

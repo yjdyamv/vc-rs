@@ -89,4 +89,37 @@ Check 'file-survived-remount' ($back.Trim() -eq 'WROTE-IN-INPLACE-VOLUME')
 Run $vc @('/dismount', $letter, '/quit', '/silent')
 
 Say ""
+Say "6. vc-rs decrypts the container in place again"
+Run $vcrs @('decrypt-in-place', $vol, '--password', $pw, '--pim', $pim)
+$size = (Get-Item $vol).Length
+Say "  file size: $size"
+Check 'decrypted-size' ($size -eq 10223616)
+
+$stream = [IO.File]::OpenRead($vol)
+$boot = New-Object byte[] 512
+$null = $stream.Read($boot, 0, 512)
+$stream.Close()
+$oem = [Text.Encoding]::ASCII.GetString($boot, 3, 8)
+$type = [Text.Encoding]::ASCII.GetString($boot, 0x36, 8)
+Say "  boot sector: $($boot[0].ToString('x2')) $($boot[1].ToString('x2')) $($boot[2].ToString('x2')) '$oem' '$type'"
+Check 'decrypted-holds-the-filesystem' ($oem -eq 'MSDOS5.0' -and $type -eq 'FAT16   ')
+
+Say ""
+Say "7. Re-encrypting the plain image gives a container VeraCrypt mounts again"
+Run $vcrs @('encrypt-in-place', $vol, '--password', $pw, '--pim', $pim)
+Run $vc @('/volume', $vol, '/letter', $letter, '/password', $pw, '/pim', $pim, '/quit', '/silent')
+$again = WaitDrive $letter 30
+Check 'veracrypt-mounted-again' $again
+if ($again) {
+    Get-ChildItem "${letter}:\" -Force | ForEach-Object { Say ("  {0}  {1}" -f $_.Name, $_.Length) }
+    $t1 = (Get-Content "${letter}:\fromvc.txt" -Raw).Trim()
+    $t2 = (Get-Content "${letter}:\from-vc-inplace.txt" -Raw).Trim()
+    Say "  fromvc.txt = '$t1'"
+    Say "  from-vc-inplace.txt = '$t2'"
+    Check 'reads-after-round-trip' ($t1 -eq 'VC-ORIGINAL-12345')
+    Check 'windows-file-survived-round-trip' ($t2 -eq 'WROTE-IN-INPLACE-VOLUME')
+    Run $vc @('/dismount', $letter, '/quit', '/silent')
+}
+
+Say ""
 if ($failures -eq 0) { Say "RESULT: ALL OK" } else { Say "RESULT: FAILURES: $failures" }
