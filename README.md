@@ -60,6 +60,7 @@ iSCSI 发起程序，Windows 看到的是一块真实磁盘，于是**用 Window
 | Keyfiles (password + keyfile pool, file or directory, repeatable) | ✅ (verified against VeraCrypt both ways, incl. a 102-byte password and directories: `scripts/vc-keyfile-test.ps1` = `ALL OK`) |
 | Container expansion (`vcrs expand`): bigger data area, both headers rewritten with fresh salts, master key and data untouched | ✅ (verified: Windows' own tools extend the filesystem into the new space through the iSCSI disk, files survive, VeraCrypt reads the grown container — `scripts/vc-expand-test.ps1` = `ALL OK`) |
 | Hidden-volume protection while writing to the outer volume (`--protect-hidden`) | ✅ (a write that would land in the hidden volume is refused, and every later write too, exactly like VeraCrypt; the hidden volume stays byte-identical) |
+| Volume sector size at creation (`--sector-size 512..4096`) | ✅ (verified: real VeraCrypt mounts a 4096-byte-sector container, Windows formatted NTFS inside it with 4096-byte sectors, and that boot sector is what lands in the container — `scripts/vc-sector-size-test.ps1` = `ALL OK`) |
 | In-place encryption of a plaintext image (`vcrs encrypt-in-place`) | ✅ (verified: real VeraCrypt mounts the finished container, reads the filesystem that was encrypted in place, and writes through that mount survive — `scripts/vc-inplace-test.ps1` = `ALL OK`) |
 | Permanent decryption back to a plain image (`vcrs decrypt-in-place`, `--resume` to continue an interrupted run) | ✅ (verified: the plain image is byte-identical to the original filesystem, and re-encrypting it gives a container VeraCrypt mounts and reads again — same script) |
 | In-place encryption of a *system* partition | ⬜ out of scope |
@@ -90,6 +91,14 @@ vcrs create secret.vc --size 100M --password "correct horse"
 # as zeros on disk, which is why VeraCrypt refuses a quick format for a hidden-volume host.
 vcrs create fast.vc --size 1G --password pw --quick
 
+# Volume sector size: 512 by default. VeraCrypt's own format wizard only ever uses a
+# non-512 size for device-backed volumes (its file containers are always 512), but the
+# format allows 512..4096 and VeraCrypt mounts such a container fine. The filesystem
+# inside has to match it (Windows refuses to mount a 512-sector filesystem on a
+# 4096-sector volume), so let Windows -- through the mount -- or `vcrs format` create
+# the filesystem inside the container instead of copying one in.
+vcrs create big.vc --size 2T --password pw --sector-size 4096
+
 # Inspect it (prints the decrypted header) — add --backup for the backup header.
 vcrs info secret.vc --password "correct horse"
 
@@ -115,7 +124,6 @@ vcrs create paranoia.vc --size 200M --password pw --ea AES-Twofish-Serpent --prf
 
 # Grow a container. The filesystem inside keeps its size; extend it from the OS afterwards.
 vcrs expand secret.vc --size 200M --force
-
 # Header backups: write one, and restore from it (or from the copy inside the container,
 # or rebuild the header from the master key when no backup exists).
 vcrs backup-headers secret.vc --out secret.hc
@@ -177,6 +185,7 @@ the iSCSI *target* itself needs no administration, only the initiator does).
 | Outer + hidden coexist | After the hidden volume was carved in, VeraCrypt still reads the outer FAT16 filesystem and its file | ✅ |
 | Windows NTFS through iSCSI → VeraCrypt | Windows sees the vc-rs data area as a partitioned disk (MBR, 1 MiB synthetic prefix), formats NTFS on it, writes `from-windows.txt`, `sub/nested.txt` and a 1 MiB random file; real VeraCrypt mounts the same container and reads all three back (SHA-256 match) | ✅ (`scripts/vc-iscsi-e2e.ps1`, `RESULT: ALL OK`) |
 | Persistence across sessions | Windows writes through the iSCSI disk, the disk is detached, then attached again: the files are still there (they live in the container) | ✅ |
+| Volume sector size | `vcrs create --sector-size 4096` makes a container whose header records 4096; real VeraCrypt mounts it, Windows formats NTFS through that mount (the type shown is RAW first, as for any unused volume), and the NTFS boot sector that lands inside the container reports 4096 bytes per sector and survives a remount; the backup header carries the value too | ✅ (`scripts/vc-sector-size-test.ps1`, `RESULT: ALL OK`) |
 | Windows NTFS through iSCSI, read by vc-rs | After Windows formatted the disk, `vcrs read` of data offset 0 shows the NTFS boot sector (`EB 52 90 "NTFS    "`) | ✅ |
 | Removable-media reporting (`--removable`) | Windows classifies the disk as removable media (`Win32_DiskDrive.MediaType` = `Removable Media`, vs `Fixed hard disk media` for the internal NVMe disk), which is what makes exFAT show up in its format dialog | ✅ |
 | VeraCrypt → vc-rs (keyfile) | VeraCrypt creates a container with `/keyfile`; `vcrs info -k` opens it and decrypts its FAT16 boot sector, while the same password without `-k` is rejected | ✅ |

@@ -96,6 +96,12 @@ struct CreateArgs {
     /// filesystem (VeraCrypt refuses that too).
     #[arg(long)]
     no_size_check: bool,
+    /// Volume sector size (512, 1024, 2048 or 4096). VeraCrypt defaults to 512
+    /// and uses 4096 for very large volumes; the header records it and the
+    /// filesystem inside should match it. XTS data-unit numbering is 512-based
+    /// regardless, so this changes no ciphertext.
+    #[arg(long, default_value_t = 512, value_parser = parse_sector_size)]
+    sector_size: u32,
     /// Print the master key of the new volume (it is masked otherwise).
     #[arg(long)]
     show_master_key: bool,
@@ -114,6 +120,9 @@ struct CreateHiddenArgs {
     ea: String,
     #[arg(long, default_value = "SHA-512")]
     prf: String,
+    /// Volume sector size, as for `create`.
+    #[arg(long, default_value_t = 512, value_parser = parse_sector_size)]
+    sector_size: u32,
     /// Print the master key of the new hidden volume (it is masked otherwise).
     #[arg(long)]
     show_master_key: bool,
@@ -609,7 +618,7 @@ fn run() -> Result<()> {
                 password: a.password.read()?,
                 keyfiles: a.password.keyfiles.clone(),
                 pim: a.password.pim,
-                sector_size: 512,
+                sector_size: a.sector_size,
                 full_format: !a.quick,
             };
             let started = std::time::Instant::now();
@@ -640,7 +649,7 @@ fn run() -> Result<()> {
                 password: a.password.read()?,
                 keyfiles: a.password.keyfiles.clone(),
                 pim: a.password.pim,
-                sector_size: 512,
+                sector_size: a.sector_size,
                 full_format: false,
             };
             let started = std::time::Instant::now();
@@ -1000,9 +1009,23 @@ fn parse_prf(s: &str) -> Result<Prf> {
     })
 }
 
+/// Parse a volume sector size: VeraCrypt allows 512..4096 in 512-byte steps
+/// (`TC_MIN_VOLUME_SECTOR_SIZE`..`TC_MAX_VOLUME_SECTOR_SIZE`).
+fn parse_sector_size(s: &str) -> Result<u32, String> {
+    let value: u32 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("{s:?} is not a sector size"))?;
+    if !(512..=4096).contains(&value) || value % 512 != 0 {
+        return Err(format!(
+            "sector size must be 512..4096 and a multiple of 512, got {value}"
+        ));
+    }
+    Ok(value)
+}
+
 /// Parse `123`, `123K`, `64M`, `4G` (binary suffixes).
-fn parse_size(s: &str) -> Result<u64, String> {
-    let s = s.trim();
+fn parse_size(s: &str) -> Result<u64, String> {    let s = s.trim();
     let (digits, mult) = match s.chars().last() {
         Some('k' | 'K') => (&s[..s.len() - 1], 1024u64),
         Some('m' | 'M') => (&s[..s.len() - 1], 1024 * 1024),
@@ -1305,7 +1328,7 @@ fn human_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_master_key, human_size, session_id_for_target};
+    use super::{format_master_key, human_size, parse_sector_size, session_id_for_target};
 
     #[test]
     fn finds_the_session_id_for_a_target() {
@@ -1341,5 +1364,16 @@ mod tests {
         let hidden = format_master_key(false, &key);
         assert!(!hidden.contains("abcd"), "the key must not appear: {hidden}");
         assert!(hidden.contains("2 bytes") && hidden.contains("--show-master-key"));
+    }
+
+    #[test]
+    fn sector_sizes_are_validated_like_veracrypt_does() {
+        for good in ["512", "1024", "2048", "4096", " 4096 "] {
+            assert!(parse_sector_size(good).is_ok(), "{good} should be accepted");
+        }
+        for bad in ["0", "256", "600", "4097", "8192", "abc", ""] {
+            let err = parse_sector_size(bad).expect_err("{bad} should be refused");
+            assert!(!err.is_empty());
+        }
     }
 }
