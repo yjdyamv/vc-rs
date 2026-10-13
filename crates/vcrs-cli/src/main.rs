@@ -49,6 +49,10 @@ enum Command {
     /// its old size and has to be extended from the operating system once the
     /// volume is mounted.
     Expand(ExpandArgs),
+    /// Encrypt a plaintext partition/device image in place (VeraCrypt's "Encrypt
+    /// a non-system partition in place"), or resume an interrupted run: the image
+    /// becomes a normal container without needing a second copy of the data.
+    EncryptInPlace(EncryptInPlaceArgs),
 }
 
 #[derive(Args)]
@@ -216,6 +220,24 @@ struct ExpandArgs {
     /// is destroyed by it (VeraCrypt asks the same question interactively).
     #[arg(long)]
     force: bool,
+    #[command(flatten)]
+    password: PasswordArgs,
+}
+
+#[derive(Args)]
+struct EncryptInPlaceArgs {
+    /// Image file to encrypt in place: a plain (unencrypted) file/partition image
+    /// whose last 128 KiB are free (VeraCrypt shrinks the filesystem by that much
+    /// first; a partition image usually needs `truncate -s -128K` or zeroed
+    /// trailing bytes). If the file already contains a container whose in-place
+    /// encryption was interrupted, the run resumes instead.
+    path: PathBuf,
+    /// Encryption algorithm for the new volume.
+    #[arg(long, default_value = "AES")]
+    ea: String,
+    /// Header key derivation function for the new volume.
+    #[arg(long, default_value = "SHA-512")]
+    prf: String,
     #[command(flatten)]
     password: PasswordArgs,
 }
@@ -514,6 +536,50 @@ fn run() -> Result<()> {
                 "  the filesystem inside still has its old size: mount the volume and extend it \
                  there (Windows: Disk Management -> Extend Volume, or `Resize-Partition`)"
             );
+            Ok(())
+        }
+        Command::EncryptInPlace(a) => {
+            let ea = EncryptionAlgorithm::from_name(&a.ea)
+                .with_context(|| format!("unknown encryption algorithm {:?}", a.ea))?;
+            let prf = Prf::from_name(&a.prf)
+                .with_context(|| format!("unknown PRF {:?}", a.prf))?;
+            // Build the options once: `--password-stdin` can only be read once.
+            let options = a.password.open_options(None, false)?;
+            let password = options.effective_password(Some(&a.path))?;
+            let host_size = std::fs::metadata(&a.path)
+                .with_context(|| format!("reading {}", a.path.display()))?
+                .len();
+            let started = std::time::Instant::now();
+            let volume =
+                vcrs_core::encrypt_in_place(&a.path, &password, a.password.pim, ea, prf)?;
+            let elapsed = started.elapsed();
+            match volume.in_place() {
+                Some(state) => {
+                    println!(
+                        "paused: {} of {} bytes encrypted ({:.1}%) in {:.1}s",
+                        state.encrypted_length,
+                        state.total(),
+                        state.progress() * 100.0,
+                        elapsed.as_secs_f64()
+                    );
+                    println!(
+                        "  run the same command again to continue (it resumes from the backup \
+                         header)"
+                    );
+                }
+                None => {
+                    println!(
+                        "encrypted {} in place in {:.1}s (was {host_size} bytes)",
+                        a.path.display(),
+                        elapsed.as_secs_f64()
+                    );
+                    println!(
+                        "  {}: {} byte data area, mountable like any other container",
+                        volume.header.ea,
+                        volume.data_size
+                    );
+                }
+            }
             Ok(())
         }
         Command::Mount(a) => {

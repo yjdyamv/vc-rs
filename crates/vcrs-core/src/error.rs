@@ -47,6 +47,13 @@ pub enum Error {
     /// Hidden-volume protection was already triggered on this volume, so every
     /// further write is refused (VeraCrypt does the same on purpose).
     HiddenVolumeProtectionActive,
+    /// The volume's in-place encryption is not finished yet, so most of the data
+    /// area is still plaintext and writes are not allowed (VeraCrypt refuses to
+    /// mount such a volume at all: `ERR_NONSYS_INPLACE_ENC_INCOMPLETE`).
+    InPlaceIncomplete {
+        /// How many bytes of the data area are still plaintext.
+        remaining: u64,
+    },
 }
 
 impl fmt::Display for Error {
@@ -76,6 +83,12 @@ impl fmt::Display for Error {
                 f,
                 "hidden volume protection has been triggered on this volume: refusing the write \
                  (VeraCrypt does the same, so the volume behaves like a failing device)"
+            ),
+            Error::InPlaceIncomplete { remaining } => write!(
+                f,
+                "the volume's in-place encryption is unfinished: {remaining} bytes of the data \
+                 area are still plaintext, so the volume is read-only; finish it with \
+                 `vcrs encrypt-in-place`"
             ),
         }
     }

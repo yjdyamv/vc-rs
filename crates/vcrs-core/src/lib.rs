@@ -50,7 +50,11 @@ pub use header::{VolumeHeader, VolumeType};
 pub use keyfile::apply_keyfiles;
 pub use layout::VolumeLayout;
 pub use prf::Prf;
-pub use volume::{CreateOptions, OpenOptions, ProtectedRange, Volume};
+pub use volume::{
+    encrypt_in_place, encrypt_in_place_stopping_after, CreateOptions, InPlaceState, OpenOptions,
+    ProtectedRange, Volume, IN_PLACE_CHUNK_SIZE, IN_PLACE_HEADER_UPDATE_INTERVAL,
+    MIN_IN_PLACE_DATA_SIZE,
+};
 pub use xts::Xts;
 
 /// Version of the VeraCrypt volume format this crate implements

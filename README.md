@@ -56,6 +56,7 @@ iSCSI 发起程序，Windows 看到的是一块真实磁盘，于是**用 Window
 | Keyfiles (password + keyfile pool, file or directory, repeatable) | ✅ (verified against VeraCrypt both ways, incl. a 102-byte password and directories: `scripts/vc-keyfile-test.ps1` = `ALL OK`) |
 | Container expansion (`vcrs expand`): bigger data area, both headers rewritten with fresh salts, master key and data untouched | ✅ (verified: Windows' own tools extend the filesystem into the new space through the iSCSI disk, files survive, VeraCrypt reads the grown container — `scripts/vc-expand-test.ps1` = `ALL OK`) |
 | Hidden-volume protection while writing to the outer volume (`--protect-hidden`) | ✅ (a write that would land in the hidden volume is refused, and every later write too, exactly like VeraCrypt; the hidden volume stays byte-identical) |
+| In-place encryption of a plaintext image (`vcrs encrypt-in-place`) | ✅ (verified: real VeraCrypt mounts the finished container, reads the filesystem that was encrypted in place, and writes through that mount survive — `scripts/vc-inplace-test.ps1` = `ALL OK`) |
 | In-place encryption of a *system* partition | ⬜ out of scope |
 
 ## Build
@@ -105,6 +106,11 @@ vcrs create paranoia.vc --size 200M --password pw --ea AES-Twofish-Serpent --prf
 # Grow a container. The filesystem inside keeps its size; extend it from the OS afterwards.
 vcrs expand secret.vc --size 200M --force
 
+# Turn a plain image (a filesystem plus 128 KiB of zeroes at the end) into a container
+# without moving it anywhere: the data area is encrypted where it is, and an interrupted
+# run can be resumed.
+vcrs encrypt-in-place plain.img --password pw
+
 # Mount the outer volume, but refuse any write that would destroy the hidden volume inside:
 vcrs mount both.vc --password outer --protect-hidden --hidden-password inner
 ```
@@ -120,7 +126,7 @@ for passwords up to 64 bytes, 128-byte pool above that).
 
 Compatibility is not asserted, it is tested against a real VeraCrypt 1.26.29 install
 (`scripts/vc-crosscheck.ps1`, `scripts/vc-crosscheck2.ps1`, `scripts/vc-hidden-test.ps1`,
-`scripts/vc-iscsi-e2e.ps1`, `scripts/vc-keyfile-test.ps1`; everything that mounts with
+`scripts/vc-iscsi-e2e.ps1`, `scripts/vc-keyfile-test.ps1`, `scripts/vc-inplace-test.ps1`; everything that mounts with
 VeraCrypt needs an elevated shell because VeraCrypt mounts through its kernel driver —
 the iSCSI *target* itself needs no administration, only the initiator does).
 
@@ -146,12 +152,14 @@ the iSCSI *target* itself needs no administration, only the initiator does).
 | Directory of keyfiles | `-k <dir>` means "all files in it" for both sides: vc-rs opens VeraCrypt's directory-keyfile container and VeraCrypt mounts vc-rs's one, reading the file back | ✅ (`scripts/vc-keyfile-test.ps1`) |
 | Expansion | vc-rs grows an NTFS container from 20 MiB to 40 MiB; re-attached, the new space shows up as unallocated on the disk and Windows' own tools extend the partition and the NTFS into it; the files written before the expansion are intact, and real VeraCrypt mounts the expanded container and reads them | ✅ (`scripts/vc-expand-test.ps1`, `RESULT: ALL OK`) |
 | Expansion (FAT) | An expanded container whose FAT filesystem is smaller than the data area is still fully VeraCrypt-readable after the expansion | ✅ (same script, part 2) |
+| In-place encryption, interrupted | Stopping after a quarter of the data area leaves only the backup header valid (VeraCrypt's `TC_HEADER_FLAG_NONSYS_INPLACE_ENC` state); a second run resumes from it and the whole data area comes back byte-identical | ✅ (`crates/vcrs-core/tests/in_place.rs`) |
+| In-place encryption → VeraCrypt | A plain FAT16 image (copied out of a VeraCrypt container) plus 128 KiB of zeroes is encrypted in place by vc-rs; real VeraCrypt mounts the result and reads `fromvc.txt`, Windows writes a new file through that mount, and the file survives a remount plus another `vcrs info` | ✅ (`scripts/vc-inplace-test.ps1`, `RESULT: ALL OK`) |
 | Hidden-volume protection | Writes overlapping the hidden volume's data area fail (`HiddenVolumeProtected`) and so does every later write (`HiddenVolumeProtectionActive`); the hidden volume's bytes are unchanged and its own password still opens it | ✅ (`crates/vcrs-core/tests/hidden_protection.rs`, `crates/vcrs-mount/tests/iscsi_device.rs`) |
 | Dokany-era checks (historical) | With the Dokany filesystem mount (removed since; code in git history): files written through the drive letter were read back by VeraCrypt, a file VeraCrypt wrote into the vc-rs-made FAT was read back through the mount, and the same held for hidden volumes | ✅ (`scripts/vc-dokan-crosscheck.ps1` = `ALL OK`, `scripts/vc-hidden-test.ps1` = `HIDDEN ROUND TRIP OK: True`, `FULL HIDDEN CHAIN OK: True`) |
 
 Header encodings are also pinned by unit tests for CRC-32 (VeraCrypt's own self-test
 value `0x91267E8A`), the header byte layout and the KDF parameters. Regression suite:
-`crates/vcrs-core/tests/{ea_prf_matrix,hidden_volume,backup_header,xts_kat}.rs` (the matrix
+`crates/vcrs-core/tests/{ea_prf_matrix,hidden_volume,backup_header,xts_kat,in_place}.rs` (the matrix
 test covers all 15 ciphers × 6 KDFs = 90 combinations, the backup test destroys the primary
 header and recovers the volume from the backup copy) and
 `crates/vcrs-mount/tests/{fat_in_volume,iscsi_device}.rs` (FAT format → write → reopen →
@@ -230,6 +238,14 @@ Three things to know:
 4. A mounted container is held **exclusively** — VeraCrypt locks the file (so does
    `vcrs mount`) — so `vcrs info`/`read`/`write` on that same file fail with a sharing
    violation or "access is denied" until it is dismounted. Work on one side at a time.
+5. Windows sometimes offers to format a disk that already contains a filesystem, and
+   **cancelling that dialog is harmless**: it is Explorer's cached view of the volume, which
+   goes stale when the disk is re-attached or when the container's size changed (after
+   `vcrs expand`). Dismiss it and re-read the disk (`Update-HostStorageCache`, a
+   `diskpart rescan`, or a detach/attach cycle) — the filesystem mounts normally. The
+   prompt is only *real* for a container that has no filesystem inside yet
+   (`vcrs read` of data offset 0 shows a boot sector like `EB 52 90 "NTFS    "` when one
+   exists, and random-looking garbage when it does not).
 
 ### Expanding a container
 
@@ -260,6 +276,37 @@ Verified end to end by `scripts/vc-expand-test.ps1`: 20 MiB container → NTFS f
 Windows through the iSCSI disk → files written → `vcrs expand --size 40M` → re-attached →
 Windows extends the NTFS into the new space → the files are intact → real VeraCrypt mounts
 the expanded container, reads the files and sees the new size.
+
+### Encrypting a plaintext image in place
+
+`vcrs encrypt-in-place <file> [--ea …] [--prf …]` does what VeraCrypt's "encrypt a
+non-system partition in place" does to a file: it turns a plain image — a bare filesystem
+followed by the 128 KiB of free space the user is told to free up (zeroed, because that
+space becomes the backup header group) — into an ordinary container, without needing room
+for a second copy:
+
+* the data area moves **128 KiB forward**: the low part of the image stays where it is, the
+  chunks are encrypted from the **top down**, and each chunk lands 128 KiB above its source
+  (`ciphertext offset = plaintext offset + TC_VOLUME_DATA_OFFSET`), which is also the XTS
+  data-unit number, exactly as VeraCrypt computes it,
+* only the **backup** header exists while the run is unfinished, and it carries
+  `TC_HEADER_FLAG_NONSYS_INPLACE_ENC` with the pair
+  (`EncryptedAreaStart` = the plaintext/ciphertext boundary, `EncryptedAreaLength` = bytes
+done so far). VeraCrypt refuses to mount such a volume (`ERR_NONSYS_INPLACE_ENC_INCOMPLETE`)
+  and resumes from that pair; so does vc-rs, so an interrupted run is continued with the
+  same command,
+* the backup header is rewritten every 64 MiB of progress and when the run stops, always
+  with the **same salt and key** (VeraCrypt's `FastVolumeHeaderUpdate`), so a resume derives
+  the same master key,
+* at the end the primary header group is written into the space the data left behind
+  (`EncryptedAreaStart` becomes 128 KiB, `EncryptedAreaLength` the whole data area) while
+  the flag stays set — which is exactly how VeraCrypt leaves a finished in-place container,
+  and why it mounts like any other volume afterwards.
+
+`crates/vcrs-core/tests/in_place.rs` covers the full run, the byte-identical resume and the
+refusal to overwrite a non-zero tail (a plain image's last 128 KiB must be free space, and
+vc-rs checks rather than clobbers). `scripts/vc-inplace-test.ps1` (elevated) proves the
+result is a real VeraCrypt volume.
 
 ### Hidden-volume protection
 
