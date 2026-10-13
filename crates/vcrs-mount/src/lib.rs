@@ -50,7 +50,10 @@ mod fat;
 pub mod iscsi;
 
 pub use device::{DataArea, VolumeDevice, SECTOR_SIZE};
-pub use iscsi::{mount_iscsi, DiskMode, IscsiMount, IscsiMountOptions, ScsiVolume, ISCSI_PORT};
+pub use iscsi::{
+    mount_iscsi, DiskMode, IscsiMount, IscsiMountOptions, ScsiVolume, DEFAULT_IDLE_TIMEOUT,
+    DEFAULT_PARTITION_START_LBA, DEFAULT_TARGET_NAME, ISCSI_PORT,
+};
 pub use vcrs_core::error::{Error, Result};
 
 /// The flavour of FAT filesystem created by [`format_volume`].

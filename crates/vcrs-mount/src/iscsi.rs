@@ -99,6 +99,10 @@ pub const DEFAULT_TARGET_NAME: &str = "iqn.2025-12.io.vcrs:volume";
 /// keeps every filesystem happy (and matches what Windows itself uses).
 pub const DEFAULT_PARTITION_START_LBA: u64 = 2048;
 
+/// How long a target keeps serving after the last initiator logged out, before
+/// it stops on its own (see [`IscsiMountOptions::idle_timeout`]).
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How the volume's data area is presented to the initiator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DiskMode {
@@ -154,6 +158,12 @@ pub struct IscsiMountOptions {
     /// was last used. The host's timestamps are frozen while the target runs and
     /// written back when it stops.
     pub preserve_timestamp: bool,
+    /// How long the target keeps serving after the last initiator logged out.
+    ///
+    /// Windows occasionally logs out and logs back in (a rescan, a reboot, a
+    /// driver reload), which is why the target does not stop the moment a
+    /// session ends. `Duration::ZERO` keeps it serving until Ctrl-C.
+    pub idle_timeout: Duration,
     /// VeraCrypt's *protect hidden volume* option.
     ///
     /// When set, the hidden volume inside this container is opened with these
@@ -174,6 +184,7 @@ impl Default for IscsiMountOptions {
             disk_mode: DiskMode::default(),
             partition_start_lba: DEFAULT_PARTITION_START_LBA,
             preserve_timestamp: true,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
             protect_hidden: None,
         }
     }
@@ -576,6 +587,7 @@ pub struct IscsiMount {
     addr: String,
     target_name: String,
     read_only: bool,
+    idle_timeout: Duration,
 }
 
 impl IscsiMount {
@@ -613,6 +625,7 @@ impl IscsiMount {
             addr: opts.bind_addr.clone(),
             target_name: opts.target_name.clone(),
             read_only: opts.read_only,
+            idle_timeout: opts.idle_timeout,
         };
         mount.wait_until_listening()?;
         log::info!(
@@ -622,6 +635,11 @@ impl IscsiMount {
             if mount.read_only { " (read-only)" } else { "" }
         );
         Ok(mount)
+    }
+
+    /// How long the target keeps serving after the last initiator logged out.
+    pub fn idle_timeout(&self) -> Duration {
+        self.idle_timeout
     }
 
     /// The address the target listens on.
@@ -705,7 +723,6 @@ impl IscsiMount {
     /// keeps running for a few seconds after the last session disappears before
     /// it gives up, and only when at least one session was seen at all.
     pub fn wait(&self) -> Result<()> {
-        const IDLE_GRACE: Duration = Duration::from_secs(5);
         let mut seen_session = false;
         let mut idle_since: Option<Instant> = None;
         while self.server.is_running() && !shutdown_requested() {
@@ -713,10 +730,13 @@ impl IscsiMount {
             if sessions > 0 {
                 seen_session = true;
                 idle_since = None;
-            } else if seen_session {
+            } else if seen_session && !self.idle_timeout.is_zero() {
                 let since = *idle_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= IDLE_GRACE {
-                    log::info!("the initiator logged out; stopping the target");
+                if since.elapsed() >= self.idle_timeout {
+                    log::info!(
+                        "the initiator logged out; stopping the target after {} s of idleness",
+                        self.idle_timeout.as_secs_f32(),
+                    );
                     break;
                 }
             }
@@ -822,7 +842,16 @@ pub fn mount_iscsi(volume_path: &Path, open: &OpenOptions, opts: &IscsiMountOpti
     , mount.target_name());
     println!("     because Windows refuses to log out a session whose disk is still in use)");
     println!();
-    println!("this process keeps serving the volume; press Ctrl-C to stop it.");
+    if opts.idle_timeout.is_zero() {
+        println!("this process keeps serving the volume until you press Ctrl-C.");
+    } else {
+        println!(
+            "this process keeps serving the volume until you press Ctrl-C, and stops by itself\n\
+             {} s after the last initiator logs out (pass --idle-timeout 0 to keep serving\n\
+             through a logout, e.g. while Windows reboots).",
+            opts.idle_timeout.as_secs_f32(),
+        );
+    }
     mount.wait()
 }
 

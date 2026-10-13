@@ -60,6 +60,7 @@ iSCSI 发起程序，Windows 看到的是一块真实磁盘，于是**用 Window
 | FAT filesystem creation inside the volume (`vcrs format`) | ✅ |
 | Raw disk for Windows over iSCSI (`vcrs mount`): any filesystem Windows supports | ✅ (verified: Windows formatted NTFS through it, VeraCrypt read the files back) |
 | Read-only disks, hidden volumes, `--disk-mode raw`, removable-media reporting | ✅ |
+| iSCSI target lifetime (`--idle-timeout <SECONDS>`, `0` = keep serving) | ✅ (stops by itself 5 s after the initiator logs out, so a rescan or a reboot can log back in) |
 | Keyfiles (password + keyfile pool, file or directory, repeatable) | ✅ (verified against VeraCrypt both ways, incl. a 102-byte password and directories: `scripts/vc-keyfile-test.ps1` = `ALL OK`) |
 | Keyfile creation (`vcrs create-keyfile`) | ✅ (128 random bytes, or `--random-source <file>` for a reproducible one; refuses to overwrite an existing file without `--force`) |
 | Crypto self-test (`vcrs test`) | ✅ (the format's CRC-32 against VeraCrypt's own check value, every header hash, all 15 algorithms over XTS, and a header round trip) |
@@ -130,7 +131,7 @@ vcrs format secret.vc --password "correct horse" --label DATA
 
 # Serve the volume as a raw iSCSI disk: Windows' own NTFS/exFAT driver does the filesystem
 # work. Needs the two iscsicli commands from "Mounting" below to attach it (elevated).
-vcrs mount   secret.vc --password "correct horse"      # --removable, --read-only, --disk-mode raw, …
+vcrs mount   secret.vc --password "correct horse"      # --removable, --read-only, --disk-mode raw, --idle-timeout 0, …
 vcrs list                                             # what is attached (--all: every iSCSI session)
 vcrs dismount --iscsi iqn.2025-12.io.vcrs:secret
 
@@ -230,6 +231,7 @@ the iSCSI *target* itself needs no administration, only the initiator does).
 | Backup file layout | Each 64 KiB half of the `.hc` file is a self-contained header region (password + its own salt opens it) — the layout VeraCrypt's own restore reads | ✅ (`crates/vcrs-core/tests/header_restore.rs`) |
 | Backup/restore/change round trip | 11 tests: restore from file / from the embedded copy / from the master key, a wrong backup leaves the container alone, both header copies rewritten, the outer volume's slots untouched when a hidden volume is changed, quick vs full detection | ✅ (`crates/vcrs-core/tests/header_restore.rs`) |
 | Sparse (dynamic) container | A 4 MiB `--sparse` container round-trips data, really occupies less than a quarter of that on disk (`GetCompressedFileSize`), and a full format is refused | ✅ (`crates/vcrs-core/tests/sparse.rs`) |
+| iSCSI target lifetime | The target stops by itself once the initiator has logged out and stayed away for the idle timeout, and `--idle-timeout 0` keeps it serving without one | ✅ (`crates/vcrs-mount/tests/iscsi_device.rs`; `scripts/vc-iscsi-e2e.ps1` waits for the process to exit: `target-exited`) |
 | Container timestamps | A container whose times are set 30 days back keeps **both** its modification and access time through `vcrs info`, `read`, `write` and `expand`, and while it is served over iSCSI; a control test shows a write *does* move the time when the freeze is off | ✅ (`crates/vcrs-core/tests/timestamps.rs`, `crates/vcrs-mount/tests/iscsi_device.rs`) |
 | Dokany-era checks (historical) | With the Dokany filesystem mount (removed since; code in git history): files written through the drive letter were read back by VeraCrypt, a file VeraCrypt wrote into the vc-rs-made FAT was read back through the mount, and the same held for hidden volumes | ✅ (`scripts/vc-dokan-crosscheck.ps1` = `ALL OK`, `scripts/vc-hidden-test.ps1` = `HIDDEN ROUND TRIP OK: True`, `FULL HIDDEN CHAIN OK: True`) |
 
@@ -281,6 +283,11 @@ VeraCrypt layout byte for byte, writes into the synthetic prefix are absorbed (s
 the container's header salt so it stays stable across sessions. `--disk-mode raw` exposes
 the bare data area instead (LBA 0 = data offset 0), which is what non-Windows initiators
 and the tests use.
+
+The serving process stops by itself a few seconds after the last initiator logs out
+(`--idle-timeout <SECONDS>`, default 5, `0` = never), so a Windows rescan or a reboot can
+log back in without you restarting it — and `vcrs dismount --iscsi <iqn>` plus a logout
+leaves no stray process behind.
 
 ```powershell
 # terminal 1 (normal rights): serve the volume — it prints the two commands below,

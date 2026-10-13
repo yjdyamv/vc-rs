@@ -305,6 +305,10 @@ struct MountArgs {
     /// Refuse all writes.
     #[arg(long)]
     read_only: bool,
+    /// Keep the iSCSI target running this many seconds after the last initiator
+    /// logs out (default 5, `0` = keep serving until Ctrl-C).
+    #[arg(long, value_name = "SECONDS")]
+    idle_timeout: Option<u64>,
     /// Do not preserve the container's modification timestamp. VeraCrypt keeps
     /// it unchanged by default (its "Preserve modification timestamp of file
     /// containers" option), so that using a volume does not reveal when it was
@@ -964,6 +968,9 @@ fn run() -> Result<()> {
             iscsi.read_only = a.read_only;
             iscsi.removable = a.removable;
             iscsi.preserve_timestamp = !a.no_preserve_timestamp;
+            if let Some(seconds) = a.idle_timeout {
+                iscsi.idle_timeout = std::time::Duration::from_secs(seconds);
+            }
             iscsi.protect_hidden = a.protect.hidden_open_options()?;
             if let Some(bind) = &a.bind {
                 iscsi.bind_addr = bind.clone();

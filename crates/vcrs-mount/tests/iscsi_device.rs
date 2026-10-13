@@ -18,6 +18,7 @@
 //! One test does start the real server and check that the socket comes up.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use iscsi_target::ScsiBlockDevice;
 use vcrs_core::volume::{CreateOptions, OpenOptions, Volume};
@@ -489,4 +490,45 @@ fn serving_a_volume_preserves_the_container_timestamp() {
     assert_eq!(read, pattern());
     drop(volume);
     let _ = std::fs::remove_file(&path);
+}
+
+/// A target with `--idle-timeout 0` keeps serving even when no initiator ever
+/// logs in (and after the last one logs out), which is what a reboot needs.
+#[test]
+fn a_zero_idle_timeout_keeps_serving() {
+    let mut target = Fixture::new("idle-zero", DiskMode::Partitioned, false);
+    target.opts.idle_timeout = Duration::ZERO;
+    target.serve();
+    let mount = target.mount.as_ref().expect("the server is running");
+    assert!(
+        mount.idle_timeout().is_zero(),
+        "the option has to reach the mount"
+    );
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(
+        mount.is_running(),
+        "the target has to keep serving when the idle timeout is zero"
+    );
+}
+
+/// The default matches what a Windows initiator expects: a short grace period
+/// after a logout, so that a rescan or a reboot can log back in.
+#[test]
+fn the_default_idle_timeout_is_a_short_grace_period() {
+    let mut target = Fixture::new("idle-default", DiskMode::Partitioned, false);
+    assert_eq!(
+        target.opts.idle_timeout,
+        vcrs_mount::DEFAULT_IDLE_TIMEOUT,
+        "the default is the five seconds Windows needs"
+    );
+    assert_eq!(vcrs_mount::DEFAULT_IDLE_TIMEOUT, Duration::from_secs(5));
+    target.serve();
+    assert_eq!(
+        target
+            .mount
+            .as_ref()
+            .expect("the server is running")
+            .idle_timeout(),
+        vcrs_mount::DEFAULT_IDLE_TIMEOUT
+    );
 }
