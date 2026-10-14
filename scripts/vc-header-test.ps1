@@ -58,7 +58,10 @@ Remove-Item $Hc -Force -ErrorAction SilentlyContinue
 # ---------------------------------------------------------------- 1. container
 Say ''
 Say '--- 1. container with a VeraCrypt-made filesystem in it'
-& $Vcrs create $Vol --size 10M --password $Password --pim $Pim | Out-Null
+# 64 MiB because `vcrs format` only creates FAT32 now (which needs ~33 MiB); the
+# VeraCrypt-made FAT16 image below is written over it and is what the rest of
+# this script works with.
+& $Vcrs create $Vol --size 64M --password $Password --pim $Pim | Out-Null
 & $Vcrs format $Vol --password $Password --pim $Pim --label VCHDR | Out-Null
 & $Vcrs write $Vol --password $Password --pim $Pim --from $Fat --offset 0 | Out-Null
 $fatVbr = Join-Path $Root '.logs\vbr-check.bin'

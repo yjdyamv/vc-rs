@@ -5,8 +5,8 @@ use std::io::Write;
 
 use iscsi_target::IscsiClient;
 use vcrs_core::volume::{CreateOptions, OpenOptions, Volume};
+use vcrs_mount::format_volume;
 use vcrs_mount::iscsi::{free_loopback_port, DiskMode, IscsiMount, IscsiMountOptions, ScsiVolume};
-use vcrs_mount::{format_volume, FatKind};
 
 macro_rules! step {
     ($($arg:tt)*) => {{
@@ -18,7 +18,7 @@ macro_rules! step {
 fn main() {
     let path = std::env::temp_dir().join("vcrs-iscsi-probe.vc");
     let _ = std::fs::remove_file(&path);
-    let size = 10 * 1024 * 1024u64;
+    let size = 40 * 1024 * 1024u64;
     let password = b"probe-password".to_vec();
 
     step!("1. create");
@@ -27,7 +27,7 @@ fn main() {
     create.pim = 1;
     let mut volume = Volume::create(&path, size, &create).expect("create");
     step!("2. format");
-    format_volume(&mut volume, FatKind::Fat16, "PROBE").expect("format");
+    format_volume(&mut volume, "PROBE").expect("format");
     volume.flush().expect("flush");
     drop(volume);
 

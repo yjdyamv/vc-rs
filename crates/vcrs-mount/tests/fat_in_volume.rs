@@ -14,10 +14,12 @@ use std::{
 
 use fatfs::{FatType, FileSystem, FsOptions};
 use vcrs_core::volume::{CreateOptions, OpenOptions, Volume};
-use vcrs_mount::{format_volume, FatKind, VolumeDevice, SECTOR_SIZE};
+use vcrs_mount::{format_volume, VolumeDevice, SECTOR_SIZE};
 
 const PASSWORD: &[u8] = b"test-password";
 const MARKER: &[u8] = b"VC-RS-FAT-ROUNDTRIP";
+/// FAT32 needs at least 65 525 clusters, so a data area of about 33 MiB.
+const FAT32_VOLUME_SIZE: u64 = 40 * 1024 * 1024;
 
 /// A container file in the system temp directory that is deleted on drop, even
 /// when an assertion fails.
@@ -31,7 +33,10 @@ impl TempVolume {
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
             .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("vcrs-mount-{tag}-{}-{unique}.vc", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "vcrs-mount-{tag}-{}-{unique}.vc",
+            std::process::id()
+        ));
         let _ = fs::remove_file(&path);
         TempVolume { path }
     }
@@ -66,11 +71,17 @@ fn pattern(length: usize) -> Vec<u8> {
 }
 
 fn create_options() -> CreateOptions {
-    CreateOptions { password: PASSWORD.to_vec(), ..CreateOptions::default() }
+    CreateOptions {
+        password: PASSWORD.to_vec(),
+        ..CreateOptions::default()
+    }
 }
 
 fn open_options() -> OpenOptions {
-    OpenOptions { password: PASSWORD.to_vec(), ..OpenOptions::default() }
+    OpenOptions {
+        password: PASSWORD.to_vec(),
+        ..OpenOptions::default()
+    }
 }
 
 /// The same numbers a mount handler would report as free space.
@@ -86,18 +97,23 @@ fn read_whole_file(filesystem: &FileSystem<VolumeDevice<Volume>>, path: &str) ->
     data
 }
 
-/// Format a 4 MiB volume, write files through `fatfs`, then reopen the volume
+/// Format a 40 MiB volume, write files through `fatfs`, then reopen the volume
 /// from scratch and verify the contents.
 #[test]
-fn fat_filesystem_round_trips_through_the_encrypted_volume() {
-    const VOLUME_SIZE: u64 = 4 * 1024 * 1024;
+fn fat32_filesystem_round_trips_through_the_encrypted_volume() {
+    const VOLUME_SIZE: u64 = FAT32_VOLUME_SIZE;
 
     let container = TempVolume::new("roundtrip");
-    let mut volume = Volume::create(container.path(), VOLUME_SIZE, &create_options()).expect("create volume");
-    assert_eq!(volume.data_size % SECTOR_SIZE as u64, 0, "the FAT region must be sector aligned");
+    let mut volume =
+        Volume::create(container.path(), VOLUME_SIZE, &create_options()).expect("create volume");
+    assert_eq!(
+        volume.data_size % SECTOR_SIZE as u64,
+        0,
+        "the FAT region must be sector aligned"
+    );
     assert!(volume.data_size >= VOLUME_SIZE - 512 * 1024);
 
-    format_volume(&mut volume, FatKind::Auto, "TESTVOL").expect("format the volume");
+    format_volume(&mut volume, "TESTVOL").expect("format the volume");
     volume.flush().expect("flush the volume");
     drop(volume);
 
@@ -107,22 +123,36 @@ fn fat_filesystem_round_trips_through_the_encrypted_volume() {
     // --- first mount: write the files ------------------------------------
     let volume = Volume::open(container.path(), &open_options()).expect("reopen the volume");
     let device = VolumeDevice::new(volume);
-    let filesystem = FileSystem::new(device.clone(), FsOptions::new()).expect("mount the FAT filesystem");
+    let filesystem =
+        FileSystem::new(device.clone(), FsOptions::new()).expect("mount the FAT filesystem");
 
-    assert_eq!(filesystem.fat_type(), FatType::Fat16, "a 4 MiB volume is FAT16");
+    assert_eq!(
+        filesystem.fat_type(),
+        FatType::Fat32,
+        "FAT32 is the only type vc-rs creates"
+    );
     assert_eq!(filesystem.volume_label().trim(), "TESTVOL");
     let free_before = free_bytes(&filesystem);
-    assert!(free_before > 3 * 1024 * 1024, "a fresh 4 MiB volume should be mostly free");
+    assert!(
+        free_before > 3 * 1024 * 1024,
+        "a fresh 40 MiB volume should be mostly free"
+    );
 
     let root = filesystem.root_dir();
-    let mut file = root.create_file("roundtrip.bin").expect("create roundtrip.bin");
+    let mut file = root
+        .create_file("roundtrip.bin")
+        .expect("create roundtrip.bin");
     file.write_all(&payload).expect("write roundtrip.bin");
     file.flush().expect("flush the file");
     drop(file);
 
     let subdir = root.create_dir("SUBDIR").expect("create SUBDIR");
-    let mut nested = subdir.create_file("inner.bin").expect("create SUBDIR/inner.bin");
-    nested.write_all(&inner_payload).expect("write SUBDIR/inner.bin");
+    let mut nested = subdir
+        .create_file("inner.bin")
+        .expect("create SUBDIR/inner.bin");
+    nested
+        .write_all(&inner_payload)
+        .expect("write SUBDIR/inner.bin");
     nested.flush().expect("flush the file");
     // Rewriting a byte at a non-zero, non-sector-aligned offset must not
     // corrupt the rest of the file.
@@ -138,10 +168,19 @@ fn fat_filesystem_round_trips_through_the_encrypted_volume() {
         .iter()
         .map(|entry| entry.expect("directory entry").file_name())
         .collect();
-    assert!(names.iter().any(|name| name == "roundtrip.bin"), "listing: {names:?}");
-    assert!(names.iter().any(|name| name == "SUBDIR"), "listing: {names:?}");
+    assert!(
+        names.iter().any(|name| name == "roundtrip.bin"),
+        "listing: {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name == "SUBDIR"),
+        "listing: {names:?}"
+    );
     let free_after_write = free_bytes(&filesystem);
-    assert!(free_after_write < free_before, "writing data must reduce the free space");
+    assert!(
+        free_after_write < free_before,
+        "writing data must reduce the free space"
+    );
 
     // Writing 4 bytes at offset 4088 of a 4089-byte file extends it to 4092.
     let mut expected_inner = inner_payload[..4096 - 8].to_vec();
@@ -157,16 +196,24 @@ fn fat_filesystem_round_trips_through_the_encrypted_volume() {
     // --- second mount: the bytes must come back ---------------------------
     let volume = Volume::open(container.path(), &open_options()).expect("reopen the volume");
     let device = VolumeDevice::new(volume);
-    let filesystem = FileSystem::new(device.clone(), FsOptions::new()).expect("mount the FAT filesystem");
+    let filesystem =
+        FileSystem::new(device.clone(), FsOptions::new()).expect("mount the FAT filesystem");
 
     assert_eq!(read_whole_file(&filesystem, "roundtrip.bin"), payload);
-    assert_eq!(read_whole_file(&filesystem, "SUBDIR/inner.bin"), expected_inner);
+    assert_eq!(
+        read_whole_file(&filesystem, "SUBDIR/inner.bin"),
+        expected_inner
+    );
     assert!(free_bytes(&filesystem) <= free_before);
     // Reading through the manifest-dependent path proves the sector cache and
     // the FAT are consistent for a second, independent `fatfs` instance.
-    let mut file = filesystem.root_dir().open_file("roundtrip.bin").expect("open");
+    let mut file = filesystem
+        .root_dir()
+        .open_file("roundtrip.bin")
+        .expect("open");
     let mut tail = Vec::new();
-    file.seek(SeekFrom::Start(payload.len() as u64 - 32)).expect("seek");
+    file.seek(SeekFrom::Start(payload.len() as u64 - 32))
+        .expect("seek");
     file.read_to_end(&mut tail).expect("read the tail");
     assert_eq!(tail, payload[payload.len() - 32..]);
     drop(file);
@@ -191,52 +238,67 @@ fn fat_filesystem_round_trips_through_the_encrypted_volume() {
     );
 }
 
-/// The `FatKind` request must be honoured for both FAT types the UI offers.
+/// A volume that is formatted comes out FAT32, with the label asked for.
 #[test]
-fn fat16_and_fat32_are_both_formatted_on_request() {
-    // 40 MiB of data area needs more than 65525 clusters, so it is FAT32 with
-    // any cluster size; 4 MiB is FAT16.
-    for (kind, size, expected) in [
-        (FatKind::Fat16, 4 * 1024 * 1024u64, FatType::Fat16),
-        (FatKind::Fat32, 40 * 1024 * 1024u64, FatType::Fat32),
-    ] {
-        let container = TempVolume::new("kind");
-        let mut volume = Volume::create(container.path(), size, &create_options()).expect("create volume");
-        format_volume(&mut volume, kind, "KINDTEST").expect("format the volume");
-        volume.flush().expect("flush the volume");
-        drop(volume);
+fn formatting_produces_fat32() {
+    let container = TempVolume::new("fat32");
+    let mut volume = Volume::create(container.path(), FAT32_VOLUME_SIZE, &create_options())
+        .expect("create volume");
+    format_volume(&mut volume, "FAT32TEST").expect("format the volume");
+    volume.flush().expect("flush the volume");
+    drop(volume);
 
-        let volume = Volume::open(container.path(), &open_options()).expect("reopen the volume");
-        let device = VolumeDevice::new(volume);
-        let filesystem = FileSystem::new(device.clone(), FsOptions::new()).expect("mount the FAT filesystem");
-        assert_eq!(filesystem.fat_type(), expected, "{kind:?} on a {size} byte volume");
-        assert_eq!(filesystem.volume_label().trim(), "KINDTEST");
+    let volume = Volume::open(container.path(), &open_options()).expect("reopen the volume");
+    let device = VolumeDevice::new(volume);
+    let filesystem =
+        FileSystem::new(device.clone(), FsOptions::new()).expect("mount the FAT filesystem");
+    assert_eq!(filesystem.fat_type(), FatType::Fat32);
+    assert_eq!(filesystem.volume_label().trim(), "FAT32TEST");
+    // FAT32 puts 28 bits of the sector count in the BPB, so the filesystem
+    // reports its own geometry; it must fit the data area it was given.
+    assert!(u64::from(filesystem.cluster_size()) >= 512);
 
-        // A write big enough to cross clusters must work for both types.
-        let root = filesystem.root_dir();
-        let mut file = root.create_file("data.bin").expect("create data.bin");
-        let payload = pattern(200_000);
-        file.write_all(&payload).expect("write data.bin");
-        drop(file);
-        drop(root);
-        drop(filesystem);
-        device.sync().expect("sync the device");
-        drop(device);
+    // A write big enough to cross clusters must work.
+    let root = filesystem.root_dir();
+    let mut file = root.create_file("data.bin").expect("create data.bin");
+    let payload = pattern(200_000);
+    file.write_all(&payload).expect("write data.bin");
+    drop(file);
+    drop(root);
+    drop(filesystem);
+    device.sync().expect("sync the device");
+    drop(device);
 
-        let volume = Volume::open(container.path(), &open_options()).expect("reopen the volume");
-        let device = VolumeDevice::new(volume);
-        let filesystem = FileSystem::new(device.clone(), FsOptions::new()).expect("mount the FAT filesystem");
-        assert_eq!(read_whole_file(&filesystem, "data.bin"), payload);
-        drop(filesystem);
-        device.sync().expect("sync the device");
-    }
+    let volume = Volume::open(container.path(), &open_options()).expect("reopen the volume");
+    let device = VolumeDevice::new(volume);
+    let filesystem =
+        FileSystem::new(device.clone(), FsOptions::new()).expect("mount the FAT filesystem");
+    assert_eq!(read_whole_file(&filesystem, "data.bin"), payload);
+    drop(filesystem);
+    device.sync().expect("sync the device");
+}
+
+/// A data area too small for 65 525 clusters is refused instead of being given
+/// a lower FAT.
+#[test]
+fn a_volume_too_small_for_fat32_is_refused() {
+    let container = TempVolume::new("toosmall");
+    let mut volume = Volume::create(container.path(), 4 * 1024 * 1024, &create_options())
+        .expect("create volume");
+    let error = format_volume(&mut volume, "TINY").expect_err("4 MiB cannot hold FAT32");
+    let message = error.to_string();
+    assert!(
+        message.contains("too small for FAT32"),
+        "unexpected error: {message}"
+    );
 }
 
 /// A volume that was never formatted must be reported, not guessed at.
 #[test]
 fn mounting_an_unformatted_volume_fails() {
     let container = TempVolume::new("unformatted");
-    let volume = Volume::create(container.path(), 4 * 1024 * 1024, &create_options()).expect("create volume");
+    let volume = Volume::create(container.path(), 4 * 1024 * 1024, &create_options())
+        .expect("create volume");
     let device = VolumeDevice::new(volume);
     assert!(
         FileSystem::new(device, FsOptions::new()).is_err(),
@@ -249,14 +311,16 @@ fn mounting_an_unformatted_volume_fails() {
 #[test]
 fn labels_are_sanitised() {
     let container = TempVolume::new("label");
-    let mut volume = Volume::create(container.path(), 4 * 1024 * 1024, &create_options()).expect("create volume");
-    format_volume(&mut volume, FatKind::Auto, "").expect("format without a label");
+    let mut volume = Volume::create(container.path(), FAT32_VOLUME_SIZE, &create_options())
+        .expect("create volume");
+    format_volume(&mut volume, "").expect("format without a label");
     volume.flush().expect("flush the volume");
     drop(volume);
 
     let volume = Volume::open(container.path(), &open_options()).expect("reopen the volume");
     let device = VolumeDevice::new(volume);
-    let filesystem = FileSystem::new(device.clone(), FsOptions::new()).expect("mount the FAT filesystem");
+    let filesystem =
+        FileSystem::new(device.clone(), FsOptions::new()).expect("mount the FAT filesystem");
     // fatfs substitutes the FAT default name for a volume without a label.
     assert!(
         matches!(filesystem.volume_label().trim(), "" | "NO NAME"),
@@ -268,5 +332,8 @@ fn labels_are_sanitised() {
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }

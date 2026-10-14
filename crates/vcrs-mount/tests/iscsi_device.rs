@@ -22,11 +22,13 @@ use std::time::Duration;
 
 use iscsi_target::ScsiBlockDevice;
 use vcrs_core::volume::{CreateOptions, OpenOptions, Volume};
+use vcrs_mount::format_volume;
 use vcrs_mount::iscsi::{free_loopback_port, DiskMode, IscsiMount, IscsiMountOptions, ScsiVolume};
-use vcrs_mount::{format_volume, FatKind};
 
-/// Container size used by every test (VeraCrypt's own minimum is 299008 bytes).
-const VOLUME_SIZE: u64 = 10 * 1024 * 1024;
+/// Container size used by every test. FAT32 needs at least 65 525 clusters, so
+/// the data area has to be about 33 MiB (VeraCrypt's own minimum is 299008
+/// bytes, which is far below what FAT32 can describe).
+const VOLUME_SIZE: u64 = 40 * 1024 * 1024;
 /// Two header groups: the data area is the rest of the container.
 const HEADER_SIZE: u64 = 262_144;
 const PASSWORD: &[u8] = b"iscsi-test-password";
@@ -35,7 +37,7 @@ const DATA_SECTORS: u64 = (VOLUME_SIZE - HEADER_SIZE) / 512;
 /// 1 MiB alignment of the synthetic partition.
 const PARTITION_START: u64 = 2048;
 
-/// A container that has been FAT16-formatted, plus the options needed to reopen
+/// A container that has been FAT32-formatted, plus the options needed to reopen
 /// it and (optionally) a device or a running server built from it.
 struct Fixture {
     path: PathBuf,
@@ -57,7 +59,7 @@ impl Fixture {
         // PIM 1 keeps the (500k-iteration default) PBKDF2 cost out of the test.
         create.pim = 1;
         let mut volume = Volume::create(&path, VOLUME_SIZE, &create).expect("create volume");
-        format_volume(&mut volume, FatKind::Fat16, LABEL).expect("format the FAT16 filesystem");
+        format_volume(&mut volume, LABEL).expect("format the FAT32 filesystem");
         volume.flush().expect("flush the container");
         drop(volume);
 
@@ -139,11 +141,15 @@ fn partitioned_disk_exposes_the_filesystem_inside_a_synthetic_mbr() {
     assert_eq!(target.device().capacity(), PARTITION_START + DATA_SECTORS);
     assert_eq!(target.device().data_start_lba(), PARTITION_START);
 
-    // LBA 0 is an MBR that describes the data area as one FAT16 partition.
+    // LBA 0 is an MBR that describes the data area as one FAT32 partition.
     let mbr = read_sector(target.device(), 0);
     assert_eq!(&mbr[510..512], &[0x55, 0xAA], "the MBR must be signed");
     let entry = 0x1BE;
-    assert_eq!(mbr[entry + 4], 0x0E, "the partition type should be FAT16 LBA");
+    assert_eq!(
+        mbr[entry + 4],
+        0x0C,
+        "the partition type should be FAT32 LBA"
+    );
     let start = u32::from_le_bytes(mbr[entry + 8..entry + 12].try_into().unwrap()) as u64;
     let sectors = u32::from_le_bytes(mbr[entry + 12..entry + 16].try_into().unwrap()) as u64;
     assert_eq!(start, PARTITION_START);
@@ -154,12 +160,15 @@ fn partitioned_disk_exposes_the_filesystem_inside_a_synthetic_mbr() {
         "the disk needs a non-zero signature, or Windows offers to initialise it"
     );
 
-    // Inside the partition sits the FAT16 filesystem, exactly as VeraCrypt's own
+    // Inside the partition sits the FAT32 filesystem, exactly as VeraCrypt's own
     // driver would present it (the data area starts with the boot sector).
     let vbr = read_sector(target.device(), start);
-    assert_eq!(&vbr[0..3], &[0xEB, 0x3C, 0x90], "no FAT boot sector");
-    assert_eq!(&vbr[0x36..0x3E], b"FAT16   ");
-    assert_eq!(&vbr[0x2B..0x36], b"ISCSITEST  ", "volume label");
+    assert_eq!(&vbr[0..3], &[0xEB, 0x58, 0x90], "no FAT32 boot sector");
+    assert_eq!(&vbr[3..11], b"MSWIN4.1");
+    // FAT32 keeps the label, the type string and the root directory elsewhere
+    // than FAT12/16: the label at 0x47 and the type at 0x52.
+    assert_eq!(&vbr[0x47..0x52], b"ISCSITEST  ", "volume label");
+    assert_eq!(&vbr[0x52..0x5A], b"FAT32   ", "filesystem type");
     assert_eq!(&vbr[510..512], &[0x55, 0xAA]);
 
     // A write through the device lands in the container as plaintext.
@@ -230,8 +239,8 @@ fn raw_mode_exposes_the_bare_data_area() {
     // ...so LBA 0 is the filesystem itself.
     let vbr = read_sector(target.device(), 0);
     assert_eq!(&vbr[3..11], b"MSWIN4.1");
-    assert_eq!(&vbr[0x36..0x3E], b"FAT16   ");
-    assert_eq!(&vbr[0x2B..0x36], b"ISCSITEST  ");
+    assert_eq!(&vbr[0x47..0x52], b"ISCSITEST  ");
+    assert_eq!(&vbr[0x52..0x5A], b"FAT32   ");
 }
 
 #[test]
@@ -257,7 +266,9 @@ fn read_only_refuses_writes_and_leaves_the_container_alone() {
 
     let volume = target.reopen();
     let mut direct = vec![0u8; 512];
-    volume.read_data(5 * 512, &mut direct).expect("read the container");
+    volume
+        .read_data(5 * 512, &mut direct)
+        .expect("read the container");
     assert_eq!(direct, before, "the container must be unchanged");
 }
 
@@ -283,7 +294,8 @@ fn writes_into_the_synthetic_region_never_reach_the_container() {
     let mut first = vec![0u8; 512];
     volume.read_data(0, &mut first).expect("read the container");
     assert_eq!(
-        &first[3..11], b"MSWIN4.1",
+        &first[3..11],
+        b"MSWIN4.1",
         "the data area must still start with the FAT boot sector"
     );
 }
@@ -357,7 +369,9 @@ fn hidden_volume_protection_refuses_writes_through_the_scsi_device() {
     })
     .expect("create the hidden volume");
     let hidden_marker = vec![0x5au8; 512];
-    hidden.write_data(0, &hidden_marker).expect("write the hidden marker");
+    hidden
+        .write_data(0, &hidden_marker)
+        .expect("write the hidden marker");
     let hidden_start = hidden.data_offset;
     let hidden_end = hidden.data_offset + hidden.data_size;
     drop(hidden);
@@ -390,7 +404,9 @@ fn hidden_volume_protection_refuses_writes_through_the_scsi_device() {
 
     // A write in the outer volume's own area works.
     let mut payload = vec![0x11u8; 512];
-    device.write(outer_lba, &payload, 512).expect("write outside the hidden volume");
+    device
+        .write(outer_lba, &payload, 512)
+        .expect("write outside the hidden volume");
     assert_eq!(read_sector(&device, outer_lba), payload);
 
     // A write into the hidden volume's area fails with a device error.
@@ -409,7 +425,10 @@ fn hidden_volume_protection_refuses_writes_through_the_scsi_device() {
     let err = device
         .write(outer_lba + 1, &[0x33u8; 512], 512)
         .expect_err("after a violation all writes must fail");
-    assert!(err.to_string().contains("hidden volume protection"), "unexpected error: {err}");
+    assert!(
+        err.to_string().contains("hidden volume protection"),
+        "unexpected error: {err}"
+    );
 
     // The bytes we tried to overwrite are untouched and the hidden volume still
     // opens with its own password and keeps its marker.
@@ -420,7 +439,9 @@ fn hidden_volume_protection_refuses_writes_through_the_scsi_device() {
     open.volume_type = Some(vcrs_core::VolumeType::Hidden);
     let hidden = Volume::open(&path, &open).expect("the hidden volume survives");
     let mut marker = vec![0u8; 512];
-    hidden.read_data(0, &mut marker).expect("read the hidden marker");
+    hidden
+        .read_data(0, &mut marker)
+        .expect("read the hidden marker");
     assert_eq!(marker, hidden_marker, "the hidden volume was not modified");
 
     let _ = std::fs::remove_file(&path);
@@ -435,10 +456,8 @@ fn hidden_volume_protection_refuses_writes_through_the_scsi_device() {
 #[cfg(windows)]
 #[test]
 fn serving_a_volume_preserves_the_container_timestamp() {
-    let path = std::env::temp_dir().join(format!(
-        "vcrs-iscsi-timestamps-{}.vc",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("vcrs-iscsi-timestamps-{}.vc", std::process::id()));
     let _ = std::fs::remove_file(&path);
 
     let mut create = CreateOptions::default();
@@ -465,7 +484,10 @@ fn serving_a_volume_preserves_the_container_timestamp() {
     open.password = PASSWORD.to_vec();
     open.pim = 1;
     let opts = IscsiMountOptions::for_volume(&path);
-    assert!(opts.preserve_timestamp, "preserving is the default, as in VeraCrypt");
+    assert!(
+        opts.preserve_timestamp,
+        "preserving is the default, as in VeraCrypt"
+    );
 
     {
         let mut device = ScsiVolume::open(&path, &open, &opts).expect("open the device");
@@ -481,7 +503,11 @@ fn serving_a_volume_preserves_the_container_timestamp() {
         );
     }
 
-    assert_eq!(modified(), past, "dropping the device restores the saved values");
+    assert_eq!(
+        modified(),
+        past,
+        "dropping the device restores the saved values"
+    );
 
     // The write still landed in the container.
     let volume = Volume::open(&path, &open).expect("re-open the container");

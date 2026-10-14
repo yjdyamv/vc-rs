@@ -37,7 +37,7 @@ enum Command {
     Read(ReadArgs),
     /// Write data into a volume.
     Write(WriteArgs),
-    /// Create a FAT filesystem inside an existing volume's data area.
+    /// Create a FAT32 filesystem inside an existing volume's data area.
     Format(FormatArgs),
     /// Mount a volume: expose its data area as a raw block device over iSCSI,
     /// so the initiator's own drivers mount (and can format) the filesystem
@@ -285,9 +285,6 @@ impl NewPasswordArgs {
 struct FormatArgs {
     /// Volume file holding the filesystem.
     path: PathBuf,
-    /// FAT flavour to create.
-    #[arg(long, value_parser = ["auto", "fat16", "fat32"], default_value = "auto")]
-    fat: String,
     /// Volume label (max 11 characters).
     #[arg(long, default_value = "")]
     label: String,
@@ -870,17 +867,12 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::Format(a) => {
-            let kind = match a.fat.as_str() {
-                "fat16" => vcrs_mount::FatKind::Fat16,
-                "fat32" => vcrs_mount::FatKind::Fat32,
-                _ => vcrs_mount::FatKind::Auto,
-            };
             let mut volume = open_rw(&a.path, &a.password, a.kind.volume_type())?;
             apply_hidden_protection(&volume, &a.protect, &a.path)?;
-            vcrs_mount::format_volume(&mut volume, kind, &a.label)?;
+            vcrs_mount::format_volume(&mut volume, &a.label)?;
             volume.flush()?;
             println!(
-                "created a {kind:?} filesystem (label {:?}) in {}",
+                "created a FAT32 filesystem (label {:?}) in {}",
                 a.label,
                 a.path.display()
             );

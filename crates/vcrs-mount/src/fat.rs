@@ -1,137 +1,88 @@
-//! Creating the FAT filesystem inside a volume's data area.
+//! Creating the FAT32 filesystem inside a volume's data area.
+//!
+//! FAT32 is the only filesystem vc-rs creates: it is the only FAT that is not
+//! limited to a size nobody uses any more (FAT12 stops at 16 MiB, FAT16 at
+//! 2 GiB), and Windows, macOS and Linux all read it. A volume whose data area is
+//! too small for FAT32 is refused rather than silently given a lower FAT.
 //!
 //! `fatfs::format_volume` writes a BPB whose FAT type is *derived from the
 //! cluster count* (`FatType::from_clusters`), not from the requested
 //! `FormatVolumeOptions::fat_type` — that option only selects a default cluster
-//! size. To honour [`FatKind`] we therefore pick the cluster size ourselves and
-//! predict, with the same arithmetic `fatfs` uses, which FAT type it will
-//! produce. [`predicted_fat_type`] reproduces `fatfs`'s internal
-//! `determine_fs_geometry` search (it tries FAT32, then FAT16, then FAT12 and
-//! takes the first geometry that self-consistently fits).
+//! size. To be sure the result is FAT32, [`cluster_size_for_fat32`] picks a
+//! cluster size for which `fatfs` derives FAT32, using the same arithmetic
+//! `fatfs` uses internally (`determine_fs_geometry`), and `format_volume` reads
+//! the filesystem back and fails if `fatfs` disagreed.
 
 use std::io;
 
 use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
-use vcrs_core::{
-    error::Error,
-    volume::Volume,
-};
+use vcrs_core::{error::Error, volume::Volume};
 
 use crate::{
     device::{VolumeDevice, SECTOR_SIZE},
-    FatKind, Result,
+    Result,
 };
 
-/// Root directory entries `fatfs` creates for FAT12/16 (its default).
-const MAX_ROOT_DIR_ENTRIES: u32 = 512;
-/// Size of a FAT directory entry.
-const DIR_ENTRY_SIZE: u32 = 32;
 /// Number of FAT copies `fatfs` creates.
 const FATS: u32 = 2;
 /// Reserved sectors `fatfs` uses for FAT32 (`fatfs` uses 1 for FAT12/16).
 const FAT32_RESERVED_SECTORS: u32 = 8;
+/// Bits per FAT entry for FAT32.
+const FAT32_BITS_PER_ENTRY: u32 = 32;
+/// The cluster count from which the FAT specification (and `fatfs`) calls a
+/// filesystem FAT32.
+const FAT32_MIN_CLUSTERS: u32 = 65_525;
+/// The largest cluster count `fatfs` accepts for FAT32 (`max_clusters`).
+const FAT32_MAX_CLUSTERS: u32 = 0x0FFF_FFF4;
 
 /// Smallest cluster size `fatfs` accepts.
 const MIN_CLUSTER_SIZE: u32 = 512;
 /// Largest cluster size `fatfs` accepts.
 const MAX_CLUSTER_SIZE: u32 = 32 * 1024;
 
-/// The FAT type `fatfs` derives from a cluster count (FAT16_MIN/FAT32_MIN).
-fn fat_type_from_clusters(total_clusters: u32) -> FatType {
-    if total_clusters < 4085 {
-        FatType::Fat12
-    } else if total_clusters < 65_525 {
-        FatType::Fat16
-    } else {
-        FatType::Fat32
-    }
-}
-
-/// Cluster limits per FAT type as enforced by `fatfs` (`max_clusters`).
-fn max_clusters(fat_type: FatType) -> u32 {
-    match fat_type {
-        FatType::Fat12 => 4084,
-        FatType::Fat16 => 65_524,
-        FatType::Fat32 => 0x0FFF_FFF4,
-    }
-}
-
-fn bits_per_fat_entry(fat_type: FatType) -> u32 {
-    match fat_type {
-        FatType::Fat12 => 12,
-        FatType::Fat16 => 16,
-        FatType::Fat32 => 32,
-    }
-}
-
-/// The geometry `fatfs` computes for one candidate FAT type, or `None` if that
-/// type cannot describe this volume.
-fn predict_fat_type(total_sectors: u32, bytes_per_sector: u16, bytes_per_cluster: u32) -> Option<FatType> {
+/// Would `fatfs` create a FAT32 filesystem for this cluster size?
+///
+/// `fatfs` computes the geometry for the requested type and then *rejects it*
+/// unless the cluster count it ends up with really is that type, so a cluster
+/// size can only be used when the arithmetic below lands in the FAT32 range.
+fn fits_fat32(total_sectors: u32, bytes_per_sector: u16, bytes_per_cluster: u32) -> bool {
     let bytes_per_sector = u32::from(bytes_per_sector);
     if bytes_per_cluster < bytes_per_sector || bytes_per_cluster % bytes_per_sector != 0 {
-        return None;
+        return false;
     }
     let sectors_per_cluster = bytes_per_cluster / bytes_per_sector;
-
-    // `fatfs` tries FAT32 first, then FAT16, then FAT12.
-    for fat_type in [FatType::Fat32, FatType::Fat16, FatType::Fat12] {
-        let reserved_sectors = if fat_type == FatType::Fat32 { FAT32_RESERVED_SECTORS } else { 1 };
-        let root_dir_sectors = if fat_type == FatType::Fat32 {
-            0
-        } else {
-            (MAX_ROOT_DIR_ENTRIES * DIR_ENTRY_SIZE).div_ceil(bytes_per_sector)
-        };
-        if total_sectors <= reserved_sectors + root_dir_sectors + 8 {
-            continue;
-        }
-        let data_and_fat = total_sectors - reserved_sectors - root_dir_sectors;
-        // fatfs: t2 = bits_per_cluster / bits_per_fat_entry + fats
-        let t2 = (u64::from(sectors_per_cluster) * u64::from(bytes_per_sector) * 8)
-            / u64::from(bits_per_fat_entry(fat_type))
-            + u64::from(FATS);
-        let sectors_per_fat = (u64::from(data_and_fat) + u64::from(sectors_per_cluster) * 2).div_ceil(t2);
-        let sectors_per_fat = match u32::try_from(sectors_per_fat) {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        let Some(data_sectors) = data_and_fat.checked_sub(sectors_per_fat * FATS) else {
-            continue;
-        };
-        let total_clusters = data_sectors / sectors_per_cluster;
-        // fatfs compares the derived type with the candidate and rejects an
-        // over-large cluster count.
-        if fat_type_from_clusters(total_clusters) == fat_type && total_clusters <= max_clusters(fat_type) {
-            return Some(fat_type);
-        }
+    if total_sectors <= FAT32_RESERVED_SECTORS + 8 {
+        return false;
     }
-    None
+    let data_and_fat = total_sectors - FAT32_RESERVED_SECTORS;
+    // fatfs: t2 = bits_per_cluster / bits_per_fat_entry + fats
+    let t2 = (u64::from(sectors_per_cluster) * u64::from(bytes_per_sector) * 8)
+        / u64::from(FAT32_BITS_PER_ENTRY)
+        + u64::from(FATS);
+    let sectors_per_fat =
+        (u64::from(data_and_fat) + u64::from(sectors_per_cluster) * 2).div_ceil(t2);
+    let Ok(sectors_per_fat) = u32::try_from(sectors_per_fat) else {
+        return false;
+    };
+    let Some(data_sectors) = data_and_fat.checked_sub(sectors_per_fat * FATS) else {
+        return false;
+    };
+    let total_clusters = data_sectors / sectors_per_cluster;
+    (FAT32_MIN_CLUSTERS..=FAT32_MAX_CLUSTERS).contains(&total_clusters)
 }
 
-/// `fatfs`'s automatic cluster size rule (`determine_bytes_per_cluster`), used
-/// as the starting point of the search for a size that yields `fat_type`.
-fn default_cluster_size(fat_type: FatType, total_bytes: u64, bytes_per_sector: u16) -> u32 {
+/// `fatfs`'s automatic cluster size rule for FAT32
+/// (`determine_bytes_per_cluster`), used as the starting point of the search for
+/// a size that yields FAT32.
+fn default_cluster_size(total_bytes: u64, bytes_per_sector: u16) -> u32 {
     let mebibyte = 1024 * 1024;
     let gibibyte = 1024 * 1024 * 1024;
-    let size = match fat_type {
-        FatType::Fat12 => next_power_of_two(total_bytes) / mebibyte * 512,
-        FatType::Fat16 => {
-            if total_bytes <= 16 * mebibyte {
-                1024
-            } else if total_bytes <= 128 * mebibyte {
-                2048
-            } else {
-                next_power_of_two(total_bytes) / (64 * mebibyte) * 1024
-            }
-        }
-        FatType::Fat32 => {
-            if total_bytes <= 260 * mebibyte {
-                512
-            } else if total_bytes <= 8 * gibibyte {
-                4096
-            } else {
-                next_power_of_two(total_bytes) / (2 * gibibyte) * 1024
-            }
-        }
+    let size = if total_bytes <= 260 * mebibyte {
+        512
+    } else if total_bytes <= 8 * gibibyte {
+        4096
+    } else {
+        next_power_of_two(total_bytes) / (2 * gibibyte) * 1024
     };
     size.clamp(u64::from(bytes_per_sector), u64::from(MAX_CLUSTER_SIZE)) as u32
 }
@@ -144,14 +95,16 @@ fn next_power_of_two(value: u64) -> u64 {
     }
 }
 
-/// Find a cluster size for which `fatfs` will create `fat_type`.
+/// Find a cluster size for which `fatfs` will create FAT32, or `None` when no
+/// cluster size can (the volume is too small for 65 525 clusters).
 ///
-/// The natural (Windows-compatible) size is tried first, then larger sizes
-/// (FAT12/16 clusters are capped by the number of clusters) and finally smaller
-/// ones (FAT32 needs a small cluster size on small volumes).
-fn cluster_size_for(fat_type: FatType, total_sectors: u32, bytes_per_sector: u16) -> Option<u32> {
+/// The natural (Windows-compatible) size is tried first, then larger sizes (a
+/// large volume needs big clusters to stay under FAT32's cluster limit) and
+/// finally smaller ones (a small volume needs small clusters to reach the
+/// minimum cluster count).
+fn cluster_size_for_fat32(total_sectors: u32, bytes_per_sector: u16) -> Option<u32> {
     let total_bytes = u64::from(total_sectors) * u64::from(bytes_per_sector);
-    let start = default_cluster_size(fat_type, total_bytes, bytes_per_sector);
+    let start = default_cluster_size(total_bytes, bytes_per_sector);
 
     let mut candidates = Vec::new();
     let mut size = start;
@@ -165,9 +118,9 @@ fn cluster_size_for(fat_type: FatType, total_sectors: u32, bytes_per_sector: u16
         size /= 2;
     }
 
-    candidates.into_iter().find(|&bytes_per_cluster| {
-        predict_fat_type(total_sectors, bytes_per_sector, bytes_per_cluster) == Some(fat_type)
-    })
+    candidates
+        .into_iter()
+        .find(|&bytes_per_cluster| fits_fat32(total_sectors, bytes_per_sector, bytes_per_cluster))
 }
 
 /// Convert a human readable volume label into the 11-byte FAT label field.
@@ -177,7 +130,9 @@ fn label_field(label: &str) -> Result<[u8; 11]> {
     if label.is_empty() {
         return Ok(field);
     }
-    let illegal = ['"', '*', '+', ',', '/', ':', ';', '<', '=', '>', '?', '[', '\\', ']', '|'];
+    let illegal = [
+        '"', '*', '+', ',', '/', ':', ';', '<', '=', '>', '?', '[', '\\', ']', '|',
+    ];
     let characters: Vec<char> = label.chars().collect();
     if characters.len() > field.len() {
         return Err(Error::InvalidParameter(format!(
@@ -204,7 +159,7 @@ fn fatfs_error(error: io::Error) -> Error {
 }
 
 /// Implementation of [`crate::format_volume`].
-pub fn format_volume(volume: &mut Volume, kind: FatKind, label: &str) -> Result<()> {
+pub fn format_volume(volume: &mut Volume, label: &str) -> Result<()> {
     let data_size = volume.data_size;
     if data_size < u64::from(SECTOR_SIZE as u32) {
         return Err(Error::InvalidParameter(format!(
@@ -224,40 +179,22 @@ pub fn format_volume(volume: &mut Volume, kind: FatKind, label: &str) -> Result<
     };
 
     let bytes_per_sector = SECTOR_SIZE as u16;
+    let Some(bytes_per_cluster) = cluster_size_for_fat32(total_sectors, bytes_per_sector) else {
+        return Err(Error::InvalidParameter(format!(
+            "a {data_size} byte volume data area is too small for FAT32: it needs at least \
+             {FAT32_MIN_CLUSTERS} clusters, so with {MIN_CLUSTER_SIZE} byte clusters at least {} bytes",
+            u64::from(FAT32_MIN_CLUSTERS) * u64::from(MIN_CLUSTER_SIZE)
+        )));
+    };
+
     let mut options = FormatVolumeOptions::new()
         .bytes_per_sector(bytes_per_sector)
-        .total_sectors(total_sectors);
+        .total_sectors(total_sectors)
+        .fat_type(FatType::Fat32)
+        .bytes_per_cluster(bytes_per_cluster);
     let label = label_field(label)?;
     if label != [b' '; 11] {
         options = options.volume_label(label);
-    }
-
-    // Pick the cluster size that produces the requested FAT type. `Auto` prefers
-    // FAT16 (what VeraCrypt uses for containers up to ~2 GiB) and falls back to
-    // FAT32; for volumes too small for either we leave the choice to `fatfs`.
-    let chosen = match kind {
-        FatKind::Auto => cluster_size_for(FatType::Fat16, total_sectors, bytes_per_sector)
-            .map(|size| (FatType::Fat16, size))
-            .or_else(|| cluster_size_for(FatType::Fat32, total_sectors, bytes_per_sector).map(|size| (FatType::Fat32, size))),
-        FatKind::Fat16 => Some((
-            FatType::Fat16,
-            cluster_size_for(FatType::Fat16, total_sectors, bytes_per_sector).ok_or_else(|| {
-                Error::InvalidParameter(format!(
-                    "a {data_size} byte volume cannot hold a FAT16 filesystem (needs 2 MiB..2 GiB)"
-                ))
-            })?,
-        )),
-        FatKind::Fat32 => Some((
-            FatType::Fat32,
-            cluster_size_for(FatType::Fat32, total_sectors, bytes_per_sector).ok_or_else(|| {
-                Error::InvalidParameter(format!(
-                    "a {data_size} byte volume cannot hold a FAT32 filesystem (needs ~35 MiB..2 TiB)"
-                ))
-            })?,
-        )),
-    };
-    if let Some((fat_type, bytes_per_cluster)) = chosen {
-        options = options.fat_type(fat_type).bytes_per_cluster(bytes_per_cluster);
     }
 
     // Everything below goes through the encrypted volume: `VolumeDevice` buffers
@@ -268,18 +205,28 @@ pub fn format_volume(volume: &mut Volume, kind: FatKind, label: &str) -> Result<
 
     // Read the filesystem back to confirm (and report) what was really created.
     let filesystem = FileSystem::new(device.clone(), FsOptions::new()).map_err(fatfs_error)?;
-    log::info!(
-        "formatted a {} byte volume data area as {:?} with {} byte clusters ({} sectors)",
-        data_size,
-        filesystem.fat_type(),
-        filesystem.cluster_size(),
-        total_sectors
-    );
+    let fat_type = filesystem.fat_type();
+    let cluster_size = filesystem.cluster_size();
     filesystem.unmount().map_err(fatfs_error)?;
 
     // Write the cached sectors through the encryption layer and fsync the host
     // file so the formatting is durable.
     device.sync().map_err(fatfs_error)?;
+
+    // `fatfs` derives the type from the cluster count, so a mismatch means the
+    // search above and `fatfs` disagree: report it instead of handing back a
+    // filesystem of a type vc-rs does not promise.
+    if fat_type != FatType::Fat32 {
+        return Err(Error::InvalidParameter(format!(
+            "the filesystem created in a {data_size} byte volume data area is {fat_type:?}, \
+             not FAT32 (the volume was left formatted)"
+        )));
+    }
+
+    log::info!(
+        "formatted a {data_size} byte volume data area as FAT32 with {cluster_size} byte clusters \
+         ({total_sectors} sectors)"
+    );
     Ok(())
 }
 
@@ -294,24 +241,37 @@ mod tests {
     }
 
     #[test]
-    fn a_4_mib_volume_becomes_fat16() {
-        let total = sectors(4 * 1024 * 1024);
-        let cluster_size = cluster_size_for(FatType::Fat16, total, BPS).unwrap();
-        assert_eq!(cluster_size, 512);
-        assert_eq!(predict_fat_type(total, BPS, cluster_size), Some(FatType::Fat16));
+    fn fat32_needs_about_thirty_three_mebibytes() {
+        // 65 525 clusters of 512 bytes is the specification's minimum, so
+        // anything below ~33 MiB cannot be FAT32 with any cluster size.
+        for mib in [1u64, 8, 16, 32] {
+            assert_eq!(
+                cluster_size_for_fat32(sectors(mib * 1024 * 1024), BPS),
+                None,
+                "{mib} MiB is too small for FAT32"
+            );
+        }
+        for mib in [33u64, 40, 100, 512] {
+            let cluster_size = cluster_size_for_fat32(sectors(mib * 1024 * 1024), BPS)
+                .unwrap_or_else(|| panic!("{mib} MiB must be enough for FAT32"));
+            assert!(
+                fits_fat32(sectors(mib * 1024 * 1024), BPS, cluster_size),
+                "{mib} MiB must be FAT32 with {cluster_size} byte clusters"
+            );
+        }
     }
 
     #[test]
-    fn a_large_volume_cannot_be_fat16() {
-        let total = sectors(8 * 1024 * 1024 * 1024);
-        assert_eq!(cluster_size_for(FatType::Fat16, total, BPS), None);
-    }
-
-    #[test]
-    fn a_40_mib_volume_can_be_fat32() {
-        let total = sectors(40 * 1024 * 1024);
-        let cluster_size = cluster_size_for(FatType::Fat32, total, BPS).unwrap();
-        assert_eq!(predict_fat_type(total, BPS, cluster_size), Some(FatType::Fat32));
+    fn a_large_volume_gets_larger_clusters() {
+        // 512 MiB is past the 260 MiB step of fatfs' automatic rule, so the
+        // cluster size must grow rather than the cluster count run away.
+        let total = sectors(512 * 1024 * 1024);
+        let cluster_size = cluster_size_for_fat32(total, BPS).unwrap();
+        assert!(
+            cluster_size > 512,
+            "a 512 MiB volume should use {cluster_size} byte clusters"
+        );
+        assert!(fits_fat32(total, BPS, cluster_size));
     }
 
     #[test]

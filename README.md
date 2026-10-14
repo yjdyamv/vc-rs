@@ -11,7 +11,8 @@ VeraCrypt 建的卷 vc-rs 能读能写）；(2) 可创建卷（普通卷、隐�
 `--quick` 可跳过）；(3) 可挂载卷：`vcrs mount` 把解密后的数据区以 **iSCSI 目标**暴露给 Windows 自带的 Microsoft
 iSCSI 发起程序，Windows 看到的是一块真实磁盘，于是**用 Windows 自己的 NTFS/exFAT/FAT 驱动**
 格式化并读写（已实测：Windows 在此磁盘上格式化 NTFS 并写入文件，真实 VeraCrypt 挂载同一容器
-能原样读到）。`vcrs format` 还能在卷内直接建 FAT 文件系统（不挂载也能用）。此外还支持
+能原样读到）。`vcrs format` 还能在卷内直接建 FAT32 文件系统（不挂载也能用，数据区至少要 33 MiB）。
+此外还支持
 备份/恢复卷头（`backup-headers`/`restore-headers`，含从主密钥重建）、改密码
 （`change`）、卷扩容、隐藏卷保护、就地加解密（文件镜像与**整个 NTFS 分区**，后者即 VeraCrypt 的
 `/encdev`：缩小文件系统、锁定卸载、遮蔽卷首、自顶向下加密）、动态卷（`--sparse`，按需分配磁盘空间）、
@@ -60,7 +61,7 @@ iSCSI 发起程序，Windows 看到的是一块真实磁盘，于是**用 Window
 | Header backup to a file, restore from it / from the embedded copy / from the master key | ✅ (`backup-headers`, `restore-headers --from|--embedded|--master-key`) |
 | Change the password, keyfiles, PIM or hash of a volume (`change`) | ✅ |
 | Free-space check before creating (refuses to write a container that cannot fit; `--no-size-check` overrides) | ✅ |
-| FAT filesystem creation inside the volume (`vcrs format`) | ✅ |
+| FAT32 filesystem creation inside the volume (`vcrs format`) | ✅ (FAT32 is the only FAT vc-rs creates: FAT16 stops at 2 GiB and FAT12 at 16 MiB, so a data area smaller than ~33 MiB — the 65 525-cluster minimum — is refused instead of being given a lower FAT) |
 | Raw disk for Windows over iSCSI (`vcrs mount`): any filesystem Windows supports | ✅ (verified: Windows formatted NTFS through it, VeraCrypt read the files back) |
 | Read-only disks, hidden volumes, `--disk-mode raw`, removable-media reporting | ✅ |
 | Mounting through the backup header (`vcrs mount --backup`, VeraCrypt's `/mountoption headerbak`) | ✅ (with the whole primary header group zeroed, `vcrs mount --backup` opens the volume and starts serving it, while `vcrs info` without it reports "incorrect password/PIM/PRF or not a VeraCrypt volume") |
@@ -141,7 +142,8 @@ vcrs create big.vc --size 2T --password pw --sector-size 4096
 # Inspect it (prints the decrypted header) — add --backup for the backup header.
 vcrs info secret.vc --password "correct horse"
 
-# Optional: put a FAT filesystem inside (handy for small containers / other systems).
+# Optional: put a FAT32 filesystem inside, without mounting (readable by Windows,
+# macOS and Linux alike; the data area must be at least ~33 MiB).
 vcrs format secret.vc --password "correct horse" --label DATA
 
 # Serve the volume as a raw iSCSI disk: Windows' own NTFS/exFAT driver does the filesystem
