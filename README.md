@@ -63,7 +63,7 @@ iSCSI 发起程序（加 `--letter S` 就在同一条命令里挂到指定盘符
 | Free-space check before creating (refuses to write a container that cannot fit; `--no-size-check` overrides) | ✅ |
 | FAT32 filesystem creation inside the volume (`vcrs format`) | ✅ (FAT32 is the only FAT vc-rs creates: FAT16 stops at 2 GiB and FAT12 at 16 MiB, so a data area smaller than ~33 MiB — the 65 525-cluster minimum — is refused instead of being given a lower FAT) |
 | Raw disk for Windows over iSCSI (`vcrs mount`): any filesystem Windows supports | ✅ (verified: Windows formatted NTFS through it, VeraCrypt read the files back) |
-| Choosing the drive letter (`vcrs mount --letter S`, or `vcrs attach`) | ✅ (attaching needs administrator rights because `iscsicli` does, so `vcrs mount --letter` raises the one UAC prompt itself, replays the elevated child's output and cleans up the machine state first — a stale session logged in to a dead target, or a disk device Windows left in an Error state, otherwise blocks the login; a letter Windows already put on the disk is kept instead of being moved, and without `--letter` only the serving half runs and the `iscsicli` commands are printed) |
+| Choosing the drive letter (`vcrs mount --letter S`, or `vcrs attach`) | ✅ (attaching needs administrator rights because `iscsicli` does, so `vcrs mount --letter` raises the one UAC prompt itself, replays the elevated child's output and cleans up the machine state first — a stale session logged in to a dead target, or a disk device Windows left in an Error state, otherwise blocks the login; a letter Windows put on the disk by itself is taken off again so that the letter you asked for goes on (a volume that already wears one refuses a second — `SetVolumeMountPointW` answers `ERROR_INVALID_PARAMETER` and the disk would just stay on `D:`), and without `--letter` only the serving half runs and the `iscsicli` commands are printed) |
 | Read-only disks, hidden volumes, `--disk-mode raw`, removable-media reporting | ✅ |
 | Mounting through the backup header (`vcrs mount --backup`, VeraCrypt's `/mountoption headerbak`) | ✅ (with the whole primary header group zeroed, `vcrs mount --backup` opens the volume and starts serving it, while `vcrs info` without it reports "incorrect password/PIM/PRF or not a VeraCrypt volume") |
 | Detaching every target at once (`vcrs dismount --all`, VeraCrypt's `/dismount` without a volume) | ✅ (it reuses the session parsing of `vcrs list` and the logout of `vcrs dismount --iscsi`, which the iSCSI end-to-end script covers; `--all` and `--iscsi` are mutually exclusive) |
@@ -324,8 +324,11 @@ the container's header salt so it stays stable across sessions. `--disk-mode raw
 the bare data area instead (LBA 0 = data offset 0), which is what non-Windows initiators
 and the tests use.
 
-The serving process stops by itself a few seconds after the last initiator logs out
-(`--idle-timeout <SECONDS>`, default 5, `0` = never), so a Windows rescan or a reboot can
+The serving process stops by itself after the last initiator logs out (`--idle-timeout
+<SECONDS>`, default 5, `0` = never; the background server that `--letter` starts uses 30 s,
+long enough for the initiator to drop and re-establish its connection while the attach is
+still running — with a 5 s clock that server used to walk away mid-attach, and the mount
+then failed with "Windows did not show the disk"), so a Windows rescan or a reboot can
 log back in without you restarting it — and `vcrs dismount --iscsi <iqn>` plus a logout
 leaves no stray process behind.
 
@@ -365,6 +368,29 @@ available"), so a container whose primary header is damaged still serves; `--let
 attaches the just-served volume in the same command (one UAC prompt) instead of leaving
 that to a second elevated terminal; `vcrs dismount --all` detaches every target at once,
 the way VeraCrypt's `/dismount` without a volume dismounts all of its volumes.
+
+The hidden volume of a container is served under a target name of its own —
+`iqn.2025-12.io.vcrs:<file>-hidden`, so `mount both.vc --hidden` is
+`iqn.2025-12.io.vcrs:both-hidden` — which is what lets the outer and the hidden volume of
+one container be mounted side by side (`vcrs mount both.vc -p outer` on `S:` and
+`vcrs mount both.vc -p inner --hidden` on `T:`). Take the hidden one off by its letter, its
+IQN or `--all`: `vcrs dismount <file>` names only the outer volume, because the file name
+is the outer volume's target.
+
+That elevation is asked for **once per ten minutes, not once per command**: the first
+elevated run leaves an agent behind (a windowless `vcrs agent --serve`), and the
+`vcrs mount --letter` / `vcrs dismount` calls after it hand their work to that agent over
+a named pipe — no second prompt, and no UAC window turning up in the middle of an
+unmount. It stops by itself after ten minutes without requests, or when asked:
+
+```powershell
+vcrs agent --status     # is one running, and with which pid
+vcrs agent --stop       # let it go now
+```
+
+`--foreground` is the escape hatch on the serving side: it keeps `vcrs mount` serving in
+the terminal it was started from, instead of handing that half to a detached copy of
+itself (which is what lets `vcrs mount --letter` give your prompt straight back).
 
 Five things to know:
 

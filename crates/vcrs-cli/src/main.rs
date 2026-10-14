@@ -16,9 +16,11 @@ use vcrs_core::header::{
 use vcrs_core::volume::{CreateOptions, OpenOptions, ProtectedRange, RestoreHeaderOptions, Volume};
 use vcrs_core::{EncryptionAlgorithm, Prf, VolumeLayout, VolumeType};
 
+mod agent;
 mod attach;
 mod detach;
 mod serve;
+mod win32;
 
 #[derive(Parser)]
 #[command(name = "vcrs", version, about = "VeraCrypt-compatible volume tooling")]
@@ -63,6 +65,10 @@ enum Command {
     /// has the prompt it needs. Not meant to be typed by hand.
     #[command(hide = true)]
     Detach(DetachArgs),
+    /// The cached elevated helper: the first prompt leaves it running, and the
+    /// commands after that need no prompt at all. `--status` and `--stop` look
+    /// after it; `--serve` is what that first prompt starts.
+    Agent(AgentArgs),
     /// Grow an existing container (VeraCrypt's Volume Expander). The data area
     /// gets bigger and the existing data is kept; the filesystem inside keeps
     /// its old size and has to be extended from the operating system once the
@@ -382,6 +388,24 @@ struct MountArgs {
     password: PasswordArgs,
     #[command(flatten)]
     protect: HiddenProtectionArgs,
+}
+
+/// What `vcrs agent` was asked to do.
+#[derive(Args)]
+struct AgentArgs {
+    /// Run the helper: listen for requests until the idle timeout, then end.
+    /// Normally started by the first prompt, not by hand.
+    #[arg(long)]
+    serve: bool,
+    /// End the helper that is running.
+    #[arg(long, conflicts_with = "serve")]
+    stop: bool,
+    /// Say whether a helper is running, and its pid.
+    #[arg(long, conflicts_with_all = ["serve", "stop"])]
+    status: bool,
+    /// Minutes with no requests after which the helper ends itself.
+    #[arg(long, value_name = "MINUTES", default_value_t = agent::DEFAULT_IDLE.as_secs_f64() / 60.0)]
+    idle: f64,
 }
 
 #[derive(Args)]
@@ -1157,6 +1181,12 @@ fn run() -> Result<()> {
             }
             if let Some(name) = &a.target_name {
                 iscsi.target_name = name.clone();
+            } else if a.kind.hidden {
+                // The hidden volume of a container needs its own target name: both
+                // halves of one file would otherwise be served (and logged into)
+                // under one IQN, so the second mount would land on the first one's
+                // session and pull in the wrong disk — or be refused outright.
+                iscsi.target_name = format!("{}-hidden", iscsi.target_name);
             }
             match a.letter {
                 None => vcrs_mount::mount_iscsi(&a.path, &options, &iscsi)?,
@@ -1243,6 +1273,9 @@ fn run() -> Result<()> {
             if !attach::is_detached_worker() {
                 return attach::wait_for_detached_worker();
             }
+            // This is the run that had a prompt approved, so it is the run that can
+            // leave an agent behind: the commands after it need no prompt at all.
+            agent::start_if_absent();
             let log = a.log.clone();
             let request = attach::AttachOptions {
                 iqn: a.iqn,
@@ -1260,10 +1293,12 @@ fn run() -> Result<()> {
                     use std::io::Write as _;
                     if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
                         let _ = writeln!(file, "vcrs: error: {err:#}");
+                        let _ = writeln!(file, "{}", attach::FAILED);
                     }
                 }
                 return Err(err);
             }
+            attach::mark_done(log.as_deref());
             Ok(())
         }
         Command::Dismount(a) => {
@@ -1290,11 +1325,50 @@ fn run() -> Result<()> {
             detach::detach_with_elevation(&options)?;
             Ok(())
         }
+        Command::Agent(a) => {
+            if a.status {
+                match agent::status() {
+                    Some(pid) => println!("the agent (pid {pid}) is running"),
+                    None => println!(
+                        "no agent is running; the next `vcrs mount --letter` or `vcrs dismount` \
+                         asks for a prompt once and leaves one behind"
+                    ),
+                }
+                return Ok(());
+            }
+            if a.stop {
+                if agent::stop() {
+                    println!("the agent was asked to stop");
+                } else {
+                    println!("no agent is running");
+                }
+                return Ok(());
+            }
+            if !a.serve {
+                bail!(
+                    "say what to do: `vcrs agent --serve` starts one, `--status` asks after it, \
+                     `--stop` ends it"
+                );
+            }
+            // The launcher's console is a window somebody can close, and a console
+            // app is killed with it (`0xC000013A`). The agent has to outlive its
+            // launcher, so it hands the job to a console-less child of its own and
+            // returns; that child is the agent.
+            attach::ignore_console_control_events();
+            if !attach::is_detached_worker() {
+                attach::spawn_detached_worker()?;
+                return Ok(());
+            }
+            agent::serve(std::time::Duration::from_secs_f64(a.idle.max(0.0) * 60.0))?;
+            Ok(())
+        }
         Command::Detach(a) => {
             attach::ignore_console_control_events();
             if !attach::is_detached_worker() {
                 return attach::wait_for_detached_worker();
             }
+            // The elevated run leaves an agent behind (see the `Attach` arm above).
+            agent::start_if_absent();
             let log = a.log.clone();
             let target = match (&a.iqn, a.letter, a.all) {
                 (Some(iqn), _, _) => detach::Target::Iqn(iqn.clone()),
@@ -1311,10 +1385,12 @@ fn run() -> Result<()> {
                     use std::io::Write as _;
                     if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
                         let _ = writeln!(file, "vcrs: error: {err:#}");
+                        let _ = writeln!(file, "{}", attach::FAILED);
                     }
                 }
                 return Err(err);
             }
+            attach::mark_done(log.as_deref());
             Ok(())
         }
     }
@@ -1588,7 +1664,7 @@ fn list_mounts(a: &ListArgs) -> Result<()> {
     }
     #[cfg(windows)]
     {
-        let output = std::process::Command::new("iscsicli")
+        let output = crate::attach::quiet_command("iscsicli")
             .args(["SessionList", "1"])
             .output();
         // `iscsicli` needs elevation, so an unelevated `vcrs list` shows the
@@ -1635,7 +1711,7 @@ fn list_mounts(a: &ListArgs) -> Result<()> {
              $letters = (Get-Partition -DiskNumber $_.Number -ErrorAction SilentlyContinue | \
              Where-Object { $_.DriveLetter } | ForEach-Object { $_.DriveLetter + ':' }) -join ','; \
              '  disk {0}: {1} bytes, offline={2}, drive letters: {3}' -f $_.Number, $_.Size, $_.IsOffline, $letters }";
-        match std::process::Command::new("powershell")
+        match crate::attach::quiet_command("powershell")
             .args(["-NoProfile", "-Command", script])
             .output()
         {

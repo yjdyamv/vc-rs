@@ -40,11 +40,11 @@ const READY_WAIT: Duration = Duration::from_secs(90);
 const POLL: Duration = Duration::from_millis(200);
 
 /// How long to wait for a detached server to stop by itself after its last
-/// session is gone before it is killed. The server's own idle time-out is three
-/// seconds (`serve::spawn` passes `--idle-timeout 3` when the user chose none),
-/// and the session is logged out before this is called, so three seconds is a
-/// full turn of that clock rather than a hopeful guess.
-const STOP_WAIT: Duration = Duration::from_secs(3);
+/// session is gone before it is killed. The server's own idle time-out is thirty
+/// seconds (`serve::spawn` passes `--idle-timeout 30` when the user chose none),
+/// and the session is logged out before this is called, so this is only the last
+/// turn of that clock rather than a hopeful guess.
+pub(crate) const STOP_WAIT: Duration = Duration::from_secs(2);
 
 /// A serving process this program started, and can find again.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,25 +287,63 @@ pub(crate) fn forget(iqn: &str) {
 
 /// Stop a background server, waiting first: the target often ends by itself a
 /// few seconds after its last session is logged out.
-pub(crate) fn stop(server: &Server, report: &mut Report) -> bool {
-    let script = format!(
-        "$p = Get-Process -Id {} -ErrorAction SilentlyContinue; \
-         if (!$p) {{ 'gone' }} else {{ \
-         for ($i = 0; $i -lt {} -and !$p.HasExited; $i++) {{ Start-Sleep -Milliseconds 500 }}; \
-         if ($p.HasExited) {{ 'exited' }} else {{ $p | Stop-Process -Force; 'killed' }} }}",
-        server.pid,
-        STOP_WAIT.as_millis() / 500
-    );
-    let outcome = match crate::attach::powershell(&script) {
-        Ok(text) => text.trim().to_string(),
-        Err(err) => {
-            report.line(&format!(
-                "could not ask Windows about the background server (pid {}): {err:#}",
-                server.pid
-            ));
-            String::new()
+/// Wait for a process to exit, then kill it if it will not.
+///
+/// This used to be a PowerShell script (`Get-Process` + `Start-Sleep` loop +
+/// `Stop-Process`), which cost a whole PowerShell start — 1.5 to 10 s on this
+/// machine, and a console window before that — for a question the kernel answers
+/// instantly. It returns the same three words the script printed.
+pub(crate) fn wait_and_kill(pid: u32, timeout: Duration) -> &'static str {
+    #[cfg(windows)]
+    unsafe {
+        use winapi::um::handleapi::CloseHandle;
+        use winapi::um::processthreadsapi::{GetExitCodeProcess, OpenProcess, TerminateProcess};
+        use winapi::um::winnt::{PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE};
+
+        // `STILL_ACTIVE` (259) lives in winapi's winbase feature; one number is not
+        // worth a feature flag, so it is declared here.
+        const STILL_ACTIVE: u32 = 259;
+
+        let handle = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            0,
+            pid,
+        );
+        if handle.is_null() {
+            // It is gone (or somebody else owns it and we are not elevated, which
+            // cannot happen here: the worker runs elevated).
+            return "gone";
         }
-    };
+        let deadline = std::time::Instant::now() + timeout;
+        let mut code: u32;
+        loop {
+            code = 0;
+            if GetExitCodeProcess(handle, &mut code) == 0 {
+                break;
+            }
+            if code != STILL_ACTIVE {
+                CloseHandle(handle);
+                return "exited";
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        TerminateProcess(handle, 1);
+        CloseHandle(handle);
+        "killed"
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (pid, timeout);
+        "gone"
+    }
+}
+
+pub(crate) fn stop(server: &Server, report: &mut Report) -> bool {
+    // Asking Windows about a process is a kernel question, not a PowerShell one.
+    let outcome = wait_and_kill(server.pid, STOP_WAIT).to_string();
     forget(&server.iqn);
     match outcome.as_str() {
         "gone" => {
@@ -382,7 +420,13 @@ fn child_arguments(
         .any(|arg| arg.to_string_lossy().starts_with("--idle-timeout"))
     {
         out.push(OsString::from("--idle-timeout"));
-        out.push(OsString::from("3"));
+        // Long enough to ride out the initiator dropping and re-establishing its
+        // connection a second after the login (the log shows `Connection closed`
+        // right after `FullFeaturePhase`); with three seconds the server used to
+        // walk away in the middle of its own attach, and the mount then failed
+        // with `Windows did not show the disk`. Once the volume is mounted the
+        // session stays connected, so this grace period is never reached.
+        out.push(OsString::from("30"));
     }
     out.push(OsString::from("--target-name"));
     out.push(OsString::from(iqn));
@@ -402,7 +446,7 @@ fn child_arguments(
 /// though the volume is mounted. The child's own stdout is the log file, so
 /// nothing here is of any use to it.
 #[cfg(windows)]
-fn disinherit_standard_handles() {
+pub(crate) fn disinherit_standard_handles() {
     use winapi::um::handleapi::{SetHandleInformation, INVALID_HANDLE_VALUE};
     use winapi::um::processenv::GetStdHandle;
     use winapi::um::winbase::{STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
@@ -419,7 +463,7 @@ fn disinherit_standard_handles() {
 }
 
 #[cfg(not(windows))]
-fn disinherit_standard_handles() {}
+pub(crate) fn disinherit_standard_handles() {}
 
 /// The log, or an empty string while it does not exist yet.
 fn read_log(path: &std::path::Path) -> String {
@@ -514,7 +558,7 @@ mod tests {
                 "mount",
                 "secret.vc",
                 "--idle-timeout",
-                "3",
+                "30",
                 "--target-name",
                 "iqn.x",
                 "--bind",

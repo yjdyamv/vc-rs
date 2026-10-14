@@ -19,14 +19,23 @@ env_logger = "0.11"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = [
+    "cfgmgr32",
     "consoleapi",
+    "errhandlingapi",
     "fileapi",
     "handleapi",
+    "ioapiset",
+    "minwinbase",
+    "namedpipeapi",
     "processenv",
     "processthreadsapi",
+    "sddl",
     "securitybaseapi",
+    "setupapi",
     "winbase",
+    "winioctl",
     "winnt",
+    "winsvc",
 ] }
 
 [target.'cfg(unix)'.dependencies]

@@ -27,6 +27,12 @@ use anyhow::{bail, Context, Result};
 /// Windows creates is recognised among the other disks in the machine.
 pub const DISK_NAME: &str = "VeraCrypt volume";
 
+/// The INQUIRY product string the SCSI target answers with, which is how Windows names
+/// a vc-rs disk in its device tree (`…\PROD_VERACRYPT_VOLUME`) — the listing matches on
+/// this rather than on the `VeraCrypt volume` name, which is a friendly name Windows
+/// builds from it.
+const DISK_PRODUCT: &str = "VERACRYPT";
+
 /// How long to wait for Windows to show the disk after the login succeeded.
 pub const DISK_WAIT: Duration = Duration::from_secs(30);
 
@@ -183,14 +189,18 @@ pub fn attach(options: &AttachOptions) -> Result<Attached> {
     // Windows recognises the filesystem a moment after the disk turns up (and
     // after the letter moved), so the copy read when the disk first appeared can
     // still be empty.  Give it a moment, then take the freshest answer.
-    let disk = fresher
-        .or_else(|| read_back(disk.number, READ_BACK_WAIT))
+    let mut disk = fresher
+        .or_else(|| read_back(disk.number, None, READ_BACK_WAIT))
         .unwrap_or(disk);
-    let has_file_system = disk
-        .partition
-        .as_ref()
-        .map(|p| p.file_system.is_some())
-        .unwrap_or(false);
+    if !has_a_file_system(&disk) {
+        std::thread::sleep(Duration::from_millis(600));
+        if let Some(again) = read_back(disk.number, None, READ_BACK_WAIT) {
+            if has_a_file_system(&again) {
+                disk = again;
+            }
+        }
+    }
+    let has_file_system = has_a_file_system(&disk);
     if !has_file_system {
         note = "the volume has no filesystem inside yet (VeraCrypt containers do not come with \
                 one): format the disk, or `vcrs format` the container itself"
@@ -217,8 +227,15 @@ pub fn attach_with_elevation(options: &AttachOptions) -> Result<()> {
         return Ok(());
     }
 
+    // An agent an earlier prompt left behind does the work with no prompt at all.
+    if let Some((_, text)) = crate::agent::try_run(&attach_arguments(options, None)) {
+        return judge(&text, "attach");
+    }
+
     let exe = std::env::current_exe().context("finding this program's own path")?;
     let log = temp_log_path();
+    // A log left behind by an earlier run is not this run's answer.
+    let _ = std::fs::remove_file(&log);
     let args = attach_arguments(options, Some(&log));
     println!(
         "attaching {} needs an elevated prompt (iscsicli carries a requireAdministrator manifest):",
@@ -229,22 +246,48 @@ pub fn attach_with_elevation(options: &AttachOptions) -> Result<()> {
          yourself from an elevated prompt)",
         options.iqn
     );
-    let code = start_elevated(&exe, &args, &log)?;
-    replay_elevated(code, &log, "attach")
+    start_elevated(&exe, &args, &log)?;
+    let text = wait_for_log(&log);
+    let _ = std::fs::remove_file(&log);
+    judge(&text, "attach")
 }
 
-/// Read back what an elevated child wrote, then judge its exit code.
+/// How long an elevated run may take before its verdict is given up on.
+const LOG_WAIT: Duration = Duration::from_secs(300);
+
+/// Wait until an elevated run has left its verdict in the log.
 ///
-/// The child has a console of its own, so its output comes back through the log
-/// file it was told to write.
-pub(crate) fn replay_elevated(code: i32, log: &Path, what: &str) -> Result<()> {
-    match std::fs::read_to_string(log) {
-        Ok(text) => print!("{text}"),
-        Err(err) => println!("  (the elevated run left no log to read: {err})"),
+/// The elevated half is not waited for as a process (see [`start_elevated`]), so
+/// its log is the only place its outcome can turn up. Reading the file as it
+/// grows also means a worker that was killed still shows what it managed to do.
+pub(crate) fn wait_for_log(log: &Path) -> String {
+    let deadline = std::time::Instant::now() + LOG_WAIT;
+    loop {
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        if text.contains(DONE) || text.contains(FAILED) {
+            return text;
+        }
+        if std::time::Instant::now() >= deadline {
+            return text;
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
-    let _ = std::fs::remove_file(log);
-    if code != 0 {
-        bail!("the elevated {what} did not succeed (exit code {code})");
+}
+
+/// Print what an elevated run wrote, and say whether it worked.
+///
+/// The work happens in a console-less child whose output comes back through a log
+/// file (or straight from an agent, see [`crate::agent`]), so the verdict is the
+/// marker that child leaves behind: [`DONE`] when it finished, [`FAILED`] when it
+/// gave up. Nothing else in the log can be trusted on its own — the lines around
+/// them are progress, and a worker that was killed mid-way leaves neither.
+pub(crate) fn judge(text: &str, what: &str) -> Result<()> {
+    print!("{text}");
+    if text.contains(FAILED) {
+        bail!("the elevated {what} failed (the lines above say why)");
+    }
+    if !text.contains(DONE) {
+        bail!("the elevated {what} left no verdict behind — it was killed, or it never started");
     }
     Ok(())
 }
@@ -301,19 +344,22 @@ pub(crate) fn temp_log_path() -> PathBuf {
     std::env::temp_dir().join(format!("vcrs-attach-{}.log", std::process::id()))
 }
 
-/// Run `exe args` elevated and wait for it, returning its exit code.
+/// Run `exe args` elevated, and return as soon as it is running.
 ///
 /// `Start-Process -Verb RunAs` is the only supported way to ask for elevation
-/// from a normal process, and `-Wait -PassThru` still gives back the child's
-/// exit code.
+/// from a normal process. Its `-Wait` is deliberately *not* used: it waits for the
+/// whole process tree, and the first elevated run starts an agent (see
+/// [`crate::agent`]) that is meant to live for minutes — the caller would sit
+/// there until the agent timed out. The caller instead reads the run's verdict out
+/// of its `--log` file (see [`wait_for_log`]).
 pub(crate) fn start_elevated(exe: &Path, args: &[String], _log: &Path) -> Result<i32> {
     let list: Vec<String> = args
         .iter()
         .map(|arg| format!("'{}'", arg.replace('\'', "''")))
         .collect();
     let script = format!(
-        "$ErrorActionPreference = 'Stop'\ntry {{ $p = Start-Process -FilePath '{exe}' \
-         -ArgumentList @({list}) -Verb RunAs -Wait -PassThru; exit $p.ExitCode }} \
+        "$ErrorActionPreference = 'Stop'\ntry {{ Start-Process -FilePath '{exe}' \
+         -ArgumentList @({list}) -WindowStyle Hidden -Verb RunAs }} \
          catch {{ Write-Error $_; exit {ELEVATION_CANCELLED} }}",
         exe = exe.display().to_string().replace('\'', "''"),
         list = list.join(","),
@@ -322,7 +368,7 @@ pub(crate) fn start_elevated(exe: &Path, args: &[String], _log: &Path) -> Result
     // elevated process *and its children*, and an inherited stdout pipe would keep
     // the caller's shell waiting for a volume that is already mounted. The elevated
     // child writes its result into `--log`, which the caller replays.
-    let out = Command::new("powershell")
+    let out = quiet_command("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -448,9 +494,6 @@ fn session_ids(list: &str, iqn: &str) -> Vec<String> {
 /// Remove vc-rs disk devices Windows still lists but that are not working.  A
 /// device whose target is gone is left in an error state, and until it is
 /// removed the disk of the new session never starts.
-/// Remove the disk device nodes Windows keeps for vc-rs volumes it made earlier,
-/// which is what frees an iSCSI session the initiator will not log out while its
-/// device is still held by the storage stack.
 pub(crate) fn forget_stale_devices(report: &mut Report) {
     let script = "Get-PnpDevice -Class DiskDrive -ErrorAction SilentlyContinue | \
         Where-Object { $_.FriendlyName -like '*VeraCrypt volume*' -and $_.Status -ne 'OK' } | \
@@ -465,7 +508,7 @@ pub(crate) fn forget_stale_devices(report: &mut Report) {
 
 /// Run `iscsicli` with arguments and give back its output.
 pub(crate) fn iscsicli(args: &[&str]) -> Result<String> {
-    let out = Command::new("iscsicli")
+    let out = quiet_command("iscsicli")
         .args(args)
         .output()
         .with_context(|| {
@@ -498,7 +541,7 @@ pub(crate) fn iscsicli(args: &[&str]) -> Result<String> {
 /// password); passing them as empty strings straight to `CreateProcess` loses
 /// them, so the line goes through `cmd`, which keeps the literal `""`.
 fn iscsicli_line(line: &str) -> Result<String> {
-    let out = Command::new("cmd")
+    let out = quiet_command("cmd")
         .args(["/c", line])
         .output()
         .with_context(|| format!("running `{line}`"))?;
@@ -517,7 +560,7 @@ fn iscsicli_line(line: &str) -> Result<String> {
 
 /// Run a PowerShell one-liner and give back its output.
 pub(crate) fn powershell(script: &str) -> Result<String> {
-    let out = Command::new("powershell")
+    let out = quiet_command("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
         .context("running powershell")?;
@@ -589,27 +632,34 @@ fn letters_from_mask(mask: u32) -> Vec<char> {
 /// every command then comes back with "The Microsoft iSCSI Initiator Service is
 /// not running". Starting it needs elevation, so this belongs on the elevated
 /// side, after the caller's elevation check.
+/// The Windows service the iSCSI work needs: without it `iscsicli AddTarget` fails
+/// with "The Microsoft iSCSI Initiator Service is not running".
+const INITIATOR_SERVICE: &str = "msiscsi";
+
 fn ensure_initiator_service(report: &mut Report) -> Result<()> {
-    let query = "(Get-Service -Name msiscsi).Status.ToString()";
-    let status = powershell(query)?.trim().to_ascii_lowercase();
-    if status == "running" {
+    // The service manager answers in milliseconds; a `Get-Service`/`Start-Service` pair
+    // costs a PowerShell launch plus a cmdlet import on every mount.
+    let state = crate::win32::service_state(INITIATOR_SERVICE)?;
+    if state == crate::win32::ServiceState::Running {
         return Ok(());
     }
     report.line(&format!(
-        "the Microsoft iSCSI Initiator Service is {status}; starting it"
+        "the Microsoft iSCSI Initiator Service is {}; starting it",
+        state.word()
     ));
-    powershell("Start-Service -Name msiscsi")?;
+    crate::win32::start_service(INITIATOR_SERVICE)?;
     let deadline = Instant::now() + SERVICE_START_WAIT;
     loop {
-        let status = powershell(query)?.trim().to_ascii_lowercase();
-        if status == "running" {
+        let state = crate::win32::service_state(INITIATOR_SERVICE)?;
+        if state == crate::win32::ServiceState::Running {
             report.line("the iSCSI service is up");
             return Ok(());
         }
         if Instant::now() >= deadline {
             bail!(
-                "the Microsoft iSCSI Initiator Service did not start (it is still {status}); \
-                 start it by hand with `sc start msiscsi`"
+                "the Microsoft iSCSI Initiator Service did not start (it is still {}); \
+                 start it by hand with `sc start msiscsi`",
+                state.word()
             );
         }
         std::thread::sleep(POLL);
@@ -637,121 +687,20 @@ pub struct DiskInfo {
 
 /// Ask Windows for every vc-rs disk and its partition.
 ///
-/// One PowerShell pass: `Get-Disk` finds the disks by their INQUIRY product
-/// string, `Get-Partition` gives the partition and its letter, and
-/// `Win32_LogicalDisk` gives the filesystem (the deleted GUI learned that
-/// `Get-Volume` reports an empty filesystem for some freshly attached disks).
-pub(crate) fn vcrs_disks() -> Result<Vec<DiskInfo>> {
-    let script = disks_script(None, None, true);
-    Ok(parse_disks(&powershell(&script)?))
-}
-
-/// PowerShell that describes the disk in `$d` as one `disk=…` row.
-///
-/// Kept in one place so the three callers that need a disk described (listing
-/// them, waiting for one, moving a letter) cannot drift apart.
-fn row_code() -> String {
-    "$p = Get-Partition -DiskNumber $d.Number -ErrorAction SilentlyContinue | \
-     Select-Object -First 1; \
-     $fs = ''; $text_letter = ''; \
-     if ($p) { if ($p.DriveLetter) { $text_letter = $p.DriveLetter; \
-       $fs = (Get-Volume -DriveLetter $text_letter -ErrorAction SilentlyContinue).FileSystem; \
-       if (-not $fs) { \
-         $fs = (Get-CimInstance Win32_LogicalDisk -Filter \"DeviceID='$text_letter':\" \
-           -ErrorAction SilentlyContinue).FileSystem } } }; \
-     'disk={0};size={1};part={2};letter={3};fs={4}' -f \
-       $d.Number, $d.Size, $(if ($p) { $p.PartitionNumber } else { 0 }), \
-       $text_letter, $(if ($fs) { $fs } else { '' })"
-        .to_string()
-}
-
-/// PowerShell for the vc-rs disks.
-///
-/// With `wait` the polling loop runs *inside* PowerShell: every process this
-/// spawns costs about a second, so polling from Rust every 500 ms cost far more
-/// than the disk takes to appear. With `all` false only the newest disk of the
-/// wanted size is described (that is the one Windows has just created); with
-/// `all` true every vc-rs disk is.
-pub(crate) fn disks_script(wait: Option<Duration>, size: Option<u64>, all: bool) -> String {
-    let want = size.unwrap_or(0);
-    let body = if all {
-        format!(
-            "Get-Disk | Where-Object {{ $_.FriendlyName -like '*{DISK_NAME}*' }} | \
-             ForEach-Object {{ $d = $_; {} }}",
-            row_code()
-        )
-    } else {
-        format!(
-            "$d = Get-Disk | Where-Object {{ $_.FriendlyName -like '*{DISK_NAME}*' -and \
-               ({want} -eq 0 -or $_.Size -eq {want}) }} | \
-             Sort-Object Number -Descending | Select-Object -First 1; \
-             if ($d) {{ {} }}",
-            row_code(),
-            want = want
-        )
-    };
-    // `Update-HostStorageCache` is what makes a disk the initiator has just
-    // logged in show up: without it Windows keeps serving the disk list it had
-    // before the login, and a freshly attached volume looks like it never
-    // arrived (the same call the iSCSI end-to-end script makes in its poll).
-    let pass = format!("Update-HostStorageCache -ErrorAction SilentlyContinue; {body}");
-    match wait {
-        None => pass,
-        Some(timeout) => format!(
-            "$deadline = (Get-Date).AddSeconds({}); do {{ {} \
-             if ($d) {{ break }}; Start-Sleep -Milliseconds 400 }} while ((Get-Date) -lt $deadline)",
-            timeout.as_secs_f64(),
-            pass
-        ),
-    }
-}
-
-/// Read the `disk=…;size=…;part=…;letter=…;fs=…` lines [`vcrs_disks`] emits.
-pub(crate) fn parse_disks(text: &str) -> Vec<DiskInfo> {
-    let mut disks: Vec<DiskInfo> = Vec::new();
-    for line in text.lines() {
-        let mut disk_number = None;
-        let mut size = None;
-        let mut part_number = None;
-        let mut letter = None;
-        let mut fs = None;
-        for field in line.trim().split(';') {
-            let Some((key, value)) = field.split_once('=') else {
-                continue;
-            };
-            let value = value.trim();
-            match key.trim() {
-                "disk" => disk_number = value.parse().ok(),
-                "size" => size = value.parse().ok(),
-                "part" => part_number = value.parse().ok(),
-                "letter" => letter = value.chars().next().filter(|c| c.is_ascii_alphabetic()),
-                "fs" => {
-                    let value = value.trim();
-                    fs = (!value.is_empty()).then(|| value.to_string());
-                }
-                _ => {}
-            }
-        }
-        let (Some(number), Some(size)) = (disk_number, size) else {
-            continue;
-        };
-        let partition = part_number.filter(|n| *n > 0).map(|number| PartitionInfo {
-            number,
-            letter,
-            file_system: fs.clone(),
-        });
-        disks.push(DiskInfo {
-            number,
-            size,
-            partition,
-            letter: letter.map(|c| c.to_ascii_uppercase()),
-        });
-    }
-    disks
+/// Does Windows see a file system on this disk's partition?
+fn has_a_file_system(disk: &DiskInfo) -> bool {
+    disk.partition
+        .as_ref()
+        .map(|p| p.file_system.is_some())
+        .unwrap_or(false)
 }
 
 /// Wait for the disk Windows creates for the target to show up.
 ///
+
+pub(crate) fn vcrs_disks() -> Result<Vec<DiskInfo>> {
+    crate::win32::vcrs_disks(DISK_PRODUCT)
+}
 /// The disk is chosen by its INQUIRY name, and by size when the caller knows it
 /// (several `vcrs mount` processes can be serving different volumes at once);
 /// the highest disk number wins when two of them are the same size, because
@@ -765,9 +714,29 @@ fn wait_for_disk(
         "waiting up to {} s for the disk …",
         timeout.as_secs()
     ));
-    let text = powershell(&disks_script(Some(timeout), disk_size, false))?;
-    if let Some(disk) = parse_disks(&text).into_iter().next() {
-        return Ok(disk);
+    // The listing is a handful of ioctls now, so the waiting happens here: a cmdlet
+    // import per poll was what made it worth pushing the loop into PowerShell.
+    let deadline = std::time::Instant::now() + timeout;
+    // A freshly logged-in iSCSI disk is a device Windows has not grown a disk for
+    // yet, and the storage stack only does that on a device-tree scan. The old
+    // PowerShell loop called `Update-HostStorageCache` every time round for exactly
+    // this reason; the Win32 call behind it is a re-enumeration of the root device
+    // node. Failing to rescan is not fatal — the disk may arrive on its own — so
+    // the error is dropped rather than ending the wait.
+    let _ = crate::win32::rescan_devices();
+    let mut since_scan = std::time::Instant::now();
+    loop {
+        if let Some(disk) = newest_disk(disk_size) {
+            return Ok(disk);
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        if since_scan.elapsed() >= Duration::from_secs(1) {
+            let _ = crate::win32::rescan_devices();
+            since_scan = std::time::Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
     // Nothing appeared: say what Windows does have, which is what tells a stale
     // device apart from a login that never got through.
@@ -788,6 +757,18 @@ fn wait_for_disk(
     );
 }
 
+/// The newest vc-rs disk of a given size, if Windows has one yet.
+///
+/// The highest disk number wins when two candidates have the same size, because
+/// Windows numbers a newly created disk above the ones already there.
+fn newest_disk(disk_size: Option<u64>) -> Option<DiskInfo> {
+    crate::win32::vcrs_disks(DISK_PRODUCT)
+        .ok()?
+        .into_iter()
+        .filter(|disk| disk_size.map_or(true, |size| disk.size == size))
+        .max_by_key(|disk| disk.number)
+}
+
 /// Make this process ignore console control events (Ctrl-C, Ctrl-Break, a
 /// closing console).
 ///
@@ -797,7 +778,14 @@ pub(crate) const WORKER_ENV: &str = "VCRS_ELEVATED_WORKER";
 /// The line that says the work finished, written into the `--log` file: the caller
 /// reads it back, so a launcher that was killed while waiting cannot make a
 /// successful job look failed.
+/// The line that says the work finished, written into the `--log` file (or sent
+/// back by an agent) when it succeeded.
 pub(crate) const DONE: &str = "vcrs: done";
+
+/// The line that says the work failed, written right after the `vcrs: error:`
+/// line. The caller reads the log rather than a process' exit code (see
+/// [`wait_for_log`]), so the verdict has to be visible in it on its own.
+pub(crate) const FAILED: &str = "vcrs: failed";
 
 /// Is this process the console-less child that does the work?
 pub(crate) fn is_detached_worker() -> bool {
@@ -811,6 +799,47 @@ pub(crate) fn mark_done(log: Option<&Path>) {
         if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
             let _ = writeln!(file, "{DONE}");
         }
+    }
+}
+
+/// Hand a job to a separate process with no console, and give the handle back.
+///
+/// One caller waits for it ([`wait_for_detached_worker`]); the agent does not — it
+/// is the job.
+pub(crate) fn spawn_detached_worker() -> Result<std::process::Child> {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let args: Vec<&std::ffi::OsStr> = args.iter().map(|arg| arg.as_os_str()).collect();
+    spawn_detached_worker_with(&args)
+}
+
+/// The same, for a job that is not this process' own command line — the agent is
+/// started with words of its own.
+pub(crate) fn spawn_detached_worker_with(args: &[&std::ffi::OsStr]) -> Result<std::process::Child> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let exe = std::env::current_exe().context("finding this program's own path")?;
+        // A child created with handle inheritance receives every inheritable handle
+        // this process holds — including a shell's end of the console pipe when this
+        // program was started from one. A worker or an agent outlives its caller, so
+        // the caller's shell would wait on a pipe that never closes.
+        crate::serve::disinherit_standard_handles();
+        Command::new(&exe)
+            .args(args)
+            .env(WORKER_ENV, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
+            .spawn()
+            .context("starting the console-less worker")
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = args;
+        bail!("a console-less worker is a Windows notion; there is none here")
     }
 }
 
@@ -828,23 +857,16 @@ pub(crate) fn mark_done(log: Option<&Path>) {
 pub(crate) fn wait_for_detached_worker() -> Result<()> {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let exe = std::env::current_exe().context("finding this program's own path")?;
-        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-        let mut child = Command::new(&exe)
-            .args(&args)
-            .env(WORKER_ENV, "1")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
-            .spawn()
-            .context("starting the console-less worker")?;
-        child
+        let mut child = spawn_detached_worker()?;
+        let status = child
             .wait()
             .context("waiting for the console-less worker")?;
+        // The caller reads the log for the [`DONE`] line, but a launcher that always
+        // reported success turned a failed attach into "Y: is mounted": the worker's
+        // exit code has to leave this process tree non-zero for the failure to be seen.
+        if !status.success() {
+            bail!("the elevated worker did not finish ({status})");
+        }
         Ok(())
     }
     #[cfg(not(windows))]
@@ -873,63 +895,80 @@ const READ_BACK_WAIT: Duration = Duration::from_secs(5);
 
 /// Move (or put) the disk's partition on `want`, then wait for Windows to
 /// recognise the filesystem, and report the letter it ended up on together with
-/// the freshest description of the disk. One PowerShell process, because each
-/// one costs about a second.
+/// the freshest description of the disk.
+///
+/// `Set-Partition -NewDriveLetter` and `Add-PartitionAccessPath` both come down to
+/// the mount point APIs on the volume's own path, so that is what this does now.
 fn set_letter(
     disk: u32,
     partition: u32,
     want: char,
     wait: Duration,
 ) -> Result<(char, Option<DiskInfo>)> {
-    // `Set-Partition -NewDriveLetter` moves a letter a partition already has and
-    // also sets the first one; an access path is the fallback, and it has to be
-    // spelled `Y:\` — `Remove-PartitionAccessPath -DriveLetter` refuses the
-    // disk-and-partition parameter set.
-    let script = format!(
-        r#"$ErrorActionPreference = 'Stop'
-$d = Get-Disk -Number {disk} -ErrorAction SilentlyContinue
-if ($d -and $d.IsOffline) {{ Set-Disk -Number {disk} -IsOffline $false }}
-$p = Get-Partition -DiskNumber {disk} -PartitionNumber {partition}
-if ($p.DriveLetter -ne '{want}') {{
-  if ($p.DriveLetter) {{
-    try {{ Set-Partition -DiskNumber {disk} -PartitionNumber {partition} -NewDriveLetter {want} -ErrorAction Stop }}
-    catch {{
-      Remove-PartitionAccessPath -DiskNumber {disk} -PartitionNumber {partition} -AccessPath ($p.DriveLetter.ToString() + ':\')
-      Add-PartitionAccessPath -DiskNumber {disk} -PartitionNumber {partition} -AccessPath '{want}:\'
-    }}
-  }} else {{
-    Add-PartitionAccessPath -DiskNumber {disk} -PartitionNumber {partition} -AccessPath '{want}:\'
-  }}
-}}
-$deadline = (Get-Date).AddSeconds({wait})
-$row = ''
-do {{
-  Update-HostStorageCache -ErrorAction SilentlyContinue
-  $d = Get-Disk -Number {disk} -ErrorAction SilentlyContinue
-  if ($d) {{ $row = {row} }}
-  if ($row -match 'fs=.+$') {{ break }}
-  Start-Sleep -Milliseconds 300
-}} while ((Get-Date) -lt $deadline)
-$row
-'letter={want}'"#,
-        disk = disk,
-        partition = partition,
-        want = want,
-        wait = wait.as_secs_f64(),
-        row = row_code()
-    );
-    let text = powershell(&script)
-        .with_context(|| format!("putting disk {disk} partition {partition} on {want}:"))?;
-    let got = text
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("letter="))
-        .and_then(|value| value.trim().chars().next())
-        .map(|c| c.to_ascii_uppercase());
-    let fresh = parse_disks(&text)
-        .into_iter()
-        .find(|found| found.number == disk);
-    match got {
-        Some(got) => Ok((got, fresh)),
+    // An offline disk has no volumes to mount, so it comes back online first.
+    if crate::win32::disk_is_offline(disk).unwrap_or(false) {
+        crate::win32::set_disk_offline(disk, false)
+            .with_context(|| format!("bringing disk {disk} back online"))?;
+    }
+    // The mount point APIs take a volume, not a partition: a volume is what Windows
+    // mounts, and it is found from the disk it starts on. The volume under a partition
+    // that has just appeared is created a moment later, so Windows is asked to look at
+    // the disk again until it turns up.
+    let deadline = std::time::Instant::now() + wait;
+    let volume = loop {
+        match crate::win32::volume_on_disk(disk) {
+            Ok(volume) => break volume,
+            Err(err) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(err.context(format!(
+                        "finding the volume on disk {disk} partition {partition}"
+                    )));
+                }
+                let _ = crate::win32::refresh_disk(disk);
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    };
+    // Windows usually beats us to it: the moment a disk with a filesystem it
+    // recognises arrives, it puts a letter of its own on the volume (`D:`, the next
+    // free one). A volume that already wears a letter will not take a second one —
+    // `SetVolumeMountPointW` answers `ERROR_INVALID_PARAMETER` and the volume simply
+    // stays where Windows put it, which is how asking for `--letter Y` used to end up
+    // on `D:`. So Windows' own choice is taken off before the asked-for letter is put
+    // on. (`release_letter` also copes with a letter whose volume is already gone.)
+    for existing in crate::win32::letters_on_disk(disk) {
+        if existing != want {
+            crate::win32::release_letter(existing)
+                .with_context(|| format!("moving disk {disk} off {existing}:"))?;
+        }
+    }
+    // A volume that has just appeared is not always ready to be put on a letter yet:
+    // the call answers `ERROR_INVALID_PARAMETER` until it is, so it is worth a few
+    // goes rather than moving on and leaving the disk on Windows' own letter.
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match crate::win32::set_mount_point(want, &volume) {
+            Ok(()) => break,
+            Err(err) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(err.context(format!(
+                        "putting disk {disk} partition {partition} on {want}:"
+                    )));
+                }
+                let _ = crate::win32::refresh_disk(disk);
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+    // Windows needs a moment before the filesystem is readable under the new letter,
+    // so read the disk back until it answers with the letter that was asked for.
+    let fresh = read_back(disk, Some(want), wait);
+    match fresh.as_ref().and_then(|found| found.letter) {
+        Some(got) if got == want => Ok((got, fresh)),
+        Some(got) => bail!(
+            "Windows put disk {disk} on {got}: instead of {want}: — move it by hand \
+             in Disk Management"
+        ),
         None => bail!(
             "Windows did not accept {want}: on disk {disk} partition {partition} \
              — assign the letter by hand in Disk Management"
@@ -937,25 +976,26 @@ $row
     }
 }
 
-/// Read a disk back until Windows reports a filesystem on it, so that the note
+/// Read a disk back until Windows shows its drive letter again, so that the note
 /// about an unformatted volume is only printed when it is true.  A container
 /// with no filesystem inside never gets one, which is why this gives up.
-fn read_back(disk: u32, wait: Duration) -> Option<DiskInfo> {
-    let script = format!(
-        "$deadline = (Get-Date).AddSeconds({}); $row = ''; \
-         do {{ Update-HostStorageCache -ErrorAction SilentlyContinue; \
-           $d = Get-Disk -Number {disk} -ErrorAction SilentlyContinue; \
-           if ($d) {{ $row = {} }}; \
-           if ($row -match 'fs=.+$') {{ break }}; \
-           Start-Sleep -Milliseconds 300 }} while ((Get-Date) -lt $deadline); \
-         $row",
-        wait.as_secs_f64(),
-        row_code()
-    );
-    let text = powershell(&script).ok()?;
-    parse_disks(&text)
-        .into_iter()
-        .find(|found| found.number == disk)
+fn read_back(disk: u32, want: Option<char>, wait: Duration) -> Option<DiskInfo> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        let found = vcrs_disks()
+            .ok()?
+            .into_iter()
+            .find(|found| found.number == disk);
+        let letter = found.as_ref().and_then(|found| found.letter);
+        let done = match want {
+            Some(want) => letter == Some(want),
+            None => letter.is_some(),
+        };
+        if done || std::time::Instant::now() >= deadline {
+            return found;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// The first non-empty line of some tool output.
@@ -1114,46 +1154,6 @@ mod tests {
     }
 
     #[test]
-    fn the_disk_lines_powershell_prints_are_read_back() {
-        let text = "disk=3;size=11272192;part=1;letter=F;fs=NTFS\ndisk=4;size=2147483648;part=0;letter=;fs=\n";
-        let disks = parse_disks(text);
-        assert_eq!(disks.len(), 2);
-        assert_eq!(
-            disks[0],
-            DiskInfo {
-                number: 3,
-                size: 11272192,
-                partition: Some(PartitionInfo {
-                    number: 1,
-                    letter: Some('F'),
-                    file_system: Some("NTFS".to_string()),
-                }),
-                letter: Some('F'),
-            }
-        );
-        // A disk Windows has not partitioned yet: no partition, no letter.
-        assert_eq!(
-            disks[1],
-            DiskInfo {
-                number: 4,
-                size: 2147483648,
-                partition: None,
-                letter: None,
-            }
-        );
-        // Noise (a warning banner, an empty line) is ignored.
-        assert!(parse_disks("Get-Partition : Access is denied\n\n").is_empty());
-    }
-
-    #[test]
-    fn a_mounted_but_unformatted_disk_has_no_file_system() {
-        let disks = parse_disks("disk=5;size=535756800;part=1;letter=G;fs=\n");
-        let partition = disks[0].partition.clone().unwrap();
-        assert_eq!(partition.letter, Some('G'));
-        assert_eq!(partition.file_system, None);
-    }
-
-    #[test]
     fn the_ids_of_the_sessions_that_outlived_their_target_are_found() {
         // Trimmed-down `iscsicli SessionList 1` output from a real run, with a
         // session on our target, one on somebody else's, and a stale session
@@ -1183,4 +1183,21 @@ mod tests {
         assert!(session_ids("Total of 0 sessions\n", "iqn.2025-12.io.vcrs:smoke").is_empty());
         assert!(session_ids("", "iqn.2025-12.io.vcrs:smoke").is_empty());
     }
+}
+
+/// Start a helper process with no console window of its own.
+///
+/// The worker that runs a dismount has no console — that is exactly what keeps a
+/// closing console from killing it — so every wrapper it starts would otherwise
+/// allocate a console of its own. That is what a user sees as a window flashing
+/// once per PowerShell call, two or three times per dismount.
+pub(crate) fn quiet_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
 }

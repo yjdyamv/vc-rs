@@ -142,7 +142,24 @@ request through a named pipe specified with `-f`”，参考实现是仓库里�
 （CLI：`vcrs mount` / `vcrs dismount --iscsi <iqn>`）。发起程序那一半（把 target 登录进来、
 并把磁盘放到指定盘符）在 `crates/vcrs-cli/src/attach.rs`：`vcrs mount --letter S` 一条命令
 做完“服务 + 挂载”，`vcrs attach` 单独执行挂载那一半（`iscsicli` 带 requireAdministrator
-清单，所以这一步必须提权，`vcrs mount --letter` 会自己弹一次 UAC）。
+清单，所以这一步必须提权，`vcrs mount --letter` 会自己弹一次 UAC）。提权**十分钟只弹一次**：
+第一次提权的那次运行会留下一个 agent（`crates/vcrs-cli/src/agent.rs`，一个无窗口的
+`vcrs agent --serve`，用命名管道收活），之后十分钟内的 `vcrs mount --letter` /
+`vcrs dismount` 都交给它，不再弹 UAC，也不会在卸载过程中闪出提权窗口；
+`vcrs agent --status` / `--stop` 可以查看或提前放它走。
+
+挂到指定盘符这一步也不再依赖 PowerShell：Windows 往往在磁盘刚出现时就自己给它一个盘符（
+通常是 `D:`），而已经带了盘符的卷拒绝再挂第二个（`SetVolumeMountPointW` 会回
+`ERROR_INVALID_PARAMETER`，磁盘就留在 `D:` 上）——所以先把这个自动盘符摘掉，再挂上用户要的
+那个；后台服务端的空闲超时也调到 30 秒，足够发起程序在挂载过程中断线重连（原来 5 秒会让服务
+在挂载途中自己退出，挂载随后报 “Windows did not show the disk”）。
+
+盘符、磁盘离线、设备卸载这些步骤已经全部改成直接调 Win32（`crates/vcrs-cli/src/win32.rs`：
+SCM 服务、`IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS`、`SetVolumeMountPointW` /
+`DeleteVolumeMountPointW`、`IOCTL_DISK_SET_DISK_ATTRIBUTES`、setupapi + `pnputil`、
+`iscsicli` 列会话），不再为每一件小事起一个 PowerShell（每次启动 PowerShell 固定要
+0.3–0.7 秒，第一次用 Storage 模块还要 2 秒以上）。实测：经 agent 重新挂载约 1.5 秒，卸载
+约 10–11 秒（此前一次挂载/卸载分别是 20–49 秒和 91 秒）。
 `iscsi-target` 1.0.0 以 `vendor/iscsi-target` 打补丁形式引入（补丁说明见
 `vendor/iscsi-target/PATCHES.md`）：
 

@@ -18,13 +18,14 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use crate::attach::{self, DiskInfo, Report};
-use crate::serve;
+use crate::serve::{self, STOP_WAIT};
+use crate::win32;
 
 /// The IQN prefix every target `vcrs mount` serves shares.
 pub(crate) const VCRS_IQN_PREFIX: &str = "iqn.2025-12.io.vcrs:";
 
 /// How long to wait for Windows to let go of a disk ("<letter>: is in use").
-const RELEASE_WAIT: Duration = Duration::from_secs(4);
+const RELEASE_WAIT: Duration = Duration::from_secs(2);
 
 /// What to detach.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,7 +95,9 @@ pub fn detach(options: &DetachOptions, report: &mut Report) -> Result<Detached> 
         );
     }
 
+    let stage = std::time::Instant::now();
     let (sessions, disks) = snapshot();
+    trace(report, "listing the sessions and the disks", stage);
     let vcrs: Vec<Session> = sessions
         .iter()
         .filter(|session| session.iqn.starts_with(VCRS_IQN_PREFIX))
@@ -163,12 +166,23 @@ pub fn detach(options: &DetachOptions, report: &mut Report) -> Result<Detached> 
         }
     };
 
-    // 1. Stop the serving processes **before** the logout. The initiator refuses to
-    //    log out a session while its target is alive and Windows has the volume in
-    //    use ("a device on that session is currently being used"), and waiting for
-    //    Windows to change its mind is what made a dismount take a minute. Once the
-    //    target is gone the session is stale, and a stale session *can* be logged
-    //    out — which is what the earlier probe on this machine showed.
+    // 1. Let go of the volumes **while the target is still serving them**. Dropping the
+    //    access path and taking a disk offline is instant while the volume is healthy,
+    //    and a dead iSCSI target leaves every later storage call waiting on command
+    //    time-outs: measured on this machine, this step took **72.6 s** with the server
+    //    stopped first and 0.2 s with it still alive.
+    //
+    //    The disks come from the request rather than from the sessions: Windows often
+    //    gives a session no disk number at all, and letting go of every vc-rs disk
+    //    because of that would take a second volume down with the one asked for.
+    let numbers: Vec<u32> = if wanted.iter().any(|session| session.disk.is_none()) {
+        target_disks(&options.target, &disks)?
+    } else {
+        wanted.iter().filter_map(|session| session.disk).collect()
+    };
+    // The serving processes are found before the release, because this step also stops
+    // them (see `release`): the volumes have to be Windows' again before the target
+    // dies, or every later storage call waits on command time-outs.
     let mut iqns: Vec<String> = wanted.iter().map(|session| session.iqn.clone()).collect();
     let servers: Vec<serve::Server> = match &options.target {
         Target::All => serve::states(),
@@ -189,11 +203,47 @@ pub fn detach(options: &DetachOptions, report: &mut Report) -> Result<Detached> 
             }
         }
     };
-    let mut stopped_any = false;
+    let pids: Vec<u32> = servers.iter().map(|server| server.pid).collect();
+    // A server we asked `release` to stop is on its way out with the volumes it served.
+    let stopped_any = !pids.is_empty();
+    let stage = std::time::Instant::now();
+    // The letters come from the disk listing, which knows them, and from the request when
+    // Windows would not name a disk: a session with no disk number still has a letter
+    // when the user asked for one.
+    let mut letters: Vec<char> = disks
+        .iter()
+        .filter(|disk| numbers.contains(&disk.number))
+        .filter_map(|disk| disk.letter)
+        .collect();
+    if let Target::Letter(letter) = &options.target {
+        let want = letter.to_ascii_uppercase();
+        if !letters.contains(&want) {
+            letters.push(want);
+        }
+    }
+    let released = release(&numbers, &letters, &pids, report)?;
+    trace(report, "letting go, stopping and forgetting", stage);
+    out.letters.extend(released.letters);
+
+    // 2. The serving processes were stopped by `release` above. The initiator refuses
+    //    to log out a session while its target is alive and Windows has the volume in
+    //    use ("a device on that session is currently being used"), and waiting for
+    //    Windows to change its mind is what made a dismount take a minute. Once the
+    //    target is gone the session is stale, and a stale session *can* be logged
+    //    out — which is what the earlier probe on this machine showed.
     for server in &servers {
-        stopped_any |= serve::stop(server, report);
         if !iqns.contains(&server.iqn) {
             iqns.push(server.iqn.clone());
+        }
+        if released.stopped.contains(&server.pid) {
+            serve::forget(&server.iqn);
+            report.line(&format!(
+                "  stopped the serving process (pid {})",
+                server.pid
+            ));
+        } else {
+            // Already gone, or it would not die: let `serve::stop` report it.
+            let _ = serve::stop(server, report);
         }
     }
 
@@ -202,42 +252,22 @@ pub fn detach(options: &DetachOptions, report: &mut Report) -> Result<Detached> 
     // Only when the session list came out empty (a target that outlived its
     // sessions): every `Get-IscsiSession` costs seconds while an older stale session
     // is making the initiator retry, so it is not done for nothing.
-    let (after_stop, after_stop_disks) = if wanted.is_empty() {
+    let stage = std::time::Instant::now();
+    let (after_stop, _) = if wanted.is_empty() {
         snapshot()
     } else {
         (Vec::new(), Vec::new())
     };
+    trace(report, "looking again after the stop", stage);
     let mut to_logout: Vec<Session> = wanted.clone();
     for session in &after_stop {
         if iqns.contains(&session.iqn) && !to_logout.iter().any(|known| known.id == session.id) {
             to_logout.push(session.clone());
         }
     }
-    let known_disks: Vec<DiskInfo> = if disks.is_empty() {
-        after_stop_disks
-    } else {
-        disks
-    };
-
-    // 2. Release the volumes: drop the drive letters, then take the disk offline —
-    //    a disk Windows is still using is one more thing holding the session open.
-    //
-    //    The disks come from the request, not from the sessions: Windows often
-    //    gives a session no disk number at all, and releasing every vc-rs disk
-    //    because of that would take a second volume down with the one asked for.
-    let numbers: Vec<u32> = if to_logout.iter().any(|session| session.disk.is_none()) {
-        target_disks(&options.target, &known_disks)?
-    } else {
-        to_logout
-            .iter()
-            .filter_map(|session| session.disk)
-            .collect()
-    };
-    let letters = release(&numbers, report)?;
-    out.letters.extend(letters);
-
-    // 2. Log the session out, 3. forget the static target.
+    // 3. Log the session out, and forget the static target.
     let mut refused: Vec<Session> = Vec::new();
+    let stage = std::time::Instant::now();
     for session in &to_logout {
         if logout(session, report) {
             out.targets.push(session.iqn.clone());
@@ -248,6 +278,11 @@ pub fn detach(options: &DetachOptions, report: &mut Report) -> Result<Detached> 
             report.line(&format!("could not forget {}: {err:#}", session.iqn));
         }
     }
+    trace(
+        report,
+        "logging the sessions out and forgetting the targets",
+        stage,
+    );
     if let Target::Iqn(iqn) = &options.target {
         if !wanted.iter().any(|session| &session.iqn == iqn) {
             // The target may be registered without a session (a login that never
@@ -332,6 +367,20 @@ pub fn detach(options: &DetachOptions, report: &mut Report) -> Result<Detached> 
 /// This is what `vcrs dismount` calls: from a normal prompt it produces one UAC
 /// prompt and nothing else to do; from an elevated prompt it detaches straight
 /// away.
+/// Report how long a stage of the detach took, when `VCRS_TRACE` is set.
+///
+/// A dismount is a chain of Windows calls (a PowerShell here, an `iscsicli` there, the
+/// storage stack in between) and guessing which one is slow costs more time than
+/// measuring it.
+fn trace(report: &mut Report, what: &str, since: std::time::Instant) {
+    if std::env::var_os("VCRS_TRACE").is_some() {
+        report.line(&format!(
+            "  [{:>6.1}s] {what}",
+            since.elapsed().as_secs_f64()
+        ));
+    }
+}
+
 pub fn detach_with_elevation(options: &DetachOptions) -> Result<()> {
     let exe = std::env::current_exe().context("finding this program's own path")?;
     if attach::elevated() {
@@ -340,7 +389,15 @@ pub fn detach_with_elevation(options: &DetachOptions) -> Result<()> {
         return Ok(());
     }
 
+    // An agent an earlier prompt left behind does the work with no prompt at all.
+    if let Some((_, text)) = crate::agent::try_run(&detach_arguments(options, None)) {
+        return attach::judge(&text, "dismount");
+    }
+
     let log = attach::temp_log_path();
+    // A log left behind by an earlier run is not this run's answer, and reading it
+    // as it grows is how the run's verdict comes back (see `attach::wait_for_log`).
+    let _ = std::fs::remove_file(&log);
     let args = detach_arguments(options, Some(&log));
     println!(
         "detaching {} needs an elevated prompt (iscsicli carries a requireAdministrator manifest):",
@@ -351,8 +408,10 @@ pub fn detach_with_elevation(options: &DetachOptions) -> Result<()> {
          yourself from an elevated prompt)",
         target_argument(&options.target)
     );
-    let code = attach::start_elevated(&exe, &args, &log)?;
-    attach::replay_elevated(code, &log, "dismount")
+    attach::start_elevated(&exe, &args, &log)?;
+    let text = attach::wait_for_log(&log);
+    let _ = std::fs::remove_file(&log);
+    attach::judge(&text, "dismount")
 }
 
 /// Everything needed to re-run this program as `vcrs detach …`.
@@ -391,60 +450,82 @@ fn target_argument(target: &Target) -> String {
 /// Returns the letters that were taken away. A letter goes away with the
 /// offline flag, but removing the access path first is what makes Windows
 /// release the volume handle immediately.
-fn release(numbers: &[u32], report: &mut Report) -> Result<Vec<char>> {
-    if numbers.is_empty() {
-        return Ok(Vec::new());
-    }
-    let before = letters_of(numbers);
-    let list = numbers
-        .iter()
-        .map(|number| number.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    let script = format!(
-        "$deadline = (Get-Date).AddSeconds(6); \
-         foreach ($n in @({list})) {{ \
-           while ($true) {{ \
-           Get-Partition -DiskNumber $n -ErrorAction SilentlyContinue | \
-             Where-Object {{ $_.DriveLetter }} | ForEach-Object {{ \
-               Remove-PartitionAccessPath -DiskNumber $n -PartitionNumber $_.PartitionNumber \
-                 -AccessPath ($_.DriveLetter + ':\\') -ErrorAction SilentlyContinue }}; \
-             Set-Disk -Number $n -IsOffline $true -ErrorAction SilentlyContinue; \
-             $d = Get-Disk -Number $n -ErrorAction SilentlyContinue; \
-             if ((-not $d) -or $d.IsOffline -or ((Get-Date) -gt $deadline)) {{ break }}; \
-             Start-Sleep -Milliseconds 250 }}; \
-           $d = Get-Disk -Number $n -ErrorAction SilentlyContinue; \
-           if ($d -and -not $d.IsOffline) {{ 'still-online=' + $n }} }}; exit 0"
-    );
-    // The offline step is **verified inside the same PowerShell** (and retried in
-    // it): the initiator will not log out a session whose disk is still online and
-    // in use, which is exactly the refusal this path runs into. A disk that will
-    // not go offline is the reason a logout would fail, so it is said out loud.
-    match attach::powershell(&script) {
-        Ok(text) => {
-            for (i, _) in text
-                .lines()
-                .filter(|line| line.trim().starts_with("still-online="))
-                .enumerate()
-            {
-                let _ = i;
-                report.line(
-                    "  a disk would not go offline: Windows may refuse to log its session out",
-                );
-            }
-        }
-        Err(err) => report.line(&format!("  could not offline the disk(s): {err:#}")),
+/// What the storage half of a dismount produced.
+#[derive(Default)]
+pub struct Released {
+    /// The letters Windows actually gave up.
+    pub letters: Vec<char>,
+    /// The serving processes this step found alive and stopped.
+    pub stopped: Vec<u32>,
+}
+
+/// Let go of the volumes, take the disks offline, stop the serving processes and get the
+/// orphaned disk devices out of the way.
+///
+/// This is the heart of a dismount and it runs on every one, so it is Win32 throughout:
+/// the earlier version asked a PowerShell for the letters, the offline step, the
+/// processes and the devices, and the process start-up alone cost seconds per call.
+///
+/// The order is what makes it work at all:
+///
+/// 1. the letters go first, while the target is **still serving** the volume — a dead
+///    target leaves every later storage call waiting on SCSI command time-outs
+///    (measured at 72.6 s on this machine against 0.2 s with it alive);
+/// 2. then the disks go offline: the initiator refuses to log a session out while a
+///    device on that session is in use, and an offline disk is not in use;
+/// 3. then the serving processes stop, which is what makes the session stale — a stale
+///    session logs out, a live one answers "a device on that session is currently
+///    being used";
+/// 4. and finally the disk devices Windows still has are taken away, because the
+///    storage stack holds a session open for those as well.
+fn release(
+    numbers: &[u32],
+    letters: &[char],
+    pids: &[u32],
+    report: &mut Report,
+) -> Result<Released> {
+    if numbers.is_empty() && letters.is_empty() && pids.is_empty() {
+        return Ok(Released::default());
     }
 
-    // Windows gives the letter back a moment later ("<letter>: is in use"
-    // otherwise), so ask it inside one PowerShell rather than starting a whole
-    // process per attempt (about a second each).
-    let left = letters_still_used(&list);
-    let gone: Vec<char> = before
+    // 1. The letters. Taking one away is instant while the volume is healthy, and the
+    //    letter going away is the first thing the user sees.
+    let mut gone: Vec<char> = Vec::new();
+    for letter in letters {
+        match win32::release_letter(*letter) {
+            Ok(()) => {
+                if !gone.contains(letter) {
+                    gone.push(*letter);
+                }
+            }
+            Err(err) => report.line(&format!(
+                "  could not take {letter}: off the volume: {err:#}"
+            )),
+        }
+    }
+
+    // 2. Offline. A disk that is offline is not in use, and only a disk that is not in
+    //    use lets its session go. Nothing is done to a disk Windows already took
+    //    offline, so a second dismount of the same volume is quiet.
+    for number in numbers {
+        if let Err(err) = win32::set_disk_offline(*number, true) {
+            report.line(&format!("  could not take disk {number} offline: {err:#}"));
+        }
+    }
+
+    // Windows acts on that a moment later, so the letters are asked for again until
+    // they are gone. A disk that goes offline takes its letters with it, which is why
+    // the wait is usually over on the first look.
+    let deadline = std::time::Instant::now() + RELEASE_WAIT;
+    let mut left: Vec<char> = gone
         .iter()
-        .filter(|letter| !left.contains(letter))
         .copied()
+        .filter(|letter| win32::volume_of_letter(*letter).is_ok())
         .collect();
+    while !left.is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        left.retain(|letter| win32::volume_of_letter(*letter).is_ok());
+    }
     if !left.is_empty() {
         let letters: String = left
             .iter()
@@ -455,35 +536,73 @@ fn release(numbers: &[u32], report: &mut Report) -> Result<Vec<char>> {
             "  {letters} is still in use: Windows has not let go of it yet"
         ));
     }
-    Ok(gone)
+
+    // 3. The serving processes. One that is already gone needs no report — the caller
+    //    says "the target keeps serving" for that case.
+    let mut stopped: Vec<u32> = Vec::new();
+    for pid in pids {
+        if serve::wait_and_kill(*pid, STOP_WAIT) != "gone" {
+            stopped.push(*pid);
+        }
+    }
+
+    // 4. The disk devices the storage stack still holds. `pnputil` is a plain program
+    //    (the earlier version called it from inside a PowerShell, which cost a whole
+    //    shell every time).
+    match win32::disk_devices(attach::DISK_NAME) {
+        Ok(devices) => {
+            for device in devices {
+                match remove_device(&device.instance_id) {
+                    Ok(()) => report.line(&format!(
+                        "  took the disk device {} away",
+                        device.instance_id
+                    )),
+                    Err(err) => report.line(&format!(
+                        "  could not take the disk device {} away: {err:#}",
+                        device.instance_id
+                    )),
+                }
+            }
+        }
+        Err(err) => report.line(&format!("  could not list the disk devices: {err:#}")),
+    }
+
+    Ok(Released {
+        letters: gone,
+        stopped,
+    })
 }
 
-/// The letters these disks still have.  Polled inside **one** PowerShell: a
-/// letter does not go away the instant its access path does, and asking from
-/// here would cost a whole process per attempt.
-fn letters_still_used(list: &str) -> Vec<char> {
-    let script = format!(
-        r#"$numbers = @({list})
-$deadline = (Get-Date).AddSeconds({wait})
-$left = @()
-do {{
-  Update-HostStorageCache -ErrorAction SilentlyContinue
-  $left = @()
-  foreach ($n in $numbers) {{
-    foreach ($p in @(Get-Partition -DiskNumber $n -ErrorAction SilentlyContinue)) {{
-      if ($p.DriveLetter) {{ $left += $p.DriveLetter }}
-    }}
-  }}
-  if ($left.Count -eq 0) {{ break }}
-  Start-Sleep -Milliseconds 300
-}} while ((Get-Date) -lt $deadline)
-'left=' + ($left -join ',')"#,
-        list = list,
-        wait = RELEASE_WAIT.as_secs()
-    );
-    attach::powershell(&script)
-        .map(|text| letters_after(&text, "left="))
-        .unwrap_or_default()
+/// `pnputil /remove-device`: what takes a phantom disk device (a vc-rs volume whose
+/// serving process is gone) out of the device tree.
+fn remove_device(instance_id: &str) -> Result<()> {
+    // `pnputil` answers 3010 (`ERROR_SUCCESS_REBOOT_REQUIRED`) when the device is gone
+    // but Windows wants a restart to settle the rest; that is still a removal.
+    const REBOOT_REQUIRED: i32 = 3010;
+    let out = attach::quiet_command("pnputil.exe")
+        .args(["/remove-device", instance_id])
+        .output()
+        .context("taking the disk device away")?;
+    if !out.status.success() && out.status.code() != Some(REBOOT_REQUIRED) {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // `pnputil` prints a banner first and its verdict last, so the verdict is the
+        // line worth repeating (and the exit code, for when it says nothing at all).
+        let last = text
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| line.trim().to_string())
+            .unwrap_or_else(|| "no output".to_string());
+        anyhow::bail!(
+            "pnputil /remove-device {instance_id}: exit {:?}: {last}",
+            out.status.code()
+        );
+    }
+    Ok(())
 }
 
 /// The disks a request is about, for the case where Windows will not name them.
@@ -566,56 +685,51 @@ fn clear_leftover_sessions(out: &mut Detached, refused: &[Session], report: &mut
     }
 }
 
-/// The letters on the `key=…` line PowerShell printed, e.g. `left=C,D`.
-fn letters_after(text: &str, key: &str) -> Vec<char> {
-    text.lines()
-        .find_map(|line| line.trim().strip_prefix(key))
-        .map(|value| {
-            value
-                .split(',')
-                .filter_map(|letter| letter.trim().chars().next())
-                .filter(|letter| letter.is_ascii_alphabetic())
-                .map(|letter| letter.to_ascii_uppercase())
-                .collect()
-        })
-        .unwrap_or_default()
+/// Every vc-rs iSCSI session in the machine, in the `sess=…` form [`parse_sessions`]
+/// reads.
+///
+/// This used to be a `Get-IscsiSession` one-liner, which cost a cmdlet import in a
+/// PowerShell process of its own.  The initiator's own `iscsicli SessionList` prints the
+/// same two facts that matter — the session id and its target — in one native process.
+/// The disk number is not in its output, and nothing here needs it: a session is named
+/// by its id and by its target.
+fn sessions_text() -> String {
+    let Ok(list) = attach::iscsicli(&["SessionList", "1"]) else {
+        return String::new();
+    };
+    let mut text = String::new();
+    let mut current: Option<String> = None;
+    for line in list.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        match key.trim() {
+            "Session Id" => current = Some(value.trim().to_string()),
+            "Target Name" => {
+                let iqn = value.trim();
+                if iqn.starts_with(VCRS_IQN_PREFIX) {
+                    if let Some(id) = current.take() {
+                        text.push_str(&format!("sess={id};iqn={iqn};disk=0;conn=True\n"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    text
 }
 
-/// The drive letters Windows currently has on these disks.
-fn letters_of(numbers: &[u32]) -> Vec<char> {
-    let disks: Vec<DiskInfo> = attach::vcrs_disks().unwrap_or_default();
-    let mut letters: Vec<char> = disks
-        .iter()
-        .filter(|disk| numbers.contains(&disk.number))
-        .filter_map(|disk| disk.letter)
-        .collect();
-    letters.sort_unstable();
-    letters.dedup();
-    letters
-}
-
-/// Every iSCSI session in the machine, with the disk each one carries.
-fn sessions_script() -> String {
-    format!(
-        "Get-IscsiSession -ErrorAction SilentlyContinue | \
-         Where-Object {{ $_.TargetNodeAddress -like '*{VCRS_IQN_PREFIX}*' }} | ForEach-Object {{ \
-           'sess={{0}};iqn={{1}};disk={{2}};conn={{3}}' -f \
-             $_.SessionIdentifier, $_.TargetNodeAddress, \
-             $(if ($_.DiskNumber) {{ $_.DiskNumber }} else {{ 0 }}), \
-             $(if ($_.IsConnected) {{ 'True' }} else {{ 'False' }}) }}"
-    )
-}
-
-/// The iSCSI sessions and the vc-rs disks in **one** PowerShell pass: they are
-/// two CIM queries and each process costs about a second.
+/// The iSCSI sessions and the vc-rs disks Windows has.
+///
+/// Both come from the machine itself now: the disks from Win32 (a few ioctls, which also
+/// does away with the `Update-HostStorageCache` a cmdlet-based listing needed before a
+/// freshly attached disk showed up), and the sessions from `iscsicli SessionList`.
 fn snapshot() -> (Vec<Session>, Vec<DiskInfo>) {
-    let script = format!(
-        "{sessions}\n{disks}",
-        sessions = sessions_script(),
-        disks = attach::disks_script(None, None, true)
-    );
-    let text = attach::powershell(&script).unwrap_or_default();
-    (parse_sessions(&text), attach::parse_disks(&text))
+    let text = sessions_text();
+    (
+        parse_sessions(&text),
+        attach::vcrs_disks().unwrap_or_default(),
+    )
 }
 
 /// Read the `sess=…;iqn=…;disk=…;conn=…` lines [`sessions`] prints.
