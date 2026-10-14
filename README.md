@@ -9,7 +9,7 @@ written here.
 × 6 种 KDF 均通过测试，并与本机真实 VeraCrypt 1.26.29 双向验证（vc-rs 建的卷 VeraCrypt 能挂载，
 VeraCrypt 建的卷 vc-rs 能读能写）；(2) 可创建卷（普通卷、隐藏卷、备份头，默认全盘随机填充，
 `--quick` 可跳过）；(3) 可挂载卷：`vcrs mount` 把解密后的数据区以 **iSCSI 目标**暴露给 Windows 自带的 Microsoft
-iSCSI 发起程序，Windows 看到的是一块真实磁盘，于是**用 Windows 自己的 NTFS/exFAT/FAT 驱动**
+iSCSI 发起程序（加 `--letter S` 就在同一条命令里挂到指定盘符，只需确认一次 UAC），Windows 看到的是一块真实磁盘，于是**用 Windows 自己的 NTFS/exFAT/FAT 驱动**
 格式化并读写（已实测：Windows 在此磁盘上格式化 NTFS 并写入文件，真实 VeraCrypt 挂载同一容器
 能原样读到）。`vcrs format` 还能在卷内直接建 FAT32 文件系统（不挂载也能用，数据区至少要 33 MiB）。
 此外还支持
@@ -63,6 +63,7 @@ iSCSI 发起程序，Windows 看到的是一块真实磁盘，于是**用 Window
 | Free-space check before creating (refuses to write a container that cannot fit; `--no-size-check` overrides) | ✅ |
 | FAT32 filesystem creation inside the volume (`vcrs format`) | ✅ (FAT32 is the only FAT vc-rs creates: FAT16 stops at 2 GiB and FAT12 at 16 MiB, so a data area smaller than ~33 MiB — the 65 525-cluster minimum — is refused instead of being given a lower FAT) |
 | Raw disk for Windows over iSCSI (`vcrs mount`): any filesystem Windows supports | ✅ (verified: Windows formatted NTFS through it, VeraCrypt read the files back) |
+| Choosing the drive letter (`vcrs mount --letter S`, or `vcrs attach`) | ✅ (attaching needs administrator rights because `iscsicli` does, so `vcrs mount --letter` raises the one UAC prompt itself, replays the elevated child's output and cleans up the machine state first — a stale session logged in to a dead target, or a disk device Windows left in an Error state, otherwise blocks the login; a letter Windows already put on the disk is kept instead of being moved, and without `--letter` only the serving half runs and the `iscsicli` commands are printed) |
 | Read-only disks, hidden volumes, `--disk-mode raw`, removable-media reporting | ✅ |
 | Mounting through the backup header (`vcrs mount --backup`, VeraCrypt's `/mountoption headerbak`) | ✅ (with the whole primary header group zeroed, `vcrs mount --backup` opens the volume and starts serving it, while `vcrs info` without it reports "incorrect password/PIM/PRF or not a VeraCrypt volume") |
 | Detaching every target at once (`vcrs dismount --all`, VeraCrypt's `/dismount` without a volume) | ✅ (it reuses the session parsing of `vcrs list` and the logout of `vcrs dismount --iscsi`, which the iSCSI end-to-end script covers; `--all` and `--iscsi` are mutually exclusive) |
@@ -147,8 +148,10 @@ vcrs info secret.vc --password "correct horse"
 vcrs format secret.vc --password "correct horse" --label DATA
 
 # Serve the volume as a raw iSCSI disk: Windows' own NTFS/exFAT driver does the filesystem
-# work. Needs the two iscsicli commands from "Mounting" below to attach it (elevated).
-vcrs mount   secret.vc --password "correct horse"      # --removable, --read-only, --backup, --disk-mode raw, --idle-timeout 0, …
+# work. `--letter S` attaches it in the same command (one UAC prompt); without it the
+# volume is only served and the two iscsicli commands from "Mounting" below are printed.
+vcrs mount   secret.vc -p "correct horse" --letter S   # --removable, --read-only, --backup, --disk-mode raw, --idle-timeout 0, …
+vcrs attach  --iqn iqn.2025-12.io.vcrs:secret --letter S  # the attach half alone (needs elevation)
 vcrs list                                             # what is attached (--all: every iSCSI session)
 vcrs dismount --iscsi iqn.2025-12.io.vcrs:secret       # or --all: every target vc-rs serves
 
@@ -327,26 +330,41 @@ log back in without you restarting it — and `vcrs dismount --iscsi <iqn>` plus
 leaves no stray process behind.
 
 ```powershell
+# one command: serve the volume and attach it to the letter you want. Attaching needs
+# administrator rights (`iscsicli` carries a requireAdministrator manifest), so vcrs asks
+# for them itself — one UAC prompt. Without `--letter` Windows picks the next free letter.
+vcrs mount secret.vc -p "correct horse" --letter S     # add --removable / --read-only / --backup
+
+# → a disk "vc-rs VeraCrypt volume" appears on S:. Format it (it starts out RAW, like a
+#   fresh VeraCrypt container):
+Format-Volume -DriveLetter S -FileSystem NTFS -NewFileSystemLabel VCRS -Confirm:$false
+
+# detach again (this takes the disk offline first, then logs the session out)
+vcrs dismount --iscsi iqn.2025-12.io.vcrs:secret       # or --all
+```
+
+If you would rather drive every step yourself, leave `--letter` off: `vcrs mount` then
+only serves the volume and prints the two commands below, and `vcrs attach` does the
+initiator half on its own (from an already elevated prompt it asks for nothing at all):
+
+```powershell
 # terminal 1 (normal rights): serve the volume — it prints the two commands below,
 # with the IQN derived from the file name.
-vcrs mount secret.vc -p "correct horse"                # add --removable / --read-only / --backup
+vcrs mount secret.vc -p "correct horse"
 
 # terminal 2 (elevated): attach it — a static target, then a normal login
 cmd /c 'iscsicli AddTarget iqn.2025-12.io.vcrs:secret vcrs 127.0.0.1 3260 0 0 0 0 0 8 0 0 "" "" 0 0'
 iscsicli QLoginTarget iqn.2025-12.io.vcrs:secret
-# → a disk "vc-rs VeraCrypt volume" appears. Format it (it starts out RAW, like a fresh
-#   VeraCrypt container) and start using the drive letter:
-Format-Volume -DriveLetter S -FileSystem NTFS -NewFileSystemLabel VCRS -Confirm:$false
-
-# detach again (this takes the disk offline first, then logs the session out)
-vcrs dismount --iscsi iqn.2025-12.io.vcrs:secret
+# — or the same thing through vcrs, which also puts the disk on the letter you want:
+vcrs attach --iqn iqn.2025-12.io.vcrs:secret --letter S
 ```
 
 `--backup` opens the volume through the copy of the header at the end of the container
 instead of the one at the front (VeraCrypt's "Use backup header embedded in volume if
-available"), so a container whose primary header is damaged still serves; `vcrs dismount
---all` detaches every target at once, the way VeraCrypt's `/dismount` without a volume
-dismounts all of its volumes.
+available"), so a container whose primary header is damaged still serves; `--letter`
+attaches the just-served volume in the same command (one UAC prompt) instead of leaving
+that to a second elevated terminal; `vcrs dismount --all` detaches every target at once,
+the way VeraCrypt's `/dismount` without a volume dismounts all of its volumes.
 
 Five things to know:
 

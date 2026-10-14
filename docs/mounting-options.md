@@ -139,7 +139,10 @@ request through a named pipe specified with `-f`”，参考实现是仓库里�
 ## 实施状态（更新）
 
 方案 A **已实现并验证，是唯一的挂载后端**，实现在 `crates/vcrs-mount/src/iscsi.rs`
-（CLI：`vcrs mount` / `vcrs dismount --iscsi <iqn>`）。
+（CLI：`vcrs mount` / `vcrs dismount --iscsi <iqn>`）。发起程序那一半（把 target 登录进来、
+并把磁盘放到指定盘符）在 `crates/vcrs-cli/src/attach.rs`：`vcrs mount --letter S` 一条命令
+做完“服务 + 挂载”，`vcrs attach` 单独执行挂载那一半（`iscsicli` 带 requireAdministrator
+清单，所以这一步必须提权，`vcrs mount --letter` 会自己弹一次 UAC）。
 `iscsi-target` 1.0.0 以 `vendor/iscsi-target` 打补丁形式引入（补丁说明见
 `vendor/iscsi-target/PATCHES.md`）：
 

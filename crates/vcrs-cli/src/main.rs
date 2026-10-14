@@ -16,6 +16,10 @@ use vcrs_core::header::{
 use vcrs_core::volume::{CreateOptions, OpenOptions, ProtectedRange, RestoreHeaderOptions, Volume};
 use vcrs_core::{EncryptionAlgorithm, Prf, VolumeLayout, VolumeType};
 
+mod attach;
+mod detach;
+mod serve;
+
 #[derive(Parser)]
 #[command(name = "vcrs", version, about = "VeraCrypt-compatible volume tooling")]
 struct Cli {
@@ -43,8 +47,22 @@ enum Command {
     /// so the initiator's own drivers mount (and can format) the filesystem
     /// inside it. Needs an elevated prompt to log the target in.
     Mount(MountArgs),
-    /// Detach a volume mounted with `vcrs mount` from the iSCSI initiator.
+    /// Detach a volume mounted with `vcrs mount` from the iSCSI initiator: it
+    /// releases the drive letter, takes the disk offline, logs the session out
+    /// and forgets the target. A bare `vcrs dismount` does that for every volume
+    /// vc-rs serves (VeraCrypt's `/dismount` without a volume); `--letter S`,
+    /// `--iscsi <IQN>` and a container path pick one. Needs the same one UAC
+    /// prompt `vcrs mount --letter` asks for, and asks for it itself.
     Dismount(DismountArgs),
+    /// Attach a volume `vcrs mount` is serving to the Microsoft iSCSI Initiator,
+    /// and put it on the drive letter you want. `vcrs mount --letter Y` does
+    /// this for you, in one command; this is the same step on its own.
+    /// Needs an elevated prompt (iscsicli refuses to run without one).
+    Attach(AttachArgs),
+    /// Detach without asking for elevation: what `vcrs dismount` runs as, once it
+    /// has the prompt it needs. Not meant to be typed by hand.
+    #[command(hide = true)]
+    Detach(DetachArgs),
     /// Grow an existing container (VeraCrypt's Volume Expander). The data area
     /// gets bigger and the existing data is kept; the filesystem inside keeps
     /// its old size and has to be extended from the operating system once the
@@ -342,6 +360,22 @@ struct MountArgs {
     /// `/mountoption headerbak`). Useful when the primary header is damaged.
     #[arg(long)]
     backup: bool,
+    /// Put the mounted volume on this drive letter, e.g. `--letter Y`.
+    ///
+    /// The attach needs an elevated prompt, so this asks Windows for one (a
+    /// single UAC prompt) and waits for it; from an already elevated prompt
+    /// there is no prompt at all. Once the letter is there the mount has done
+    /// its job, so the target is handed to a detached copy of this program and
+    /// the prompt comes back — the volume stays mounted until `vcrs dismount`
+    /// (or until the initiator logs out and the idle timeout runs out).
+    /// `--foreground` keeps serving in this terminal instead, which is what
+    /// `vcrs mount` does without `--letter`.
+    #[arg(long, value_name = "LETTER")]
+    letter: Option<char>,
+    /// Serve the volume in this terminal even when `--letter` is given (Ctrl-C
+    /// then stops the target).
+    #[arg(long)]
+    foreground: bool,
     #[command(flatten)]
     kind: VolumeKindArgs,
     #[command(flatten)]
@@ -351,21 +385,68 @@ struct MountArgs {
 }
 
 #[derive(Args)]
-struct DismountArgs {
-    /// IQN of the target started by `vcrs mount` (list the attached ones with
-    /// `iscsicli SessionList 1`).
-    #[arg(
-        long,
-        value_name = "IQN",
-        num_args = 0..=1,
-        default_missing_value = "iqn.2025-12.io.vcrs:volume",
-        conflicts_with = "all"
-    )]
-    iscsi: Option<String>,
-    /// Detach every target vc-rs serves, not just one (VeraCrypt's `/dismount`
-    /// without a volume).
+struct AttachArgs {
+    /// IQN of the target `vcrs mount` is serving (printed by `vcrs mount`).
+    #[arg(long, value_name = "IQN")]
+    iqn: String,
+    /// `host:port` the target listens on.
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:3260")]
+    address: String,
+    /// Drive letter to put the volume on, e.g. `Y` (Windows picks one itself
+    /// when this is not given).
+    #[arg(long, value_name = "LETTER")]
+    letter: Option<char>,
+    /// Size in bytes of the disk the target presents. Used to tell this
+    /// volume's disk apart from another one when several are served at once.
+    #[arg(long, value_name = "BYTES")]
+    disk_size: Option<u64>,
+    /// How long to wait for Windows to show the disk.
+    #[arg(long, value_name = "SECONDS", default_value_t = 30)]
+    wait: u64,
+    /// Write the output to this file as well (used by `vcrs mount --letter`,
+    /// whose elevated child has a console window of its own).
+    #[arg(long, value_name = "FILE")]
+    log: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct DetachArgs {
+    /// Target to detach, by the IQN `vcrs mount` printed.
+    #[arg(long, value_name = "IQN", conflicts_with_all = ["letter", "all"])]
+    iqn: Option<String>,
+    /// The volume Windows has on this drive letter.
+    #[arg(long, value_name = "LETTER", conflicts_with = "all")]
+    letter: Option<char>,
+    /// Detach every target vc-rs serves.
     #[arg(long)]
     all: bool,
+    /// Write the output to this file as well (used by the `vcrs dismount` that
+    /// started this process, which reads the file back).
+    #[arg(long, value_name = "FILE")]
+    log: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct DismountArgs {
+    /// The container `vcrs mount` is serving (`vcrs dismount secret.vc`). The
+    /// target name is derived from the file name exactly as the mount does it,
+    /// so the extension does not matter.
+    #[arg(value_name = "CONTAINER", conflicts_with_all = ["iscsi", "letter", "all"])]
+    path: Option<PathBuf>,
+    /// The volume Windows has on this drive letter (`vcrs dismount --letter S`).
+    #[arg(long, value_name = "LETTER", conflicts_with_all = ["iscsi", "all"])]
+    letter: Option<char>,
+    /// The target by name, exactly as `vcrs mount` printed it.
+    #[arg(long, value_name = "IQN", conflicts_with = "all")]
+    iscsi: Option<String>,
+    /// Every target vc-rs serves — what a bare `vcrs dismount` does, like
+    /// VeraCrypt's `/dismount` without a volume.
+    #[arg(long)]
+    all: bool,
+    /// Write the output to this file as well (used by the elevated child this
+    /// command starts; not meant to be typed by hand).
+    #[arg(long, value_name = "FILE", hide = true)]
+    log: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -1066,24 +1147,174 @@ fn run() -> Result<()> {
             iscsi.protect_hidden = a.protect.hidden_open_options()?;
             if let Some(bind) = &a.bind {
                 iscsi.bind_addr = bind.clone();
+            } else {
+                // Two volumes cannot share a portal, and the default portal is
+                // `127.0.0.1:3260`: without this a second `vcrs mount` would fail
+                // with `os error 10048` although nothing is wrong with it. The
+                // initiator is told the portal in `AddTarget`, so a different port
+                // costs nothing.
+                iscsi.bind_addr = attach::free_bind_addr(&iscsi.bind_addr)?;
             }
             if let Some(name) = &a.target_name {
                 iscsi.target_name = name.clone();
             }
-            vcrs_mount::mount_iscsi(&a.path, &options, &iscsi)?;
+            match a.letter {
+                None => vcrs_mount::mount_iscsi(&a.path, &options, &iscsi)?,
+                Some(letter) => {
+                    // Refuse a letter that cannot work before a target is left
+                    // running behind it.
+                    let letter = attach::check_letter(letter)?;
+                    if !a.foreground {
+                        // With `--letter` the mount is finished by the time this
+                        // command returns, so holding the terminal open for as
+                        // long as the volume stays mounted buys nothing. The
+                        // target moves to a detached copy of this program, which
+                        // `vcrs dismount` stops again.
+                        let mut report = attach::Report::new(None);
+                        let server = serve::spawn(
+                            &iscsi.target_name,
+                            &options.password,
+                            Some(letter),
+                            &iscsi.bind_addr,
+                            &mut report,
+                        )?;
+                        let request = attach::AttachOptions {
+                            iqn: iscsi.target_name.clone(),
+                            address: iscsi.bind_addr.clone(),
+                            letter: Some(letter),
+                            disk_size: serve::disk_size(&server),
+                            wait: attach::DISK_WAIT,
+                            log: None,
+                        };
+                        match attach::attach_with_elevation(&request) {
+                            Ok(()) => {
+                                serve::remember(&server)?;
+                                println!(
+                                    "{letter}: is mounted. `vcrs dismount --letter {letter}` (or \
+                                     `vcrs dismount`) takes it off again."
+                                );
+                                return Ok(());
+                            }
+                            Err(err) => {
+                                // Nothing was attached, so nothing should keep
+                                // serving either.
+                                let _ = serve::stop(&server, &mut report);
+                                return Err(err).context(
+                                    "attaching the volume; nothing is mounted (the background \
+                                     server was stopped again)",
+                                );
+                            }
+                        }
+                    }
+                    // Attaching is what produces the drive letter, and it needs
+                    // elevation (iscsicli), so it happens once the target is up
+                    // and before this process blocks on serving it. A failed
+                    // attach must not kill the mount: the target is running, so
+                    // report it and keep serving.
+                    let hook = |mount: &vcrs_mount::IscsiMount, disk_size: u64| {
+                        let request = attach::AttachOptions {
+                            iqn: mount.target_name().to_string(),
+                            address: mount.addr().to_string(),
+                            letter: Some(letter),
+                            disk_size: Some(disk_size),
+                            wait: attach::DISK_WAIT,
+                            log: None,
+                        };
+                        if let Err(err) = attach::attach_with_elevation(&request) {
+                            println!("\ncould not attach the volume: {err:#}");
+                            println!("the target keeps serving it; attach it by hand with");
+                            println!(
+                                "    vcrs attach --iqn {} --address {} --letter {}",
+                                request.iqn, request.address, letter
+                            );
+                        }
+                    };
+                    vcrs_mount::mount_iscsi_with(&a.path, &options, &iscsi, Some(&hook))?;
+                }
+            }
             println!("iSCSI target stopped");
             Ok(())
         }
-        Command::Dismount(a) => {
-            if a.all {
-                return dismount_all();
+        Command::Attach(a) => {
+            // The elevated half of a mount has to run to the end; a console control
+            // event (a Ctrl-C in some arrangements, or a closing console) killed it
+            // with STATUS_CONTROL_C_EXIT in the middle of the work.
+            attach::ignore_console_control_events();
+            if !attach::is_detached_worker() {
+                return attach::wait_for_detached_worker();
             }
-            let iqn = a.iscsi.as_deref().context(
-                "`vcrs dismount` detaches an iSCSI target: pass `--iscsi <IQN>` \
-                 (the target name printed by `vcrs mount`; `iscsicli SessionList 1` lists them) \
-                 or `--all` for every target vc-rs serves",
-            )?;
-            iscsi_logout(iqn)?;
+            let log = a.log.clone();
+            let request = attach::AttachOptions {
+                iqn: a.iqn,
+                address: a.address,
+                letter: a.letter,
+                disk_size: a.disk_size,
+                wait: std::time::Duration::from_secs(a.wait),
+                log: a.log,
+            };
+            if let Err(err) = attach::attach(&request) {
+                // The elevated child gets a console of its own, so the process
+                // that asked for it reads this file back: a failure has to be
+                // in it, or all the parent sees is a bare exit code.
+                if let Some(path) = &log {
+                    use std::io::Write as _;
+                    if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+                        let _ = writeln!(file, "vcrs: error: {err:#}");
+                    }
+                }
+                return Err(err);
+            }
+            Ok(())
+        }
+        Command::Dismount(a) => {
+            let target = match (&a.path, a.letter, &a.iscsi, a.all) {
+                (Some(path), _, _, _) => {
+                    // The same derivation `vcrs mount` uses for the target name:
+                    // the file stem, so `secret.vc` and `secret.hc` are one name.
+                    if path.file_stem().and_then(|stem| stem.to_str()).is_none() {
+                        bail!(
+                            "cannot tell which target {} is: pass a container path, \
+                             `--letter <LETTER>` or `--iscsi <IQN>`",
+                            path.display()
+                        );
+                    }
+                    detach::Target::Iqn(vcrs_mount::IscsiMountOptions::for_volume(path).target_name)
+                }
+                (None, Some(letter), _, _) => detach::Target::Letter(letter),
+                (None, None, Some(iqn), _) => detach::Target::Iqn(iqn.clone()),
+                // A bare `vcrs dismount` detaches everything vc-rs serves, the
+                // way VeraCrypt's `/dismount` without a volume dismounts all.
+                (None, None, None, _) => detach::Target::All,
+            };
+            let options = detach::DetachOptions { target, log: a.log };
+            detach::detach_with_elevation(&options)?;
+            Ok(())
+        }
+        Command::Detach(a) => {
+            attach::ignore_console_control_events();
+            if !attach::is_detached_worker() {
+                return attach::wait_for_detached_worker();
+            }
+            let log = a.log.clone();
+            let target = match (&a.iqn, a.letter, a.all) {
+                (Some(iqn), _, _) => detach::Target::Iqn(iqn.clone()),
+                (None, Some(letter), _) => detach::Target::Letter(letter),
+                (None, None, _) => detach::Target::All,
+            };
+            let options = detach::DetachOptions { target, log: a.log };
+            let mut report = attach::Report::new(log.as_deref());
+            if let Err(err) = detach::detach(&options, &mut report) {
+                // The elevated child gets a console of its own, so the process
+                // that asked for it reads this file back: a failure has to be
+                // in it, or all the parent sees is a bare exit code.
+                if let Some(path) = &log {
+                    use std::io::Write as _;
+                    if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+                        let _ = writeln!(file, "vcrs: error: {err:#}");
+                    }
+                }
+                return Err(err);
+            }
             Ok(())
         }
     }
@@ -1097,7 +1328,7 @@ const KEYFILE_SIZE: usize = 128;
 
 /// The IQN prefix `vcrs mount` uses for the targets it serves.
 #[cfg(any(windows, test))]
-const VCRS_IQN_PREFIX: &str = "iqn.2025-12.io.vcrs:";
+const VCRS_IQN_PREFIX: &str = detach::VCRS_IQN_PREFIX;
 
 /// Prints what an in-place transformation of a partition is about to do (and,
 /// without `--yes`, is all that happens).
@@ -1673,150 +1904,6 @@ fn self_test() -> Result<()> {
     Ok(())
 }
 
-/// Detach every iSCSI target vc-rs serves: VeraCrypt's `/dismount` without a
-/// volume unmounts all of its volumes, and this is the same idea for the
-/// targets one or more `vcrs mount` processes are serving.
-#[cfg(windows)]
-fn dismount_all() -> Result<()> {
-    let output = std::process::Command::new("iscsicli")
-        .args(["SessionList", "1"])
-        .output();
-    let targets: Vec<String> = match output {
-        Ok(output) if output.status.success() => {
-            let text = String::from_utf8_lossy(&output.stdout);
-            parse_sessions(&text)
-                .into_iter()
-                .filter(|s| s.target.starts_with(VCRS_IQN_PREFIX))
-                .map(|s| s.target)
-                .collect()
-        }
-        Ok(output) => {
-            println!(
-                "  iscsicli SessionList failed: {} (it needs an elevated prompt)",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-            Vec::new()
-        }
-        Err(err) => {
-            println!("  iscsicli SessionList could not run: {err} (it needs an elevated prompt)");
-            Vec::new()
-        }
-    };
-    if targets.is_empty() {
-        println!("no vc-rs volume is attached");
-        return Ok(());
-    }
-    for target in targets {
-        iscsi_logout(&target)?;
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn dismount_all() -> Result<()> {
-    bail!("detaching every target needs the Microsoft iSCSI Initiator (Windows only)");
-}
-
-/// The initiator identifies a login by its *session id*, not by the target name,
-/// so the session list has to be parsed: `LogoutTarget` only accepts a session
-/// id and `QLogoutTarget` does not exist.  A session whose disk Windows is still
-/// using cannot be logged out at all ("the session cannot be logged out since a
-/// device on that session is currently being used"), so the drive letters are
-/// removed and the disk taken offline first.
-fn iscsi_logout(iqn: &str) -> Result<()> {
-    println!("detaching the iSCSI target {iqn}");
-    #[cfg(windows)]
-    {
-        // 1. release the volume: drop drive letters, then take the disk offline.
-        let release = "Get-Disk | Where-Object { $_.FriendlyName -like '*VeraCrypt volume*' } | ForEach-Object { \
-             Get-Partition -DiskNumber $_.Number -ErrorAction SilentlyContinue | \
-             Where-Object { $_.DriveLetter } | ForEach-Object { \
-                 Remove-PartitionAccessPath -DiskNumber $_.DiskNumber -PartitionNumber $_.PartitionNumber \
-                     -AccessPath ($_.DriveLetter + ':\') -ErrorAction SilentlyContinue }; \
-             Set-Disk -Number $_.Number -IsOffline $true -ErrorAction SilentlyContinue }";
-        run_tool(
-            "releasing the disk",
-            "powershell",
-            &["-NoProfile", "-Command", release],
-        );
-
-        // 2. log the session out, then 3. forget the static target.
-        match std::process::Command::new("iscsicli")
-            .arg("SessionList")
-            .arg("1")
-            .output()
-        {
-            Ok(out) => {
-                let text = String::from_utf8_lossy(&out.stdout);
-                match session_id_for_target(&text, iqn) {
-                    Some(id) => {
-                        run_tool("LogoutTarget", "iscsicli", &["LogoutTarget", id.as_str()])
-                    }
-                    None => println!("  no session for {iqn} (already logged out?)"),
-                }
-            }
-            Err(err) => {
-                println!("  iscsicli SessionList: {err}");
-                println!("  (the Microsoft iSCSI Initiator needs an elevated prompt)");
-            }
-        }
-        run_tool("RemoveTarget", "iscsicli", &["RemoveTarget", iqn]);
-
-        // The initiator refuses to log out a session whose disk Windows is still
-        // holding ("the session cannot be logged out since a device on that
-        // session is currently being used"), and it keeps the disk until the
-        // session actually goes away -- which happens when the serving process
-        // stops. Say so instead of leaving a disk behind silently.
-        let stale = "Get-Disk | Where-Object { $_.FriendlyName -like '*VeraCrypt volume*' } | \
-             ForEach-Object { '{0} ({1} bytes)' -f $_.Number, $_.Size }";
-        if let Ok(out) = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", stale])
-            .output()
-        {
-            let text = String::from_utf8_lossy(&out.stdout);
-            let text = text.trim();
-            if !text.is_empty() {
-                println!("  Windows still lists disk {text} because the session is still alive:");
-                println!("  stop the `vcrs mount` process (Ctrl-C) -- the disk goes away with it");
-            }
-        }
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = iqn;
-        bail!("the iSCSI initiator is only available on Windows")
-    }
-}
-
-/// Run a helper program and report the outcome without failing the run.
-#[cfg(windows)]
-fn run_tool(what: &str, program: &str, args: &[&str]) {
-    match std::process::Command::new(program).args(args).status() {
-        Ok(status) if status.success() => println!("  {what}: ok"),
-        Ok(status) => println!("  {what}: exited with {status}"),
-        Err(err) => println!("  {what}: {err}"),
-    }
-}
-
-/// Pick the session id that belongs to `iqn` out of `iscsicli SessionList 1`.
-#[cfg(any(windows, test))]
-fn session_id_for_target(list: &str, iqn: &str) -> Option<String> {
-    let mut current: Option<String> = None;
-    for line in list.lines() {
-        if let Some((key, value)) = line.split_once(':') {
-            let key = key.trim();
-            let value = value.trim();
-            if key.eq_ignore_ascii_case("Session Id") && !value.is_empty() {
-                current = Some(value.to_string());
-            } else if key.eq_ignore_ascii_case("Target Name") && value == iqn {
-                return current;
-            }
-        }
-    }
-    None
-}
-
 fn open_ro(path: &Path, creds: &PasswordArgs, volume_type: Option<VolumeType>) -> Result<Volume> {
     Volume::open(path, &creds.open_options(volume_type, false)?).map_err(Into::into)
 }
@@ -2183,8 +2270,8 @@ fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_master_key, human_size, parse_sector_size, parse_sessions, session_id_for_target,
-        Cli, Command, IscsiSession,
+        format_master_key, human_size, parse_sector_size, parse_sessions, Cli, Command,
+        IscsiSession,
     };
     use clap::Parser;
 
@@ -2209,13 +2296,37 @@ mod tests {
 
     #[test]
     fn dismount_takes_one_iqn_or_all_of_them() {
-        // `/dismount <letter>` vs `/dismount` in VeraCrypt.
+        // `/dismount <letter>` vs `/dismount` in VeraCrypt, plus the container
+        // path `vcrs mount` was started with.
         let cmd = Cli::parse_from(["vcrs", "dismount", "--iscsi", "iqn.x:y"]);
         let Command::Dismount(args) = cmd.command else {
             panic!("expected the dismount subcommand")
         };
         assert_eq!(args.iscsi.as_deref(), Some("iqn.x:y"));
+        assert!(args.path.is_none() && args.letter.is_none());
         assert!(!args.all);
+
+        let cmd = Cli::parse_from(["vcrs", "dismount", "--letter", "Y"]);
+        let Command::Dismount(args) = cmd.command else {
+            panic!("expected the dismount subcommand")
+        };
+        assert_eq!(args.letter, Some('Y'));
+
+        let cmd = Cli::parse_from(["vcrs", "dismount", "secret.vc"]);
+        let Command::Dismount(args) = cmd.command else {
+            panic!("expected the dismount subcommand")
+        };
+        assert_eq!(
+            args.path.as_deref(),
+            Some(std::path::Path::new("secret.vc"))
+        );
+
+        // a bare `vcrs dismount` is the `--all` case
+        let cmd = Cli::parse_from(["vcrs", "dismount"]);
+        let Command::Dismount(args) = cmd.command else {
+            panic!("expected the dismount subcommand")
+        };
+        assert!(!args.all && args.iscsi.is_none() && args.path.is_none() && args.letter.is_none());
 
         let cmd = Cli::parse_from(["vcrs", "dismount", "--all"]);
         let Command::Dismount(args) = cmd.command else {
@@ -2224,15 +2335,13 @@ mod tests {
         assert!(args.all);
         assert!(args.iscsi.is_none());
 
-        // bare `--iscsi` still means the default IQN
-        let cmd = Cli::parse_from(["vcrs", "dismount", "--iscsi"]);
-        let Command::Dismount(args) = cmd.command else {
-            panic!("expected the dismount subcommand")
-        };
-        assert_eq!(args.iscsi.as_deref(), Some("iqn.2025-12.io.vcrs:volume"));
-
-        // the two ways of naming targets cannot be combined
+        // the ways of naming targets cannot be combined
         assert!(Cli::try_parse_from(["vcrs", "dismount", "--all", "--iscsi", "iqn.x:y"]).is_err());
+        assert!(Cli::try_parse_from(["vcrs", "dismount", "--letter", "Y", "--all"]).is_err());
+        assert!(Cli::try_parse_from(["vcrs", "dismount", "secret.vc", "--letter", "Y"]).is_err());
+        assert!(
+            Cli::try_parse_from(["vcrs", "dismount", "secret.vc", "--iscsi", "iqn.x:y"]).is_err()
+        );
     }
 
     #[test]
@@ -2267,24 +2376,6 @@ mod tests {
         );
         assert!(parse_sessions("").is_empty());
         assert!(parse_sessions("Total of 0 sessions\n").is_empty());
-    }
-
-    #[test]
-    fn finds_the_session_id_for_a_target() {
-        // Trimmed-down `iscsicli SessionList 1` output from a real run.
-        let list = "Microsoft iSCSI Initiator Version 10.0 Build 26300\n\
-                    Total of 1 sessions\n\
-                    Session Id             : ffffe68332afe010-4000013700000006\n\
-                    Initiator Node Name    : iqn.1991-05.com.microsoft:desktop-985akhr\n\
-                    Target Node Name       : (null)\n\
-                    Target Name            : iqn.2025-12.io.vcrs:probe\n\
-                    ISID                   : 40 00 01 37 00 00\n";
-        assert_eq!(
-            session_id_for_target(list, "iqn.2025-12.io.vcrs:probe").as_deref(),
-            Some("ffffe68332afe010-4000013700000006")
-        );
-        assert_eq!(session_id_for_target(list, "iqn.other:target"), None);
-        assert_eq!(session_id_for_target("", "iqn.2025-12.io.vcrs:probe"), None);
     }
 
     #[test]

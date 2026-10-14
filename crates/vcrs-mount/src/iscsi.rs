@@ -796,8 +796,29 @@ fn install_ctrl_handler() {}
 /// elevated prompt (the Microsoft initiator requires administrator rights, just
 /// like mounting with VeraCrypt does).
 pub fn mount_iscsi(volume_path: &Path, open: &OpenOptions, opts: &IscsiMountOptions) -> Result<()> {
+    mount_iscsi_with(volume_path, open, opts, None)
+}
+
+/// Serve `volume_path` over iSCSI, calling `on_ready` once the target is
+/// listening and before blocking on it.
+///
+/// The callback is what lets a front-end attach the volume itself
+/// (`vcrs mount --letter Y`) instead of printing the two `iscsicli` commands and
+/// leaving the user to run them in an elevated prompt: it receives the running
+/// [`IscsiMount`] and the size of the disk it presents, and is called on the
+/// serving thread before [`IscsiMount::wait`]. When it is present the manual
+/// instructions are not printed.  It cannot fail the mount: the target is up by
+/// then, so a front-end that cannot attach the volume reports that itself and
+/// leaves the process serving.
+pub fn mount_iscsi_with(
+    volume_path: &Path,
+    open: &OpenOptions,
+    opts: &IscsiMountOptions,
+    on_ready: Option<&dyn Fn(&IscsiMount, u64)>,
+) -> Result<()> {
     install_ctrl_handler();
     let device = ScsiVolume::open(volume_path, open, opts)?;
+    let disk_size = device.disk_size();
     println!(
         "serving {} ({} bytes of data area, {} byte sectors, {}) as a {} byte disk",
         volume_path.display(),
@@ -816,31 +837,39 @@ pub fn mount_iscsi(volume_path: &Path, open: &OpenOptions, opts: &IscsiMountOpti
     let mount = IscsiMount::start(device, opts)?;
     println!("iSCSI target ready: {} on {}", mount.target_name(), mount.addr());
     println!();
-    println!("attach it from an ELEVATED prompt (the Microsoft iSCSI Initiator needs admin):");
-    println!(
-        "    iscsicli AddTarget {} vcrs {} {} 0 0 0 0 0 8 0 0 \"\" \"\" 0 0",
-        mount.target_name(),
-        portal_host(&mount.addr()),
-        portal_port(&mount.addr()),
-    );
-    println!("    iscsicli QLoginTarget {}", mount.target_name());
-    println!();
-    println!("(a *static* target is registered because the target crate cannot complete the");
-    println!(" initiator's multi-PDU login during a portal *scan*; the two empty strings are");
-    println!(" the CHAP user/password and the trailing 0 means 'no authentication')");
-    println!("(both commands must reach iscsicli with those two arguments still empty, which is");
-    println!(" why the `cmd /c` hop with literal \"\" is used in scripts/vc-iscsi-e2e.ps1)");
-    println!();
-    println!("Windows then shows the volume as a partitioned disk: the data area appears as a");
-    println!("single partition (the container itself keeps its VeraCrypt layout).");
-    println!("detach it again with:");
-    println!("    iscsicli QLogoutTarget {}", mount.target_name());
-    println!("    iscsicli LogoutTarget <SessionId>      (see: iscsicli SessionList 1)");
-    println!("    iscsicli RemoveTarget {}", mount.target_name());
-    println!(
-        "    (or: vcrs dismount --iscsi {} -- it also takes the disk offline first,"
-    , mount.target_name());
-    println!("     because Windows refuses to log out a session whose disk is still in use)");
+    match on_ready {
+        Some(on_ready) => on_ready(&mount, disk_size),
+        None => {
+            println!(
+                "attach it from an ELEVATED prompt (the Microsoft iSCSI Initiator needs admin):"
+            );
+            println!(
+                "    iscsicli AddTarget {} vcrs {} {} 0 0 0 0 0 8 0 0 \"\" \"\" 0 0",
+                mount.target_name(),
+                portal_host(&mount.addr()),
+                portal_port(&mount.addr()),
+            );
+            println!("    iscsicli QLoginTarget {}", mount.target_name());
+            println!();
+            println!("(a *static* target is registered because the target crate cannot complete the");
+            println!(" initiator's multi-PDU login during a portal *scan*; the two empty strings are");
+            println!(" the CHAP user/password and the trailing 0 means 'no authentication')");
+            println!("(both commands must reach iscsicli with those two arguments still empty, which is");
+            println!(" why the `cmd /c` hop with literal \"\" is used in scripts/vc-iscsi-e2e.ps1)");
+            println!();
+            println!("Windows then shows the volume as a partitioned disk: the data area appears as a");
+            println!("single partition (the container itself keeps its VeraCrypt layout).");
+            println!("detach it again with:");
+            println!("    iscsicli QLogoutTarget {}", mount.target_name());
+            println!("    iscsicli LogoutTarget <SessionId>      (see: iscsicli SessionList 1)");
+            println!("    iscsicli RemoveTarget {}", mount.target_name());
+            println!(
+                "    (or: vcrs dismount --iscsi {} -- it also takes the disk offline first,",
+                mount.target_name()
+            );
+            println!("     because Windows refuses to log out a session whose disk is still in use)");
+        }
+    }
     println!();
     if opts.idle_timeout.is_zero() {
         println!("this process keeps serving the volume until you press Ctrl-C.");
