@@ -79,7 +79,15 @@ fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
 #[test]
 fn a_plain_image_becomes_a_normal_volume() {
     let (path, image) = plain_image("vcrs-inplace-plain.hc", 1);
-    let volume = encrypt_in_place(&path, PASSWORD, PIM, EncryptionAlgorithm::Aes, Prf::Sha512).unwrap();
+    let volume = encrypt_in_place(
+        &path,
+        PASSWORD,
+        PIM,
+        EncryptionAlgorithm::Aes,
+        Prf::Sha512,
+        None,
+    )
+    .unwrap();
 
     assert!(volume.in_place().is_none(), "the run has to finish");
     assert_eq!(volume.data_offset, HEADER_GROUP);
@@ -104,7 +112,10 @@ fn a_plain_image_becomes_a_normal_volume() {
     assert_eq!(on_disk.len() as u64, FILE_SIZE);
     // The header body is encrypted, so the "VERA" magic is not visible in the
     // file -- only the 64-byte salt in front of it is plaintext.
-    assert!(on_disk[..64].iter().any(|b| *b != 0), "the header salt has to be random");
+    assert!(
+        on_disk[..64].iter().any(|b| *b != 0),
+        "the header salt has to be random"
+    );
     assert_ne!(
         &on_disk[HEADER_GROUP as usize..HEADER_GROUP as usize + 512],
         &image[..512],
@@ -139,6 +150,7 @@ fn an_interrupted_run_resumes_where_it_stopped() {
         EncryptionAlgorithm::Aes,
         Prf::Sha512,
         Some(DATA_SIZE / 4),
+        None,
     )
     .unwrap();
     let state = partial.in_place().expect("the run has to be unfinished");
@@ -160,11 +172,23 @@ fn an_interrupted_run_resumes_where_it_stopped() {
 
     // Only the backup header is valid while the run is unfinished, and that is
     // exactly where the resume starts from.
-    let finished = encrypt_in_place(&path, PASSWORD, PIM, EncryptionAlgorithm::Aes, Prf::Sha512).unwrap();
+    let finished = encrypt_in_place(
+        &path,
+        PASSWORD,
+        PIM,
+        EncryptionAlgorithm::Aes,
+        Prf::Sha512,
+        None,
+    )
+    .unwrap();
     assert!(finished.in_place().is_none());
     let mut read = vec![0u8; DATA_SIZE as usize];
     finished.read_data(0, &mut read).unwrap();
-    assert_eq!(read, image[..DATA_SIZE as usize], "the resume must not have damaged anything");
+    assert_eq!(
+        read,
+        image[..DATA_SIZE as usize],
+        "the resume must not have damaged anything"
+    );
     assert_eq!(finished.header.volume_data_size, DATA_SIZE);
     assert_eq!(finished.header.encrypted_area_length, DATA_SIZE);
 
@@ -174,7 +198,8 @@ fn an_interrupted_run_resumes_where_it_stopped() {
 #[test]
 fn a_plain_image_is_not_decrypted() {
     let (path, image) = plain_image("vcrs-inplace-not.hc", 6);
-    let err = decrypt_in_place(&path, PASSWORD, PIM).expect_err("there is nothing to decrypt");
+    let err =
+        decrypt_in_place(&path, PASSWORD, PIM, None).expect_err("there is nothing to decrypt");
     assert!(
         err.to_string().contains("not a VeraCrypt volume"),
         "unexpected error: {err}"
@@ -186,9 +211,17 @@ fn a_plain_image_is_not_decrypted() {
 #[test]
 fn a_container_survives_a_decryption_round_trip() {
     let (path, image) = plain_image("vcrs-inplace-roundtrip.hc", 7);
-    encrypt_in_place(&path, PASSWORD, PIM, EncryptionAlgorithm::Aes, Prf::Sha512).unwrap();
+    encrypt_in_place(
+        &path,
+        PASSWORD,
+        PIM,
+        EncryptionAlgorithm::Aes,
+        Prf::Sha512,
+        None,
+    )
+    .unwrap();
 
-    let outcome = decrypt_in_place(&path, PASSWORD, PIM).unwrap();
+    let outcome = decrypt_in_place(&path, PASSWORD, PIM, None).unwrap();
     assert!(outcome.finished);
     assert_eq!(outcome.decrypted, DATA_SIZE);
     assert_eq!(outcome.data_size, DATA_SIZE);
@@ -215,11 +248,20 @@ fn a_container_survives_a_decryption_round_trip() {
 #[test]
 fn an_interrupted_decryption_resumes() {
     let (path, image) = plain_image("vcrs-inplace-dec-resume.hc", 8);
-    encrypt_in_place(&path, PASSWORD, PIM, EncryptionAlgorithm::Aes, Prf::Sha512).unwrap();
+    encrypt_in_place(
+        &path,
+        PASSWORD,
+        PIM,
+        EncryptionAlgorithm::Aes,
+        Prf::Sha512,
+        None,
+    )
+    .unwrap();
 
     // A quarter of the data area, decrypted from the bottom up.
     let partial =
-        decrypt_in_place_stopping_after(&path, PASSWORD, PIM, false, Some(DATA_SIZE / 4)).unwrap();
+        decrypt_in_place_stopping_after(&path, PASSWORD, PIM, false, Some(DATA_SIZE / 4), None)
+            .unwrap();
     assert!(!partial.finished);
     assert_eq!(partial.decrypted, DATA_SIZE / 4);
     assert_eq!(partial.data_size, DATA_SIZE);
@@ -235,24 +277,34 @@ fn an_interrupted_decryption_resumes() {
         },
     )
     .unwrap();
-    assert_eq!(state.header.encrypted_area_start, HEADER_GROUP + DATA_SIZE / 4);
-    assert_eq!(state.header.encrypted_area_length, DATA_SIZE - DATA_SIZE / 4);
+    assert_eq!(
+        state.header.encrypted_area_start,
+        HEADER_GROUP + DATA_SIZE / 4
+    );
+    assert_eq!(
+        state.header.encrypted_area_length,
+        DATA_SIZE - DATA_SIZE / 4
+    );
 
     // The bottom quarter of the image is back where it was ...
     let on_disk = std::fs::read(&path).unwrap();
-    assert_eq!(&on_disk[..(DATA_SIZE / 4) as usize], &image[..(DATA_SIZE / 4) as usize]);
+    assert_eq!(
+        &on_disk[..(DATA_SIZE / 4) as usize],
+        &image[..(DATA_SIZE / 4) as usize]
+    );
 
     // ... and a fresh (non-resumed) run is refused, because a half decrypted and a
     // half encrypted container look the same in the header: the caller has to say
     // which direction to continue in, exactly like VeraCrypt's switch does.
-    let err = decrypt_in_place(&path, PASSWORD, PIM)
+    let err = decrypt_in_place(&path, PASSWORD, PIM, None)
         .expect_err("only an explicit resume may continue a partial transformation");
     assert!(
-        err.to_string().contains("unfinished in-place transformation"),
+        err.to_string()
+            .contains("unfinished in-place transformation"),
         "unexpected error: {err}"
     );
 
-    let finished = decrypt_in_place_stopping_after(&path, PASSWORD, PIM, true, None).unwrap();
+    let finished = decrypt_in_place_stopping_after(&path, PASSWORD, PIM, true, None, None).unwrap();
     assert!(finished.finished);
     assert_eq!(finished.decrypted, DATA_SIZE - DATA_SIZE / 4);
     let restored = std::fs::read(&path).unwrap();
@@ -271,11 +323,19 @@ fn a_non_empty_tail_is_refused() {
     let image = pattern(FILE_SIZE as usize, 3);
     std::fs::write(&path, &image).unwrap();
 
-    let err = encrypt_in_place(&path, PASSWORD, PIM, EncryptionAlgorithm::Aes, Prf::Sha512)
-        .expect_err("a non-empty tail must not be silently overwritten");
+    let err = encrypt_in_place(
+        &path,
+        PASSWORD,
+        PIM,
+        EncryptionAlgorithm::Aes,
+        Prf::Sha512,
+        None,
+    )
+    .expect_err("a non-empty tail must not be silently overwritten");
     let message = err.to_string();
     assert!(
-        message.contains("not a header this password opens") && message.contains("zero those bytes"),
+        message.contains("not a header this password opens")
+            && message.contains("zero those bytes"),
         "unexpected error: {message}"
     );
     // Nothing was written.

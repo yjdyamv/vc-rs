@@ -1054,7 +1054,16 @@ fn run() -> Result<()> {
                 .with_context(|| format!("reading {}", a.path.display()))?
                 .len();
             let started = std::time::Instant::now();
-            let volume = vcrs_core::encrypt_in_place(&a.path, &password, a.password.pim, ea, prf)?;
+            let mut reporter = watch_progress();
+            let watch = vcrs_core::Watch::new(&mut reporter);
+            let volume = vcrs_core::encrypt_in_place(
+                &a.path,
+                &password,
+                a.password.pim,
+                ea,
+                prf,
+                Some(watch),
+            )?;
             let elapsed = started.elapsed();
             match volume.in_place() {
                 Some(state) => {
@@ -1092,12 +1101,15 @@ fn run() -> Result<()> {
             let options = a.password.open_options(None, false)?;
             let password = options.effective_password(Some(&a.path))?;
             let started = std::time::Instant::now();
+            let mut reporter = watch_progress();
+            let watch = vcrs_core::Watch::new(&mut reporter);
             let outcome = vcrs_core::decrypt_in_place_stopping_after(
                 &a.path,
                 &password,
                 a.password.pim,
                 a.resume,
                 None,
+                Some(watch),
             )?;
             let elapsed = started.elapsed();
             if outcome.finished {
@@ -1479,6 +1491,26 @@ fn describe_device(device: &vcrs_core::Device, action: &str) -> Result<()> {
 
 /// `vcrs encrypt-in-place <partition>`: VeraCrypt's non-system in-place
 /// encryption, driven against a real partition instead of a container file.
+/// A watcher for a long in-place run: a line every five percent, on stderr so a
+/// pipeline's stdout stays what the command meant to say.
+fn watch_progress() -> impl FnMut(u64, u64) {
+    let mut said = 0u64;
+    let started = std::time::Instant::now();
+    move |done: u64, total: u64| {
+        if total == 0 {
+            return;
+        }
+        let percent = done.saturating_mul(100) / total;
+        if percent >= said + 5 || done == total {
+            said = percent;
+            eprintln!(
+                "  {done} of {total} bytes ({percent}%), {:.0}s",
+                started.elapsed().as_secs_f64()
+            );
+        }
+    }
+}
+
 fn encrypt_device(a: &EncryptInPlaceArgs, ea: EncryptionAlgorithm, prf: Prf) -> Result<()> {
     let device = vcrs_core::Device::open(&a.path, true).with_context(|| {
         format!(
@@ -1513,7 +1545,9 @@ fn encrypt_device(a: &EncryptInPlaceArgs, ea: EncryptionAlgorithm, prf: Prf) -> 
         info.data_area_size()
     );
     let started = std::time::Instant::now();
-    let outcome = vcrs_core::encrypt_device_in_place(&device, &options, None)?;
+    let mut reporter = watch_progress();
+    let watch = vcrs_core::Watch::new(&mut reporter);
+    let outcome = vcrs_core::encrypt_device_in_place(&device, &options, None, Some(watch))?;
     let elapsed = started.elapsed();
     if outcome.finished {
         println!(
@@ -1571,7 +1605,10 @@ fn decrypt_device(a: &DecryptInPlaceArgs) -> Result<()> {
         random_source: None,
     };
     let started = std::time::Instant::now();
-    let outcome = vcrs_core::decrypt_device_in_place(&device, &options, a.resume, None)?;
+    let mut reporter = watch_progress();
+    let watch = vcrs_core::Watch::new(&mut reporter);
+    let outcome =
+        vcrs_core::decrypt_device_in_place(&device, &options, a.resume, None, Some(watch))?;
     let elapsed = started.elapsed();
     if outcome.finished {
         println!(

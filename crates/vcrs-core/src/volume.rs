@@ -64,6 +64,36 @@ pub struct InPlaceState {
     pub remaining: u64,
 }
 
+/// A watcher for a long in-place run.
+///
+/// An in-place transformation takes minutes to hours (a 500 GB volume is hours),
+/// so a caller that wants to show a percentage builds one of these around a
+/// closure and is called back after every [`IN_PLACE_CHUNK_SIZE`] chunk. Everyone
+/// else passes `None`.
+pub struct Watch<'a> {
+    callback: &'a mut dyn FnMut(u64, u64),
+}
+
+impl<'a> Watch<'a> {
+    /// Watch a run through this callback, which is told the bytes done and the
+    /// total once per chunk.
+    pub fn new(callback: &'a mut dyn FnMut(u64, u64)) -> Self {
+        Self { callback }
+    }
+
+    /// Tell the watcher how far the run has come.
+    pub fn report(&mut self, done: u64, total: u64) {
+        (self.callback)(done, total);
+    }
+}
+
+/// Pass the progress on to the caller's watcher, if it wanted one.
+fn report(progress: Option<&mut Watch<'_>>, done: u64, total: u64) {
+    if let Some(watch) = progress {
+        watch.report(done, total);
+    }
+}
+
 impl InPlaceState {
     /// Size of the whole data area.
     pub fn total(&self) -> u64 {
@@ -1227,6 +1257,7 @@ pub fn encrypt_in_place_stopping_after(
     ea: EncryptionAlgorithm,
     prf: Prf,
     stop_after: Option<u64>,
+    mut progress: Option<Watch<'_>>,
 ) -> Result<Volume> {
     let layout = VolumeLayout::V2Normal;
     let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
@@ -1382,6 +1413,7 @@ pub fn encrypt_in_place_stopping_after(
         since_update += chunk;
         header.encrypted_area_start = data_offset;
         header.encrypted_area_length = encrypted_length;
+        report(progress.as_mut(), encrypted_length, data_size);
 
         if since_update >= IN_PLACE_HEADER_UPDATE_INTERVAL || encrypted_length == data_size {
             // VeraCrypt's FastVolumeHeaderUpdate: same salt and key, new lengths.
@@ -1469,8 +1501,9 @@ pub fn encrypt_in_place(
     pim: i32,
     ea: EncryptionAlgorithm,
     prf: Prf,
+    progress: Option<Watch<'_>>,
 ) -> Result<Volume> {
-    encrypt_in_place_stopping_after(path, password, pim, ea, prf, None)
+    encrypt_in_place_stopping_after(path, password, pim, ea, prf, None, progress)
 }
 
 /// The state of an unfinished in-place encryption, when the header describes one.
@@ -1529,6 +1562,7 @@ pub fn decrypt_in_place_stopping_after(
     pim: i32,
     resume: bool,
     stop_after: Option<u64>,
+    mut progress: Option<Watch<'_>>,
 ) -> Result<DecryptOutcome> {
     let volume = Volume::open(
         path,
@@ -1581,6 +1615,8 @@ pub fn decrypt_in_place_stopping_after(
 
     let mut processed = 0u64;
     let mut since_update = 0u64;
+    // The amount to decrypt does not change, even though `remaining` counts down.
+    let total = remaining;
     while remaining > 0 {
         let mut chunk = std::cmp::min(remaining, IN_PLACE_CHUNK_SIZE);
         if let Some(limit) = stop_after {
@@ -1608,6 +1644,7 @@ pub fn decrypt_in_place_stopping_after(
         since_update += chunk;
         header.encrypted_area_start = start;
         header.encrypted_area_length = remaining;
+        report(progress.as_mut(), processed, total);
 
         if since_update >= IN_PLACE_HEADER_UPDATE_INTERVAL || remaining == 0 {
             // VeraCrypt's FastVolumeHeaderUpdate: same salt and key, new lengths.
@@ -1655,8 +1692,13 @@ pub fn decrypt_in_place_stopping_after(
 }
 
 /// [`decrypt_in_place_stopping_after`] with no early stop and no resume.
-pub fn decrypt_in_place(path: &Path, password: &[u8], pim: i32) -> Result<DecryptOutcome> {
-    decrypt_in_place_stopping_after(path, password, pim, false, None)
+pub fn decrypt_in_place(
+    path: &Path,
+    password: &[u8],
+    pim: i32,
+    progress: Option<Watch<'_>>,
+) -> Result<DecryptOutcome> {
+    decrypt_in_place_stopping_after(path, password, pim, false, None, progress)
 }
 
 /// Options for transforming a *partition* in place, i.e. VeraCrypt's non-system
@@ -1765,6 +1807,7 @@ pub fn encrypt_device_in_place(
     device: &crate::device::Device,
     options: &DeviceInPlaceOptions,
     stop_after: Option<u64>,
+    mut progress: Option<Watch<'_>>,
 ) -> Result<DeviceInPlaceOutcome> {
     let info = device.info().clone();
     if let Some(reason) = info.blocker() {
@@ -1948,6 +1991,7 @@ pub fn encrypt_device_in_place(
             .map_err(|e| device_io_error("writing the device", dest, e))?;
         start = dest;
         done += chunk;
+        report(progress.as_mut(), done, total);
         if done - last_update >= IN_PLACE_HEADER_UPDATE_INTERVAL || done == total {
             // VeraCrypt's FastVolumeHeaderUpdate: the same salt and key, so the
             // run can be resumed from the backup header at any point.
@@ -2024,6 +2068,7 @@ pub fn decrypt_device_in_place(
     options: &DeviceInPlaceOptions,
     resume: bool,
     stop_after: Option<u64>,
+    mut progress: Option<Watch<'_>>,
 ) -> Result<DeviceInPlaceOutcome> {
     let info = device.info().clone();
     validate_sector_size(info.sector_size)?;
@@ -2079,6 +2124,7 @@ pub fn decrypt_device_in_place(
         write_all_at(file, start - VOLUME_HEADER_GROUP_SIZE, &buffer).map_err(Error::Io)?;
         start += chunk;
         done -= chunk;
+        report(progress.as_mut(), total - done, total);
         if last_update - done >= IN_PLACE_HEADER_UPDATE_INTERVAL || done == 0 {
             header.encrypted_area_start = start;
             header.encrypted_area_length = done;

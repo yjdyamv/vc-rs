@@ -483,6 +483,12 @@ done so far). VeraCrypt refuses to mount such a volume (`ERR_NONSYS_INPLACE_ENC_
   the flag stays set — which is exactly how VeraCrypt leaves a finished in-place container,
   and why it mounts like any other volume afterwards.
 
+Long runs say where they are: `encrypt-in-place` and `decrypt-in-place` (the partition
+forms too) print a line every five percent — `  20971520 of 50069504 bytes (41%), 3s` — on
+**stderr**, so a script's stdout stays what the command meant to say. The core passes that
+out through `vcrs_core::Watch` (`Watch::new(&mut |done, total| …)`, then `Some(&mut watch)`
+to the call), which is also what a GUI drives a progress bar with.
+
 `crates/vcrs-core/tests/in_place.rs` covers the full run, the byte-identical resume and the
 refusal to overwrite a non-zero tail (a plain image's last 128 KiB must be free space, and
 vc-rs checks rather than clobbers). `scripts/vc-inplace-test.ps1` (elevated) proves the
