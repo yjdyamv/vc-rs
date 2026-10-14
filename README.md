@@ -71,7 +71,7 @@ iSCSI 发起程序（加 `--letter S` 就在同一条命令里挂到指定盘符
 | Keyfiles (password + keyfile pool, file or directory, repeatable) | ✅ (verified against VeraCrypt both ways, incl. a 102-byte password and directories: `scripts/vc-keyfile-test.ps1` = `ALL OK`) |
 | Keyfile creation (`vcrs create-keyfile`) | ✅ (128 random bytes, or `--random-source <file>` for a reproducible one; refuses to overwrite an existing file without `--force`) |
 | Crypto self-test (`vcrs test`, and *Test Vectors* in the window) | ✅ (the format's CRC-32 against VeraCrypt's own check value, every header hash, all 15 algorithms over XTS, and a header round trip) |
-| List attached volumes (`vcrs list`) | ✅ (session id, initiator and the disk Windows has for it; `--all` shows every iSCSI session. `iscsicli` needs an elevated prompt, so unelevated it lists the disks only) |
+| List attached volumes (`vcrs list`) | ✅ (session id, initiator and the disk Windows has for it; `--all` shows every iSCSI session. `iscsicli` needs an elevated prompt, so unelevated it lists the disks only; `--json` prints the same snapshot as a JSON document for a program, and it also names the background serving processes) |
 | Container expansion (`vcrs expand`): bigger data area, both headers rewritten with fresh salts, master key and data untouched | ✅ (verified: Windows' own tools extend the filesystem into the new space through the iSCSI disk, files survive, VeraCrypt reads the grown container — `scripts/vc-expand-test.ps1` = `ALL OK`) |
 | Hidden-volume protection while writing to the outer volume (`--protect-hidden`) | ✅ (a write that would land in the hidden volume is refused, and every later write too, exactly like VeraCrypt; the hidden volume stays byte-identical) |
 | Volume sector size at creation (`--sector-size 512..4096`) | ✅ (verified: real VeraCrypt mounts a 4096-byte-sector container, Windows formatted NTFS inside it with 4096-byte sectors, and that boot sector is what lands in the container — `scripts/vc-sector-size-test.ps1` = `ALL OK`) |
@@ -207,7 +207,11 @@ vcrs mount both.vc --password outer --protect-hidden --hidden-password inner
 ```
 
 `--password-stdin` (raw bytes) and `$VCRS_PASSWORD` are supported; prefer those over
-`--password` for anything real, since command lines are visible to other processes.
+`--password` for anything real, since command lines are visible to other processes. At a
+terminal with none of them given, `vcrs` asks for the password itself with the echo
+off — and asks twice when it is *setting* a new one (`create`, `--new-password`), so one
+typo cannot lock a volume away. A piped stdin keeps the old immediate refusal, so a
+script that forgot a password fails instead of waiting forever.
 VeraCrypt's own switch names work too, for muscle memory: `--encryption` for `--ea`,
 `--hash` for `--prf`, and `--protection-password` / `--protection-pim` /
 `--protection-keyfile` for `--hidden-password` / `--hidden-pim` / `--hidden-keyfile`.
@@ -367,7 +371,9 @@ instead of the one at the front (VeraCrypt's "Use backup header embedded in volu
 available"), so a container whose primary header is damaged still serves; `--letter`
 attaches the just-served volume in the same command (one UAC prompt) instead of leaving
 that to a second elevated terminal; `vcrs dismount --all` detaches every target at once,
-the way VeraCrypt's `/dismount` without a volume dismounts all of its volumes.
+the way VeraCrypt's `/dismount` without a volume dismounts all of its volumes. A bare
+`vcrs dismount` means the same thing — but it says so before it does it, so nobody loses
+a second volume to a missing argument.
 
 The hidden volume of a container is served under a target name of its own —
 `iqn.2025-12.io.vcrs:<file>-hidden`, so `mount both.vc --hidden` is
@@ -391,6 +397,10 @@ vcrs agent --stop       # let it go now
 `--foreground` is the escape hatch on the serving side: it keeps `vcrs mount` serving in
 the terminal it was started from, instead of handing that half to a detached copy of
 itself (which is what lets `vcrs mount --letter` give your prompt straight back).
+
+The exit code says what happened, on Windows' terms: `0` it worked, `1` it did not, `2`
+the command line was wrong (clap), and `1223` — Windows' `ERROR_CANCELLED` — the
+elevation prompt was declined, so a script can tell the user's "no" from a real failure.
 
 Five things to know:
 

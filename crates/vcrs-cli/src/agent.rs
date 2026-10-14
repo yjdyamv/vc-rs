@@ -31,7 +31,7 @@ use crate::attach;
 const ALLOWED: [&str; 3] = ["attach", "detach", "dismount"];
 
 /// How long the agent waits for a request before it ends itself.
-pub(crate) const DEFAULT_IDLE: Duration = Duration::from_secs(600);
+pub const DEFAULT_IDLE: Duration = Duration::from_secs(600);
 
 /// The pipe the agent listens on: one per user, so two accounts on one machine do
 /// not talk to each other's agent.
@@ -49,7 +49,7 @@ fn pipe_name() -> String {
 /// The environment variable the agent sets in the children it runs, so a child can
 /// tell that an agent is already looking after this machine and must not start
 /// another one (which would then ask the first one to do its work, forever).
-pub(crate) const FROM_AGENT_ENV: &str = "VCRS_FROM_AGENT";
+pub const FROM_AGENT_ENV: &str = "VCRS_FROM_AGENT";
 
 /// Leave an agent behind, unless one is already listening.
 ///
@@ -57,7 +57,7 @@ pub(crate) const FROM_AGENT_ENV: &str = "VCRS_FROM_AGENT";
 /// approved. Starting the agent from there costs no second prompt, and the
 /// commands after it find it ([`try_run`]) and need none at all. Failing to leave
 /// one is not worth an error: the work that was asked for is already done.
-pub(crate) fn start_if_absent() {
+pub fn start_if_absent() {
     if std::env::var_os(FROM_AGENT_ENV).is_some() {
         return;
     }
@@ -75,13 +75,13 @@ pub(crate) fn start_if_absent() {
 /// `None` when no agent is listening, which is the signal to ask for a prompt the
 /// long way. A caller that reached an agent and then lost it gets an error back
 /// instead: silently asking for a prompt could mount the volume twice.
-pub(crate) fn try_run(words: &[String]) -> Option<(i32, String)> {
+pub fn try_run(words: &[String]) -> Option<(i32, String)> {
     let request = format!("run {}", words.join(" "));
     exchange(&request)
 }
 
 /// The pid of the running agent, or `None` when there is none.
-pub(crate) fn status() -> Option<u32> {
+pub fn status() -> Option<u32> {
     let text = exchange("ping")?.1;
     text.split_whitespace()
         .last()
@@ -89,7 +89,7 @@ pub(crate) fn status() -> Option<u32> {
 }
 
 /// Ask the running agent to end itself. `false` when there was none.
-pub(crate) fn stop() -> bool {
+pub fn stop() -> bool {
     matches!(exchange("stop"), Some(_))
 }
 
@@ -121,7 +121,7 @@ fn split_reply(text: &str) -> (i32, String) {
 // ------------------------------------------------------------------- the agent
 
 /// Serve requests until the idle timeout passes, or somebody says `stop`.
-pub(crate) fn serve(idle: Duration) -> Result<()> {
+pub fn serve(idle: Duration) -> Result<()> {
     #[cfg(windows)]
     {
         pipe::serve(&pipe_name(), idle)
@@ -249,7 +249,7 @@ mod pipe {
     }
 
     /// One end of the agent's pipe.
-    pub(super) struct Pipe(winapi::shared::ntdef::HANDLE);
+    pub struct Pipe(winapi::shared::ntdef::HANDLE);
 
     impl Drop for Pipe {
         fn drop(&mut self) {
@@ -363,7 +363,7 @@ mod pipe {
 
     impl Pipe {
         /// Connect to the agent, or `None` when there is none (the pipe is missing).
-        pub(super) fn connect(name: &str) -> Option<Pipe> {
+        pub fn connect(name: &str) -> Option<Pipe> {
             let path = wide(name);
             let handle = unsafe {
                 CreateFileW(
@@ -382,13 +382,13 @@ mod pipe {
             Some(Pipe(handle))
         }
 
-        pub(super) fn write_line(&mut self, line: &str) -> Result<()> {
+        pub fn write_line(&mut self, line: &str) -> Result<()> {
             let text = format!("{line}\n");
             write_all(self.0, text.as_bytes())
         }
 
         /// Read until the agent closes its end, which is how a reply ends.
-        pub(super) fn read_to_end(&mut self) -> Result<String> {
+        pub fn read_to_end(&mut self) -> Result<String> {
             let mut bytes = Vec::new();
             let mut buffer = vec![0u8; 4096];
             loop {
@@ -429,7 +429,7 @@ mod pipe {
     }
 
     /// Listen until the idle timeout passes with no request, or somebody says `stop`.
-    pub(super) fn serve(name: &str, idle: Duration) -> Result<()> {
+    pub fn serve(name: &str, idle: Duration) -> Result<()> {
         let path = wide(name);
         let security = pipe_security()?;
         let pipe = unsafe {

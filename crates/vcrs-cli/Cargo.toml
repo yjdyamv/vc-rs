@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Command line front-end for vcrs (VeraCrypt-compatible volumes in Rust)"
 
+[lib]
+name = "vcrs_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "vcrs"
 path = "src/main.rs"
@@ -16,6 +20,8 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 log.workspace = true
 env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = [

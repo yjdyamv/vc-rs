@@ -22,7 +22,7 @@ use crate::serve::{self, STOP_WAIT};
 use crate::win32;
 
 /// The IQN prefix every target `vcrs mount` serves shares.
-pub(crate) const VCRS_IQN_PREFIX: &str = "iqn.2025-12.io.vcrs:";
+pub const VCRS_IQN_PREFIX: &str = "iqn.2025-12.io.vcrs:";
 
 /// How long to wait for Windows to let go of a disk ("<letter>: is in use").
 const RELEASE_WAIT: Duration = Duration::from_secs(2);

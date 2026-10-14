@@ -44,11 +44,11 @@ const POLL: Duration = Duration::from_millis(200);
 /// seconds (`serve::spawn` passes `--idle-timeout 30` when the user chose none),
 /// and the session is logged out before this is called, so this is only the last
 /// turn of that clock rather than a hopeful guess.
-pub(crate) const STOP_WAIT: Duration = Duration::from_secs(2);
+pub const STOP_WAIT: Duration = Duration::from_secs(2);
 
 /// A serving process this program started, and can find again.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Server {
+pub struct Server {
     pub iqn: String,
     pub pid: u32,
     pub log: PathBuf,
@@ -92,7 +92,7 @@ fn slug(iqn: &str) -> String {
 /// recognisable even if the container is moved later, and two mounted volumes do
 /// not fight over the same port. The password goes in over a pipe rather than on
 /// the command line, so it does not end up in a second process's arguments.
-pub(crate) fn spawn(
+pub fn spawn(
     iqn: &str,
     password: &[u8],
     letter: Option<char>,
@@ -163,7 +163,7 @@ pub(crate) fn spawn(
 }
 
 /// Wait until the detached server's target accepts logins.
-pub(crate) fn wait_until_ready(server: &Server, child: &mut Child) -> Result<()> {
+pub fn wait_until_ready(server: &Server, child: &mut Child) -> Result<()> {
     let deadline = Instant::now() + READY_WAIT;
     loop {
         if read_log(&server.log).contains(READY) {
@@ -189,7 +189,7 @@ pub(crate) fn wait_until_ready(server: &Server, child: &mut Child) -> Result<()>
 /// The size of the disk the target presents, read out of the server's log
 /// (`serving … as a 11272192 byte disk`), so the attach can tell its own disk
 /// from any other vc-rs volume that is already mounted.
-pub(crate) fn disk_size(server: &Server) -> Option<u64> {
+pub fn disk_size(server: &Server) -> Option<u64> {
     let text = read_log(&server.log);
     let at = text.find(" byte disk")?;
     let head = &text[..at];
@@ -206,7 +206,7 @@ pub(crate) fn disk_size(server: &Server) -> Option<u64> {
 
 /// Record a server that is serving a mounted volume, so `vcrs dismount` can stop
 /// it again.
-pub(crate) fn remember(server: &Server) -> Result<()> {
+pub fn remember(server: &Server) -> Result<()> {
     let state = Server::state_path(&server.iqn);
     // The IQN is written out in full: the file name is a slug (the `:` of an IQN
     // cannot be part of a path), so it can only ever be a fallback for state files
@@ -225,12 +225,12 @@ pub(crate) fn remember(server: &Server) -> Result<()> {
 }
 
 /// The server recorded for `iqn`, if it has not been stopped already.
-pub(crate) fn state(iqn: &str) -> Option<Server> {
+pub fn state(iqn: &str) -> Option<Server> {
     read_state(&Server::state_path(iqn))
 }
 
 /// Every server still recorded, newest state files included.
-pub(crate) fn states() -> Vec<Server> {
+pub fn states() -> Vec<Server> {
     let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
         return Vec::new();
     };
@@ -281,7 +281,7 @@ fn read_state(path: &std::path::Path) -> Option<Server> {
 }
 
 /// Forget a server's state file (after it went away, or after it was stopped).
-pub(crate) fn forget(iqn: &str) {
+pub fn forget(iqn: &str) {
     let _ = fs::remove_file(Server::state_path(iqn));
 }
 
@@ -293,7 +293,7 @@ pub(crate) fn forget(iqn: &str) {
 /// `Stop-Process`), which cost a whole PowerShell start — 1.5 to 10 s on this
 /// machine, and a console window before that — for a question the kernel answers
 /// instantly. It returns the same three words the script printed.
-pub(crate) fn wait_and_kill(pid: u32, timeout: Duration) -> &'static str {
+pub fn wait_and_kill(pid: u32, timeout: Duration) -> &'static str {
     #[cfg(windows)]
     unsafe {
         use winapi::um::handleapi::CloseHandle;
@@ -341,7 +341,7 @@ pub(crate) fn wait_and_kill(pid: u32, timeout: Duration) -> &'static str {
     }
 }
 
-pub(crate) fn stop(server: &Server, report: &mut Report) -> bool {
+pub fn stop(server: &Server, report: &mut Report) -> bool {
     // Asking Windows about a process is a kernel question, not a PowerShell one.
     let outcome = wait_and_kill(server.pid, STOP_WAIT).to_string();
     forget(&server.iqn);
@@ -446,7 +446,7 @@ fn child_arguments(
 /// though the volume is mounted. The child's own stdout is the log file, so
 /// nothing here is of any use to it.
 #[cfg(windows)]
-pub(crate) fn disinherit_standard_handles() {
+pub fn disinherit_standard_handles() {
     use winapi::um::handleapi::{SetHandleInformation, INVALID_HANDLE_VALUE};
     use winapi::um::processenv::GetStdHandle;
     use winapi::um::winbase::{STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
@@ -463,7 +463,7 @@ pub(crate) fn disinherit_standard_handles() {
 }
 
 #[cfg(not(windows))]
-pub(crate) fn disinherit_standard_handles() {}
+pub fn disinherit_standard_handles() {}
 
 /// The log, or an empty string while it does not exist yet.
 fn read_log(path: &std::path::Path) -> String {

@@ -11,7 +11,7 @@ use anyhow::Result;
 
 /// How a Windows service is doing, in the words the rest of the CLI prints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ServiceState {
+pub enum ServiceState {
     NotInstalled,
     Stopped,
     StartPending,
@@ -23,7 +23,7 @@ pub(crate) enum ServiceState {
 
 impl ServiceState {
     /// The state as a word, the way `Get-Service` would have said it.
-    pub(crate) fn word(self) -> &'static str {
+    pub fn word(self) -> &'static str {
         match self {
             ServiceState::NotInstalled => "not installed",
             ServiceState::Stopped => "stopped",
@@ -80,7 +80,7 @@ mod platform {
             .collect()
     }
 
-    pub(super) fn service_state(name: &str) -> Result<ServiceState> {
+    pub fn service_state(name: &str) -> Result<ServiceState> {
         unsafe {
             let manager = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
             if manager.is_null() {
@@ -117,7 +117,7 @@ mod platform {
         }
     }
 
-    pub(super) fn file_system(letter: char) -> Option<String> {
+    pub fn file_system(letter: char) -> Option<String> {
         use winapi::um::fileapi::GetVolumeInformationW;
         let root = wide(&format!("{letter}:\\"));
         let mut name = [0u16; 64];
@@ -141,7 +141,7 @@ mod platform {
         Some(String::from_utf16_lossy(&name[..len]))
     }
 
-    pub(super) fn start_service(name: &str) -> Result<()> {
+    pub fn start_service(name: &str) -> Result<()> {
         unsafe {
             let manager = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
             if manager.is_null() {
@@ -177,33 +177,33 @@ mod platform {
     use super::ServiceState;
     use anyhow::{bail, Result};
 
-    pub(super) fn service_state(_name: &str) -> Result<ServiceState> {
+    pub fn service_state(_name: &str) -> Result<ServiceState> {
         bail!("services are a Windows notion; there are none here")
     }
 
-    pub(super) fn file_system(_letter: char) -> Option<String> {
+    pub fn file_system(_letter: char) -> Option<String> {
         None
     }
 
-    pub(super) fn start_service(_name: &str) -> Result<()> {
+    pub fn start_service(_name: &str) -> Result<()> {
         bail!("services are a Windows notion; there are none here")
     }
 }
 
 /// The file system on a drive letter (`NTFS`, `FAT32`), or `None` when the volume has
 /// none — a disk that has just been attached and has not been formatted yet.
-pub(crate) fn file_system(letter: char) -> Option<String> {
+pub fn file_system(letter: char) -> Option<String> {
     platform::file_system(letter)
 }
 
 /// What a service is doing right now (`msiscsi`, for the iSCSI work).
-pub(crate) fn service_state(name: &str) -> Result<ServiceState> {
+pub fn service_state(name: &str) -> Result<ServiceState> {
     platform::service_state(name)
 }
 
 /// Ask the service manager to start a service. A service that is already running is
 /// not an error.
-pub(crate) fn start_service(name: &str) -> Result<()> {
+pub fn start_service(name: &str) -> Result<()> {
     platform::start_service(name)
 }
 
@@ -224,13 +224,13 @@ fn wide_to_string(wide: &[u16]) -> String {
 /// The volume behind a drive letter, and the disk that volume is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg(windows)]
-pub(crate) struct VolumeOnDisk {
+pub struct VolumeOnDisk {
     /// The volume's own name, `\\?\Volume{…}\` — what the mount-point API takes.
-    pub(crate) volume: String,
+    pub volume: String,
     /// The physical disk the volume starts on.
-    pub(crate) disk: u32,
+    pub disk: u32,
     /// The partition number Windows gives that volume.
-    pub(crate) partition: u32,
+    pub partition: u32,
 }
 
 /// The volume a drive letter is a mount point on, and the disk behind it.
@@ -240,7 +240,7 @@ pub(crate) struct VolumeOnDisk {
 /// can be asked which disk extents it covers.  It needs no elevation for a volume the
 /// caller can read.
 #[cfg(windows)]
-pub(crate) fn volume_of_letter(letter: char) -> Result<VolumeOnDisk> {
+pub fn volume_of_letter(letter: char) -> Result<VolumeOnDisk> {
     let letter = letter.to_ascii_uppercase();
     if !letter.is_ascii_alphabetic() {
         anyhow::bail!("{letter} is not a drive letter");
@@ -370,7 +370,7 @@ const DDD_EXACT_MATCH_ON_REMOVE: u32 = 0x0000_0004;
 /// has the volume open has closed it) and `FSCTL_DISMOUNT_VOLUME` do. This is the
 /// sequence VeraCrypt's own unmount runs; without it a dismount leaves the session
 /// logged in, and the next attach has to clear the leftover before it can log in.
-pub(crate) fn dismount_volume(letter: char, wait: std::time::Duration) -> Result<()> {
+pub fn dismount_volume(letter: char, wait: std::time::Duration) -> Result<()> {
     const SLASH: char = '\\';
     let letter = letter.to_ascii_uppercase();
     let path = nul_terminated(&format!("{SLASH}{SLASH}.{SLASH}{letter}:"));
@@ -447,7 +447,7 @@ fn control(handle: winapi::um::winnt::HANDLE, code: u32) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn release_letter(letter: char) -> Result<()> {
+pub fn release_letter(letter: char) -> Result<()> {
     let letter = letter.to_ascii_uppercase();
     if !letter.is_ascii_alphabetic() {
         anyhow::bail!("{letter} is not a drive letter");
@@ -543,7 +543,7 @@ fn open_disk(number: u32, write: bool) -> Result<winapi::um::winnt::HANDLE> {
 /// the disk and its volumes at once. That is what the iSCSI session needs before it can be
 /// logged out — Windows otherwise answers "a device on that session is currently being used"
 /// even after the disk device has been removed from the device tree.
-pub(crate) fn eject_media(number: u32) -> Result<()> {
+pub fn eject_media(number: u32) -> Result<()> {
     let handle = open_disk(number, true)?;
     let result = control(handle, winapi::um::winioctl::IOCTL_STORAGE_EJECT_MEDIA);
     unsafe {
@@ -552,7 +552,7 @@ pub(crate) fn eject_media(number: u32) -> Result<()> {
     result.map_err(|err| err.context(format!("ejecting the medium of disk {number}")))
 }
 
-pub(crate) fn disk_is_offline(number: u32) -> Result<bool> {
+pub fn disk_is_offline(number: u32) -> Result<bool> {
     let handle = open_disk(number, false)?;
     let mut attributes = GetDiskAttributes {
         version: std::mem::size_of::<GetDiskAttributes>() as u32,
@@ -603,7 +603,7 @@ pub(crate) fn disk_is_offline(number: u32) -> Result<bool> {
 /// disk is not in use.  Nothing is done when the disk already has the wanted state, so
 /// this is safe to call on a disk Windows has handled already.
 #[cfg(windows)]
-pub(crate) fn set_disk_offline(number: u32, offline: bool) -> Result<()> {
+pub fn set_disk_offline(number: u32, offline: bool) -> Result<()> {
     if disk_is_offline(number)? == offline {
         return Ok(());
     }
@@ -650,11 +650,11 @@ pub(crate) fn set_disk_offline(number: u32, offline: bool) -> Result<()> {
 /// A device Windows has, with the id `pnputil` and the Config Manager take.
 #[cfg(windows)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DiskDevice {
+pub struct DiskDevice {
     /// The instance id, such as `SCSI\DISK&VEN_VC-RS&PROD_VERACRYPT_VOLUME\1&…`.
-    pub(crate) instance_id: String,
+    pub instance_id: String,
     /// The name Windows shows for it, which is what the caller filters on.
-    pub(crate) name: String,
+    pub name: String,
 }
 
 // winapi has `SP_DEVINFO_DATA` itself, so there is no structure to write here; only the
@@ -675,7 +675,7 @@ const GUID_DEVINTERFACE_DISK: winapi::shared::guiddef::GUID = winapi::shared::gu
 /// device interfaces are enumerated and each one's friendly name is read, which is the
 /// name the caller knows the volume by.
 #[cfg(windows)]
-pub(crate) fn disk_devices(matching: &str) -> Result<Vec<DiskDevice>> {
+pub fn disk_devices(matching: &str) -> Result<Vec<DiskDevice>> {
     const DIGCF_PRESENT: u32 = 0x0000_0002;
     const DIGCF_DEVICEINTERFACE: u32 = 0x0000_0010;
     const SPDRP_FRIENDLYNAME: u32 = 0x0000_000C;
@@ -767,7 +767,7 @@ struct StoragePropertyQuery {
 
 /// Every drive letter Windows has, straight from the kernel.
 #[cfg(windows)]
-pub(crate) fn drive_letters() -> Vec<char> {
+pub fn drive_letters() -> Vec<char> {
     let mask = unsafe { winapi::um::fileapi::GetLogicalDrives() };
     (0..26u32)
         .filter(|bit| mask & (1 << bit) != 0)
@@ -908,7 +908,7 @@ fn disk_partitions(handle: winapi::um::winnt::HANDLE) -> Result<Vec<u32>> {
 /// system.  Every call is an ioctl, so the whole listing costs milliseconds where the
 /// cmdlet import alone used to cost seconds — and a caller that polls can poll.
 #[cfg(windows)]
-pub(crate) fn vcrs_disks(product: &str) -> Result<Vec<crate::attach::DiskInfo>> {
+pub fn vcrs_disks(product: &str) -> Result<Vec<crate::attach::DiskInfo>> {
     // The letters Windows has, with the disk each one sits on.  A letter is the only
     // thing that names a volume, and a volume is the only thing that names a file
     // system, so a disk listing starts here.
@@ -972,7 +972,7 @@ pub(crate) fn vcrs_disks(product: &str) -> Result<Vec<crate::attach::DiskInfo>> 
 /// underneath the partition exists — the Storage cmdlets refresh the disk for
 /// themselves, and this is the ioctl that does it at the Win32 level.
 #[cfg(windows)]
-pub(crate) fn refresh_disk(number: u32) -> Result<()> {
+pub fn refresh_disk(number: u32) -> Result<()> {
     let handle = open_disk(number, true)?;
     let mut returned = 0u32;
     let ok = unsafe {
@@ -1001,7 +1001,7 @@ pub(crate) fn refresh_disk(number: u32) -> Result<()> {
 /// freshly attached container often already wears one (`D:`, the next free letter)
 /// before the requested letter is set — this is how that letter is found again, so
 /// that it can be taken off before the asked-for one goes on.
-pub(crate) fn letters_on_disk(number: u32) -> Vec<char> {
+pub fn letters_on_disk(number: u32) -> Vec<char> {
     drive_letters()
         .into_iter()
         .filter(|letter| {
@@ -1012,7 +1012,7 @@ pub(crate) fn letters_on_disk(number: u32) -> Vec<char> {
         .collect()
 }
 
-pub(crate) fn volume_on_disk(number: u32) -> Result<String> {
+pub fn volume_on_disk(number: u32) -> Result<String> {
     let mut buffer = [0u16; 1024];
     let find =
         unsafe { winapi::um::fileapi::FindFirstVolumeW(buffer.as_mut_ptr(), buffer.len() as u32) };
@@ -1100,7 +1100,7 @@ fn volume_disk(volume: &str) -> Result<u32> {
 /// Put a volume on a drive letter, which is what `Set-Partition -NewDriveLetter`
 /// does underneath.
 #[cfg(windows)]
-pub(crate) fn set_mount_point(letter: char, volume: &str) -> Result<()> {
+pub fn set_mount_point(letter: char, volume: &str) -> Result<()> {
     const SLASH: char = '\\';
     let mount = nul_terminated(&format!("{letter}:{SLASH}"));
     let volume = nul_terminated(volume);
@@ -1120,7 +1120,7 @@ pub(crate) fn set_mount_point(letter: char, volume: &str) -> Result<()> {
 /// scan happens, and on a machine that also has a security minifilter loaded that
 /// scan can be slow enough that the wait loop would give up first. `DevInst` 0 is
 /// the root of the tree, so this scans everything, not one branch.
-pub(crate) fn rescan_devices() -> Result<()> {
+pub fn rescan_devices() -> Result<()> {
     #[cfg(windows)]
     {
         let code = unsafe {

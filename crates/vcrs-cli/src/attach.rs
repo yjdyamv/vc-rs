@@ -260,7 +260,7 @@ const LOG_WAIT: Duration = Duration::from_secs(300);
 /// The elevated half is not waited for as a process (see [`start_elevated`]), so
 /// its log is the only place its outcome can turn up. Reading the file as it
 /// grows also means a worker that was killed still shows what it managed to do.
-pub(crate) fn wait_for_log(log: &Path) -> String {
+pub fn wait_for_log(log: &Path) -> String {
     let deadline = std::time::Instant::now() + LOG_WAIT;
     loop {
         let text = std::fs::read_to_string(log).unwrap_or_default();
@@ -281,7 +281,7 @@ pub(crate) fn wait_for_log(log: &Path) -> String {
 /// marker that child leaves behind: [`DONE`] when it finished, [`FAILED`] when it
 /// gave up. Nothing else in the log can be trusted on its own — the lines around
 /// them are progress, and a worker that was killed mid-way leaves neither.
-pub(crate) fn judge(text: &str, what: &str) -> Result<()> {
+pub fn judge(text: &str, what: &str) -> Result<()> {
     print!("{text}");
     if text.contains(FAILED) {
         bail!("the elevated {what} failed (the lines above say why)");
@@ -293,7 +293,23 @@ pub(crate) fn judge(text: &str, what: &str) -> Result<()> {
 }
 
 /// Exit code `Start-Process -Verb RunAs` reports when the user refuses UAC.
-pub(crate) const ELEVATION_CANCELLED: i32 = 1223;
+pub const ELEVATION_CANCELLED: i32 = 1223;
+
+/// The elevation prompt was declined, or could not be shown.
+///
+/// It travels up as its own error type so `main` can exit with Windows' own
+/// `ERROR_CANCELLED` instead of a bare failure: a script can then tell the
+/// user's "no" from a real problem.
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the elevation prompt was declined")
+    }
+}
+
+impl std::error::Error for Cancelled {}
 
 fn describe(attached: &Attached) -> String {
     let mut text = match attached.letter {
@@ -340,7 +356,7 @@ fn attach_arguments(options: &AttachOptions, log: Option<&Path>) -> Vec<String> 
     args
 }
 
-pub(crate) fn temp_log_path() -> PathBuf {
+pub fn temp_log_path() -> PathBuf {
     std::env::temp_dir().join(format!("vcrs-attach-{}.log", std::process::id()))
 }
 
@@ -352,7 +368,7 @@ pub(crate) fn temp_log_path() -> PathBuf {
 /// [`crate::agent`]) that is meant to live for minutes — the caller would sit
 /// there until the agent timed out. The caller instead reads the run's verdict out
 /// of its `--log` file (see [`wait_for_log`]).
-pub(crate) fn start_elevated(exe: &Path, args: &[String], _log: &Path) -> Result<i32> {
+pub fn start_elevated(exe: &Path, args: &[String], _log: &Path) -> Result<i32> {
     let list: Vec<String> = args
         .iter()
         .map(|arg| format!("'{}'", arg.replace('\'', "''")))
@@ -381,7 +397,7 @@ pub(crate) fn start_elevated(exe: &Path, args: &[String], _log: &Path) -> Result
         if !text.is_empty() {
             println!("  {text}");
         }
-        bail!("elevation was refused, so nothing was attached");
+        return Err(anyhow::Error::new(Cancelled));
     }
     Ok(code)
 }
@@ -439,7 +455,7 @@ pub fn check_letter(letter: char) -> Result<char> {
 /// The letter the user asked for, upper-cased and checked to be a letter — but
 /// *not* checked to be free, which only makes sense when a letter is being
 /// taken. A dismount has to accept the letter its volume is already on.
-pub(crate) fn letter_argument(letter: char) -> Result<char> {
+pub fn letter_argument(letter: char) -> Result<char> {
     if !letter.is_ascii_alphabetic() {
         bail!("{letter:?} is not a drive letter");
     }
@@ -494,7 +510,7 @@ fn session_ids(list: &str, iqn: &str) -> Vec<String> {
 /// Remove vc-rs disk devices Windows still lists but that are not working.  A
 /// device whose target is gone is left in an error state, and until it is
 /// removed the disk of the new session never starts.
-pub(crate) fn forget_stale_devices(report: &mut Report) {
+pub fn forget_stale_devices(report: &mut Report) {
     let script = "Get-PnpDevice -Class DiskDrive -ErrorAction SilentlyContinue | \
         Where-Object { $_.FriendlyName -like '*VeraCrypt volume*' -and $_.Status -ne 'OK' } | \
         ForEach-Object { pnputil /remove-device $_.InstanceId | Out-Null; \
@@ -507,7 +523,7 @@ pub(crate) fn forget_stale_devices(report: &mut Report) {
 }
 
 /// Run `iscsicli` with arguments and give back its output.
-pub(crate) fn iscsicli(args: &[&str]) -> Result<String> {
+pub fn iscsicli(args: &[&str]) -> Result<String> {
     let out = quiet_command("iscsicli")
         .args(args)
         .output()
@@ -564,7 +580,7 @@ fn iscsicli_line(line: &str) -> Result<String> {
 }
 
 /// Run a PowerShell one-liner and give back its output.
-pub(crate) fn powershell(script: &str) -> Result<String> {
+pub fn powershell(script: &str) -> Result<String> {
     let out = quiet_command("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
@@ -703,7 +719,7 @@ fn has_a_file_system(disk: &DiskInfo) -> bool {
 /// Wait for the disk Windows creates for the target to show up.
 ///
 
-pub(crate) fn vcrs_disks() -> Result<Vec<DiskInfo>> {
+pub fn vcrs_disks() -> Result<Vec<DiskInfo>> {
     crate::win32::vcrs_disks(DISK_PRODUCT)
 }
 /// The disk is chosen by its INQUIRY name, and by size when the caller knows it
@@ -778,27 +794,27 @@ fn newest_disk(disk_size: Option<u64>) -> Option<DiskInfo> {
 /// closing console).
 ///
 /// Set in the child that really does the work (see [`run_detached_worker`]).
-pub(crate) const WORKER_ENV: &str = "VCRS_ELEVATED_WORKER";
+pub const WORKER_ENV: &str = "VCRS_ELEVATED_WORKER";
 
 /// The line that says the work finished, written into the `--log` file: the caller
 /// reads it back, so a launcher that was killed while waiting cannot make a
 /// successful job look failed.
 /// The line that says the work finished, written into the `--log` file (or sent
 /// back by an agent) when it succeeded.
-pub(crate) const DONE: &str = "vcrs: done";
+pub const DONE: &str = "vcrs: done";
 
 /// The line that says the work failed, written right after the `vcrs: error:`
 /// line. The caller reads the log rather than a process' exit code (see
 /// [`wait_for_log`]), so the verdict has to be visible in it on its own.
-pub(crate) const FAILED: &str = "vcrs: failed";
+pub const FAILED: &str = "vcrs: failed";
 
 /// Is this process the console-less child that does the work?
-pub(crate) fn is_detached_worker() -> bool {
+pub fn is_detached_worker() -> bool {
     std::env::var_os(WORKER_ENV).is_some()
 }
 
 /// Note in the log that the work finished.
-pub(crate) fn mark_done(log: Option<&Path>) {
+pub fn mark_done(log: Option<&Path>) {
     if let Some(path) = log {
         use std::io::Write as _;
         if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
@@ -811,7 +827,7 @@ pub(crate) fn mark_done(log: Option<&Path>) {
 ///
 /// One caller waits for it ([`wait_for_detached_worker`]); the agent does not — it
 /// is the job.
-pub(crate) fn spawn_detached_worker() -> Result<std::process::Child> {
+pub fn spawn_detached_worker() -> Result<std::process::Child> {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let args: Vec<&std::ffi::OsStr> = args.iter().map(|arg| arg.as_os_str()).collect();
     spawn_detached_worker_with(&args)
@@ -819,7 +835,7 @@ pub(crate) fn spawn_detached_worker() -> Result<std::process::Child> {
 
 /// The same, for a job that is not this process' own command line — the agent is
 /// started with words of its own.
-pub(crate) fn spawn_detached_worker_with(args: &[&std::ffi::OsStr]) -> Result<std::process::Child> {
+pub fn spawn_detached_worker_with(args: &[&std::ffi::OsStr]) -> Result<std::process::Child> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -859,7 +875,7 @@ pub(crate) fn spawn_detached_worker_with(args: &[&std::ffi::OsStr]) -> Result<st
 /// `DETACHED_PROCESS | CREATE_NO_WINDOW`; this process only waits for it, and if it
 /// is killed anyway the worker carries on. The caller learns the outcome from the
 /// `--log` file (the [`DONE`] line), not from an exit code.
-pub(crate) fn wait_for_detached_worker() -> Result<()> {
+pub fn wait_for_detached_worker() -> Result<()> {
     #[cfg(windows)]
     {
         let mut child = spawn_detached_worker()?;
@@ -880,7 +896,7 @@ pub(crate) fn wait_for_detached_worker() -> Result<()> {
     }
 }
 
-pub(crate) fn ignore_console_control_events() {
+pub fn ignore_console_control_events() {
     #[cfg(windows)]
     unsafe {
         unsafe extern "system" fn ignore(
@@ -1004,7 +1020,7 @@ fn read_back(disk: u32, want: Option<char>, wait: Duration) -> Option<DiskInfo> 
 }
 
 /// The first non-empty line of some tool output.
-pub(crate) fn first_line(text: &str) -> Option<String> {
+pub fn first_line(text: &str) -> Option<String> {
     text.lines()
         .map(|line| line.trim())
         .find(|line| !line.is_empty())
@@ -1018,7 +1034,7 @@ pub(crate) fn first_line(text: &str) -> Option<String> {
 /// so without this a second `vcrs mount` fails with `os error 10048` (address
 /// already in use) although nothing is wrong with the request. Windows' initiator
 /// is told the portal in `AddTarget`, so a different port costs nothing.
-pub(crate) fn free_bind_addr(preferred: &str) -> Result<String> {
+pub fn free_bind_addr(preferred: &str) -> Result<String> {
     let (host, port) = split_address(preferred);
     let mut last = None;
     for candidate in port..port.saturating_add(PORT_SEARCH) {
@@ -1055,17 +1071,17 @@ fn split_address(address: &str) -> (String, u16) {
 }
 
 /// Output that goes to the terminal and, for an elevated child, to a log file.
-pub(crate) struct Report {
+pub struct Report {
     log: Option<std::fs::File>,
 }
 
 impl Report {
-    pub(crate) fn new(path: Option<&Path>) -> Self {
+    pub fn new(path: Option<&Path>) -> Self {
         let log = path.and_then(|path| std::fs::File::create(path).ok());
         Self { log }
     }
 
-    pub(crate) fn line(&mut self, text: &str) {
+    pub fn line(&mut self, text: &str) {
         println!("{text}");
         if let Some(log) = &mut self.log {
             let _ = writeln!(log, "{text}");
@@ -1196,7 +1212,7 @@ mod tests {
 /// closing console from killing it — so every wrapper it starts would otherwise
 /// allocate a console of its own. That is what a user sees as a window flashing
 /// once per PowerShell call, two or three times per dismount.
-pub(crate) fn quiet_command(program: &str) -> Command {
+pub fn quiet_command(program: &str) -> Command {
     let mut command = Command::new(program);
     #[cfg(windows)]
     {

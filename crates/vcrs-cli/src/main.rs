@@ -16,17 +16,17 @@ use vcrs_core::header::{
 use vcrs_core::volume::{CreateOptions, OpenOptions, ProtectedRange, RestoreHeaderOptions, Volume};
 use vcrs_core::{EncryptionAlgorithm, Prf, VolumeLayout, VolumeType};
 
-mod agent;
-mod attach;
-mod detach;
-mod serve;
-mod win32;
+use vcrs_cli::{agent, attach, detach, prompt, serve, status};
 
 #[derive(Parser)]
 #[command(name = "vcrs", version, about = "VeraCrypt-compatible volume tooling")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Print a machine-readable JSON document instead of the usual lines, for the
+    /// commands that have one (`vcrs list --json`).
+    #[arg(long, global = true)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -211,6 +211,7 @@ impl PasswordArgs {
             self.password.as_deref(),
             self.password_stdin,
             "no password given (use --password, $VCRS_PASSWORD or --password-stdin)",
+            false,
         )
     }
 
@@ -240,8 +241,16 @@ impl PasswordArgs {
 }
 
 /// Read a password the way every command does: raw bytes from stdin (with one
-/// trailing newline trimmed) or the UTF-8 bytes of the string that was given.
-fn read_password(value: Option<&str>, from_stdin: bool, missing: &str) -> Result<Vec<u8>> {
+/// trailing newline trimmed), the UTF-8 bytes of the string that was given, or —
+/// when there is neither and a person is at the terminal — a prompt with the echo
+/// switched off. `fresh` marks a password that is being *set* rather than checked;
+/// those are asked for twice, so one typo cannot lock the volume away for good.
+fn read_password(
+    value: Option<&str>,
+    from_stdin: bool,
+    missing: &str,
+    fresh: bool,
+) -> Result<Vec<u8>> {
     if from_stdin {
         let mut buf = Vec::new();
         std::io::stdin().read_to_end(&mut buf)?;
@@ -255,7 +264,8 @@ fn read_password(value: Option<&str>, from_stdin: bool, missing: &str) -> Result
     }
     match value {
         Some(password) => Ok(password.as_bytes().to_vec()),
-        None => bail!("{missing}"),
+        None if fresh => prompt::new_password(missing),
+        None => prompt::password(missing),
     }
 }
 
@@ -292,6 +302,7 @@ impl NewPasswordArgs {
             self.new_password_stdin,
             "no new password given (use --new-password, $VCRS_NEW_PASSWORD or \
              --new-password-stdin)",
+            true,
         )
     }
 
@@ -831,19 +842,30 @@ struct WriteArgs {
     protect: HiddenProtectionArgs,
 }
 
+/// The exit codes are VeraCrypt's own where they exist: 0 for "it worked", 1 for
+/// "it did not", 2 for a usage mistake (clap), and Windows' 1223 when the
+/// elevation prompt was declined — so a script can tell the user's "no" from a
+/// real failure.
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("vcrs: error: {e:#}");
+            if e.downcast_ref::<attach::Cancelled>().is_some() {
+                // `std::process::exit` keeps the whole 32-bit code; an `ExitCode`
+                // built from a `u8` would truncate 1223 to 199.
+                std::process::exit(attach::ELEVATION_CANCELLED);
+            }
             ExitCode::FAILURE
         }
     }
 }
 
 fn run() -> Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let json = cli.json;
+    match cli.command {
         Command::Create(a) => {
             let ea = parse_ea(&a.ea)?;
             let prf = parse_prf(&a.prf)?;
@@ -1148,7 +1170,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::CreateKeyfile(a) => create_keyfile(&a),
-        Command::List(a) => list_mounts(&a),
+        Command::List(a) => list_mounts(&a, json),
         Command::Test(_) => self_test(),
         Command::DeviceInfo(a) => device_info(&a),
         Command::Mount(a) => {
@@ -1317,9 +1339,18 @@ fn run() -> Result<()> {
                 }
                 (None, Some(letter), _, _) => detach::Target::Letter(letter),
                 (None, None, Some(iqn), _) => detach::Target::Iqn(iqn.clone()),
+                (None, None, None, true) => detach::Target::All,
                 // A bare `vcrs dismount` detaches everything vc-rs serves, the
-                // way VeraCrypt's `/dismount` without a volume dismounts all.
-                (None, None, None, _) => detach::Target::All,
+                // way VeraCrypt's `/dismount` without a volume dismounts all —
+                // but say so first, so nobody loses two volumes to a missing
+                // argument.
+                (None, None, None, false) => {
+                    println!(
+                        "no volume named: detaching every volume vc-rs serves (name one with a \
+                         container path, `--letter <LETTER>` or `--iqn <IQN>`)"
+                    );
+                    detach::Target::All
+                }
             };
             let options = detach::DetachOptions { target, log: a.log };
             detach::detach_with_elevation(&options)?;
@@ -1401,10 +1432,6 @@ fn run() -> Result<()> {
 /// The keyfiles VeraCrypt writes are `VolumePassword::MaxSize` = 128 bytes of
 /// random data (see `CoreBase::CreateKeyfile` in src/Core/CoreBase.cpp).
 const KEYFILE_SIZE: usize = 128;
-
-/// The IQN prefix `vcrs mount` uses for the targets it serves.
-#[cfg(any(windows, test))]
-const VCRS_IQN_PREFIX: &str = detach::VCRS_IQN_PREFIX;
 
 /// Prints what an in-place transformation of a partition is about to do (and,
 /// without `--yes`, is all that happens).
@@ -1606,128 +1633,68 @@ fn create_keyfile(a: &CreateKeyfileArgs) -> Result<()> {
     Ok(())
 }
 
-/// One `iscsicli SessionList 1` entry.
-#[cfg(any(windows, test))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct IscsiSession {
-    id: String,
-    initiator: String,
-    target: String,
-}
-
-/// Parse `iscsicli SessionList 1` output into one entry per session.
-#[cfg(any(windows, test))]
-fn parse_sessions(list: &str) -> Vec<IscsiSession> {
-    let mut sessions: Vec<IscsiSession> = Vec::new();
-    let mut current: Option<IscsiSession> = None;
-    for line in list.lines() {
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        let key = key.trim();
-        let value = value.trim();
-        if key.eq_ignore_ascii_case("Session Id") && !value.is_empty() {
-            if let Some(session) = current.take() {
-                sessions.push(session);
-            }
-            current = Some(IscsiSession {
-                id: value.to_string(),
-                initiator: String::new(),
-                target: String::new(),
-            });
-            continue;
-        }
-        if let Some(session) = current.as_mut() {
-            if key.eq_ignore_ascii_case("Initiator Node Name") {
-                session.initiator = value.to_string();
-            } else if (key.eq_ignore_ascii_case("Target Name")
-                || key.eq_ignore_ascii_case("Target Node Name"))
-                && session.target.is_empty()
-                && value != "(null)"
-            {
-                session.target = value.to_string();
-            }
-        }
-    }
-    if let Some(session) = current.take() {
-        sessions.push(session);
-    }
-    sessions
-}
-
-/// List the iSCSI sessions (ours, or all of them) and the disks Windows has.
-fn list_mounts(a: &ListArgs) -> Result<()> {
+/// List the iSCSI sessions (ours, or all of them), the serving processes and the
+/// disks Windows has.
+fn list_mounts(a: &ListArgs, json: bool) -> Result<()> {
     #[cfg(not(windows))]
     {
-        let _ = a;
+        let _ = (a, json);
         bail!("listing iSCSI sessions needs the Microsoft iSCSI Initiator (Windows only)");
     }
     #[cfg(windows)]
     {
-        let output = crate::attach::quiet_command("iscsicli")
-            .args(["SessionList", "1"])
-            .output();
-        // `iscsicli` needs elevation, so an unelevated `vcrs list` shows the
-        // disks it can see and says why the sessions are missing.
-        let sessions = match output {
-            Ok(output) if output.status.success() => {
-                let text = String::from_utf8_lossy(&output.stdout).into_owned();
-                parse_sessions(&text)
-            }
-            Ok(output) => {
-                println!(
-                    "  (iscsicli SessionList failed: {}; it needs an elevated prompt)",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-                Vec::new()
-            }
-            Err(err) => {
-                println!(
-                    "  (iscsicli SessionList could not run: {err}; it needs an elevated prompt)"
-                );
-                Vec::new()
-            }
-        };
-        let ours: Vec<IscsiSession> = sessions
-            .into_iter()
-            .filter(|s| a.all || s.target.starts_with(VCRS_IQN_PREFIX))
-            .collect();
-        if ours.is_empty() {
+        let state = status::snapshot(a.all);
+        if json {
+            println!("{}", serde_json::to_string_pretty(&state)?);
+            return Ok(());
+        }
+        if state.sessions.is_empty() {
             if a.all {
                 println!("no iSCSI session is logged in");
             } else {
                 println!("no vc-rs volume is attached (pass --all to list every iSCSI session)");
             }
         } else {
-            for session in &ours {
-                println!("{}  (session {})", session.target, session.id);
+            for session in &state.sessions {
+                println!("{}  (session {})", session.iqn, session.id);
                 if !session.initiator.is_empty() {
                     println!("  initiator {}", session.initiator);
                 }
             }
         }
-
-        let script = "Get-Disk | Where-Object { $_.FriendlyName -like '*VeraCrypt volume*' } | ForEach-Object { \
-             $letters = (Get-Partition -DiskNumber $_.Number -ErrorAction SilentlyContinue | \
-             Where-Object { $_.DriveLetter } | ForEach-Object { $_.DriveLetter + ':' }) -join ','; \
-             '  disk {0}: {1} bytes, offline={2}, drive letters: {3}' -f $_.Number, $_.Size, $_.IsOffline, $letters }";
-        match crate::attach::quiet_command("powershell")
-            .args(["-NoProfile", "-Command", script])
-            .output()
-        {
-            Ok(out) => {
-                let text = String::from_utf8_lossy(&out.stdout);
-                let text = text.trim();
-                if text.is_empty() {
-                    println!("no disk with the vc-rs disk name is present");
-                } else {
-                    println!("disks:");
-                    for line in text.lines() {
-                        println!("{}", line.trim_end());
+        if !state.servers.is_empty() {
+            println!("serving in the background:");
+            for server in &state.servers {
+                match server.letter {
+                    Some(letter) => {
+                        println!("  {}  (pid {}, on {letter}:)", server.iqn, server.pid)
                     }
+                    None => println!("  {}  (pid {})", server.iqn, server.pid),
                 }
             }
-            Err(err) => println!("  (could not query the disks: {err})"),
+        }
+        if state.disks.is_empty() {
+            println!("no disk with the vc-rs disk name is present");
+        } else {
+            println!("disks:");
+            for disk in &state.disks {
+                let letter = match disk.letter {
+                    Some(letter) => format!("{letter}:"),
+                    None => "no drive letter".to_string(),
+                };
+                let mut what = format!("{} bytes", disk.size);
+                if let Some(file_system) = &disk.file_system {
+                    what.push_str(", ");
+                    what.push_str(file_system);
+                }
+                if let Some(partition) = disk.partition {
+                    what.push_str(&format!(", partition {partition}"));
+                }
+                println!("  disk {}: {what}, {letter}", disk.number);
+            }
+        }
+        for note in &state.notes {
+            println!("  {note}");
         }
         Ok(())
     }
@@ -2345,10 +2312,7 @@ fn human_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        format_master_key, human_size, parse_sector_size, parse_sessions, Cli, Command,
-        IscsiSession,
-    };
+    use super::{format_master_key, human_size, parse_sector_size, Cli, Command};
     use clap::Parser;
 
     #[test]
@@ -2418,40 +2382,6 @@ mod tests {
         assert!(
             Cli::try_parse_from(["vcrs", "dismount", "secret.vc", "--iscsi", "iqn.x:y"]).is_err()
         );
-    }
-
-    #[test]
-    fn lists_every_session_in_the_list() {
-        // Trimmed-down `iscsicli SessionList 1` output from a real run with one
-        // vc-rs target and one unrelated session.
-        let list = "Microsoft iSCSI Initiator Version 10.0 Build 26300\n\
-                    Total of 2 sessions\n\
-                    Session Id             : ffffe68332afe010-4000013700000006\n\
-                    Initiator Node Name    : iqn.1991-05.com.microsoft:desktop-985akhr\n\
-                    Target Node Name       : (null)\n\
-                    Target Name            : iqn.2025-12.io.vcrs:probe\n\
-                    ISID                   : 40 00 01 37 00 00\n\
-                    Session Id             : ffffe68332afe010-4000013700000009\n\
-                    Initiator Node Name    : iqn.1991-05.com.microsoft:desktop-985akhr\n\
-                    Target Node Name       : iqn.other:storage\n\
-                    ISID                   : 40 00 01 37 00 00\n";
-        assert_eq!(
-            parse_sessions(list),
-            vec![
-                IscsiSession {
-                    id: "ffffe68332afe010-4000013700000006".to_string(),
-                    initiator: "iqn.1991-05.com.microsoft:desktop-985akhr".to_string(),
-                    target: "iqn.2025-12.io.vcrs:probe".to_string(),
-                },
-                IscsiSession {
-                    id: "ffffe68332afe010-4000013700000009".to_string(),
-                    initiator: "iqn.1991-05.com.microsoft:desktop-985akhr".to_string(),
-                    target: "iqn.other:storage".to_string(),
-                },
-            ]
-        );
-        assert!(parse_sessions("").is_empty());
-        assert!(parse_sessions("Total of 0 sessions\n").is_empty());
     }
 
     #[test]
