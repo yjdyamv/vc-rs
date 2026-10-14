@@ -154,6 +154,11 @@ request through a named pipe specified with `-f`”，参考实现是仓库里�
 那个；后台服务端的空闲超时也调到 30 秒，足够发起程序在挂载过程中断线重连（原来 5 秒会让服务
 在挂载途中自己退出，挂载随后报 “Windows did not show the disk”）。
 
+卸载时也补上了 VeraCrypt 自己那一步：先 `FSCTL_LOCK_VOLUME`（等所有打开该卷的句柄关闭，
+最多 10 秒）再 `FSCTL_DISMOUNT_VOLUME` 把文件系统摘下来，然后才摘盘符、离线磁盘、结束服务、
+注销会话。少了这一步，卷一旦在用，Windows 就会用 “The session cannot be logged out since a
+device on that session is currently being used.” 拒绝登出，留下只能靠下次挂载清理的残留会话。
+
 盘符、磁盘离线、设备卸载这些步骤已经全部改成直接调 Win32（`crates/vcrs-cli/src/win32.rs`：
 SCM 服务、`IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS`、`SetVolumeMountPointW` /
 `DeleteVolumeMountPointW`、`IOCTL_DISK_SET_DISK_ATTRIBUTES`、setupapi + `pnputil`、

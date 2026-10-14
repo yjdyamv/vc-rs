@@ -27,6 +27,12 @@ pub(crate) const VCRS_IQN_PREFIX: &str = "iqn.2025-12.io.vcrs:";
 /// How long to wait for Windows to let go of a disk ("<letter>: is in use").
 const RELEASE_WAIT: Duration = Duration::from_secs(2);
 
+/// How long to wait for whatever has the volume open to close it, so that the
+/// filesystem can be taken off and the session logged out. The lock succeeds at
+/// once on a volume nobody is using, so this only costs time when it really is in
+/// use — and a volume in use is exactly the case Windows refuses to log out.
+const LOCK_WAIT: Duration = Duration::from_secs(10);
+
 /// What to detach.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
@@ -488,8 +494,20 @@ fn release(
         return Ok(Released::default());
     }
 
-    // 1. The letters. Taking one away is instant while the volume is healthy, and the
-    //    letter going away is the first thing the user sees.
+    // 1. The filesystem off the volume first, then its letters. A mounted filesystem is
+    //    a device "currently being used", and Windows will not log the session behind
+    //    it out until it is taken off ("The session cannot be logged out since a device
+    //    on that session is currently being used."); this is why a dismount used to
+    //    leave its session behind. It is instant while the volume is healthy, and it
+    //    has to happen while the target is still serving it: a dead target turns every
+    //    step afterwards into a SCSI command time-out (measured: 72.6 s against 0.2 s).
+    for letter in letters {
+        if let Err(err) = win32::dismount_volume(*letter, LOCK_WAIT) {
+            report.line(&format!(
+                "  could not take the filesystem off {letter}: {err:#}"
+            ));
+        }
+    }
     let mut gone: Vec<char> = Vec::new();
     for letter in letters {
         match win32::release_letter(*letter) {

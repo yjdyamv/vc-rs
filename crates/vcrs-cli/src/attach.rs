@@ -524,7 +524,12 @@ pub(crate) fn iscsicli(args: &[&str]) -> Result<String> {
         all.push_str(errors.trim());
         all.push('\n');
     }
-    if !out.status.success() && !all.to_ascii_lowercase().contains("already") {
+    // Some failures mean the state is already the one being asked for: a session that
+    // has gone by itself ("already"), or a target that is not registered any more
+    // ("The target name is not found or is marked as hidden from login."). Those are
+    // not errors — the second says exactly what this call set out to achieve.
+    let lower = all.to_ascii_lowercase();
+    if !out.status.success() && !lower.contains("already") && !lower.contains("not found") {
         bail!(
             "`iscsicli {}` failed ({}): {}",
             args.join(" "),

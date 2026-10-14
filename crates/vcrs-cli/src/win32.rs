@@ -360,6 +360,88 @@ const DDD_EXACT_MATCH_ON_REMOVE: u32 = 0x0000_0004;
 /// has no volume under it any more.  A letter that is already gone is a success: that
 /// is the state the caller wanted.
 #[cfg(windows)]
+/// Take the filesystem off a volume, so that the session behind it can be logged out.
+///
+/// Windows refuses to log an iSCSI session out while a device on it is in use — "The
+/// session cannot be logged out since a device on that session is currently being
+/// used." — and a mounted filesystem is exactly that. Taking the drive letter away and
+/// offlining the disk are not enough on their own: the filesystem itself has to be told
+/// to let go, which is what `FSCTL_LOCK_VOLUME` (it only succeeds once everything that
+/// has the volume open has closed it) and `FSCTL_DISMOUNT_VOLUME` do. This is the
+/// sequence VeraCrypt's own unmount runs; without it a dismount leaves the session
+/// logged in, and the next attach has to clear the leftover before it can log in.
+pub(crate) fn dismount_volume(letter: char, wait: std::time::Duration) -> Result<()> {
+    const SLASH: char = '\\';
+    let letter = letter.to_ascii_uppercase();
+    let path = nul_terminated(&format!("{SLASH}{SLASH}.{SLASH}{letter}:"));
+    let handle = unsafe {
+        winapi::um::fileapi::CreateFileW(
+            path.as_ptr(),
+            winapi::um::winnt::GENERIC_READ | winapi::um::winnt::GENERIC_WRITE,
+            winapi::um::winnt::FILE_SHARE_READ | winapi::um::winnt::FILE_SHARE_WRITE,
+            std::ptr::null_mut(),
+            winapi::um::fileapi::OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+        let err = std::io::Error::last_os_error();
+        // A volume that is already gone needs nothing done to it.
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        anyhow::bail!("opening {letter}: to take the filesystem off it: {err}");
+    }
+
+    // The lock only succeeds once every handle on the volume has closed — Explorer, an
+    // indexer, a shell sitting in the directory — so it is given a few goes: the volume
+    // is in use until it is not, and waiting is what VeraCrypt does here too.
+    let deadline = std::time::Instant::now() + wait;
+    let locked = loop {
+        match control(handle, winapi::um::winioctl::FSCTL_LOCK_VOLUME) {
+            Ok(()) => break Ok(()),
+            Err(err) => {
+                if std::time::Instant::now() >= deadline {
+                    break Err(err);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+    };
+    // Dismounting is what actually releases the device the session is holding. The lock
+    // is deliberately kept until the handle closes: nothing may open the volume again
+    // between here and the logout.
+    let result = locked.and_then(|()| {
+        control(handle, winapi::um::winioctl::FSCTL_DISMOUNT_VOLUME)
+            .map_err(|err| err.context(format!("taking the filesystem off {letter}:")))
+    });
+    unsafe { winapi::um::handleapi::CloseHandle(handle) };
+    result
+}
+
+/// One `DeviceIoControl` that takes no input and returns nothing.
+fn control(handle: winapi::um::winnt::HANDLE, code: u32) -> Result<()> {
+    let mut returned: u32 = 0;
+    let ok = unsafe {
+        winapi::um::ioapiset::DeviceIoControl(
+            handle,
+            code,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        let err = std::io::Error::last_os_error();
+        anyhow::bail!("the volume control 0x{code:08x}: {err}");
+    }
+    Ok(())
+}
+
 pub(crate) fn release_letter(letter: char) -> Result<()> {
     let letter = letter.to_ascii_uppercase();
     if !letter.is_ascii_alphabetic() {
