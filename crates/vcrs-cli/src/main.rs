@@ -10,8 +10,8 @@ use std::process::ExitCode;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use vcrs_core::header::{
-    HEADER_ENCRYPTED_DATA_OFFSET, MASTER_KEY_AREA_OFFSET, VOLUME_HEADER_SIZE, VOLUME_HEADER_SIZE_LEGACY,
-    VolumeHeader,
+    VolumeHeader, HEADER_ENCRYPTED_DATA_OFFSET, MASTER_KEY_AREA_OFFSET, VOLUME_HEADER_SIZE,
+    VOLUME_HEADER_SIZE_LEGACY,
 };
 use vcrs_core::volume::{CreateOptions, OpenOptions, ProtectedRange, RestoreHeaderOptions, Volume};
 use vcrs_core::{EncryptionAlgorithm, Prf, VolumeLayout, VolumeType};
@@ -94,7 +94,8 @@ struct CreateArgs {
     path: PathBuf,
     /// Volume size, e.g. `100M`, `4G`, or a byte count.
     #[arg(short, long, value_parser = parse_size)]
-    size: u64,    /// Encryption algorithm, e.g. `AES`, `Serpent-AES`, `AES-Twofish-Serpent`.
+    size: u64,
+    /// Encryption algorithm, e.g. `AES`, `Serpent-AES`, `AES-Twofish-Serpent`.
     #[arg(short, long, visible_alias = "encryption", default_value = "AES")]
     ea: String,
     /// Header key derivation function, e.g. `SHA-512`, `Blake2s`, `Argon2`.
@@ -194,7 +195,11 @@ impl PasswordArgs {
     fn is_given(&self) -> bool {
         self.password.is_some() || self.password_stdin || !self.keyfiles.is_empty()
     }
-    fn open_options(&self, volume_type: Option<VolumeType>, use_backup_header: bool) -> Result<OpenOptions> {
+    fn open_options(
+        &self,
+        volume_type: Option<VolumeType>,
+        use_backup_header: bool,
+    ) -> Result<OpenOptions> {
         Ok(OpenOptions {
             password: self.read()?,
             keyfiles: self.keyfiles.clone(),
@@ -235,7 +240,11 @@ fn read_password(value: Option<&str>, from_stdin: bool, missing: &str) -> Result
 #[derive(Args, Clone)]
 struct NewPasswordArgs {
     /// New password.
-    #[arg(long = "new-password", env = "VCRS_NEW_PASSWORD", hide_env_values = true)]
+    #[arg(
+        long = "new-password",
+        env = "VCRS_NEW_PASSWORD",
+        hide_env_values = true
+    )]
     new_password: Option<String>,
     /// Read the new password from stdin (raw bytes, one trailing newline trimmed).
     #[arg(long = "new-password-stdin", conflicts_with = "new_password")]
@@ -331,6 +340,11 @@ struct MountArgs {
     /// used; pass this to let the container's timestamp change normally.
     #[arg(long)]
     no_preserve_timestamp: bool,
+    /// Open the volume through its backup header instead of the primary one
+    /// (VeraCrypt's "Use backup header embedded in volume if available",
+    /// `/mountoption headerbak`). Useful when the primary header is damaged.
+    #[arg(long)]
+    backup: bool,
     #[command(flatten)]
     kind: VolumeKindArgs,
     #[command(flatten)]
@@ -347,9 +361,14 @@ struct DismountArgs {
         long,
         value_name = "IQN",
         num_args = 0..=1,
-        default_missing_value = "iqn.2025-12.io.vcrs:volume"
+        default_missing_value = "iqn.2025-12.io.vcrs:volume",
+        conflicts_with = "all"
     )]
     iscsi: Option<String>,
+    /// Detach every target vc-rs serves, not just one (VeraCrypt's `/dismount`
+    /// without a volume).
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Args)]
@@ -575,7 +594,11 @@ struct HiddenProtectionArgs {
     #[arg(long = "hidden-password-stdin", conflicts_with = "hidden_password")]
     hidden_password_stdin: bool,
     /// PIM of the hidden volume.
-    #[arg(long = "hidden-pim", visible_alias = "protection-pim", default_value_t = 0)]
+    #[arg(
+        long = "hidden-pim",
+        visible_alias = "protection-pim",
+        default_value_t = 0
+    )]
     hidden_pim: i32,
     /// Keyfile of the hidden volume (repeatable).
     #[arg(
@@ -605,10 +628,12 @@ impl HiddenProtectionArgs {
             pim: self.hidden_pim,
             keyfiles: self.hidden_keyfiles.clone(),
         };
-        let options = creds.open_options(Some(VolumeType::Hidden), false).context(
-            "--protect-hidden needs the hidden volume's password \
+        let options = creds
+            .open_options(Some(VolumeType::Hidden), false)
+            .context(
+                "--protect-hidden needs the hidden volume's password \
              (--hidden-password, $VCRS_HIDDEN_PASSWORD or --hidden-password-stdin)",
-        )?;
+            )?;
         Ok(Some(options))
     }
 }
@@ -899,8 +924,7 @@ fn run() -> Result<()> {
         Command::EncryptInPlace(a) => {
             let ea = EncryptionAlgorithm::from_name(&a.ea)
                 .with_context(|| format!("unknown encryption algorithm {:?}", a.ea))?;
-            let prf = Prf::from_name(&a.prf)
-                .with_context(|| format!("unknown PRF {:?}", a.prf))?;
+            let prf = Prf::from_name(&a.prf).with_context(|| format!("unknown PRF {:?}", a.prf))?;
             if vcrs_core::looks_like_device(&a.path) {
                 return encrypt_device(&a, ea, prf);
             }
@@ -911,8 +935,7 @@ fn run() -> Result<()> {
                 .with_context(|| format!("reading {}", a.path.display()))?
                 .len();
             let started = std::time::Instant::now();
-            let volume =
-                vcrs_core::encrypt_in_place(&a.path, &password, a.password.pim, ea, prf)?;
+            let volume = vcrs_core::encrypt_in_place(&a.path, &password, a.password.pim, ea, prf)?;
             let elapsed = started.elapsed();
             match volume.in_place() {
                 Some(state) => {
@@ -936,8 +959,7 @@ fn run() -> Result<()> {
                     );
                     println!(
                         "  {}: {} byte data area, mountable like any other container",
-                        volume.header.ea,
-                        volume.data_size
+                        volume.header.ea, volume.data_size
                     );
                 }
             }
@@ -951,14 +973,13 @@ fn run() -> Result<()> {
             let options = a.password.open_options(None, false)?;
             let password = options.effective_password(Some(&a.path))?;
             let started = std::time::Instant::now();
-            let outcome =
-                vcrs_core::decrypt_in_place_stopping_after(
-                    &a.path,
-                    &password,
-                    a.password.pim,
-                    a.resume,
-                    None,
-                )?;
+            let outcome = vcrs_core::decrypt_in_place_stopping_after(
+                &a.path,
+                &password,
+                a.password.pim,
+                a.resume,
+                None,
+            )?;
             let elapsed = started.elapsed();
             if outcome.finished {
                 println!(
@@ -1034,7 +1055,7 @@ fn run() -> Result<()> {
         Command::Test(_) => self_test(),
         Command::DeviceInfo(a) => device_info(&a),
         Command::Mount(a) => {
-            let options = a.password.open_options(a.kind.volume_type(), false)?;
+            let options = a.password.open_options(a.kind.volume_type(), a.backup)?;
 
             let disk_mode = match a.disk_mode.as_deref() {
                 None => vcrs_mount::DiskMode::default(),
@@ -1062,9 +1083,13 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::Dismount(a) => {
+            if a.all {
+                return dismount_all();
+            }
             let iqn = a.iscsi.as_deref().context(
                 "`vcrs dismount` detaches an iSCSI target: pass `--iscsi <IQN>` \
-                 (the target name printed by `vcrs mount`; `iscsicli SessionList 1` lists them)",
+                 (the target name printed by `vcrs mount`; `iscsicli SessionList 1` lists them) \
+                 or `--all` for every target vc-rs serves",
             )?;
             iscsi_logout(iqn)?;
             Ok(())
@@ -1087,7 +1112,11 @@ const VCRS_IQN_PREFIX: &str = "iqn.2025-12.io.vcrs:";
 fn describe_device(device: &vcrs_core::Device, action: &str) -> Result<()> {
     let info = device.info();
     println!("{action} {}", info.path.display());
-    println!("  size            {} ({} bytes)", human_size(info.size), info.size);
+    println!(
+        "  size            {} ({} bytes)",
+        human_size(info.size),
+        info.size
+    );
     println!("  sector size     {}", info.sector_size);
     match (info.partition_style.as_deref(), info.partition_number) {
         (Some(style), Some(number)) => println!("  partition       {style} partition {number}"),
@@ -1095,7 +1124,9 @@ fn describe_device(device: &vcrs_core::Device, action: &str) -> Result<()> {
     }
     println!(
         "  filesystem      {}",
-        info.boot_sector_fs.as_deref().unwrap_or("nothing recognisable")
+        info.boot_sector_fs
+            .as_deref()
+            .unwrap_or("nothing recognisable")
     );
     if let Some(ntfs) = &info.ntfs {
         println!(
@@ -1265,7 +1296,10 @@ fn create_keyfile(a: &CreateKeyfileArgs) -> Result<()> {
     };
     std::fs::write(&a.path, &bytes)
         .with_context(|| format!("writing the keyfile {}", a.path.display()))?;
-    println!("wrote a {KEYFILE_SIZE} byte keyfile to {}", a.path.display());
+    println!(
+        "wrote a {KEYFILE_SIZE} byte keyfile to {}",
+        a.path.display()
+    );
     println!(
         "  pass it with `--keyfile {}` in addition to the password; losing it makes the volume unopenable",
         a.path.display()
@@ -1349,7 +1383,9 @@ fn list_mounts(a: &ListArgs) -> Result<()> {
                 Vec::new()
             }
             Err(err) => {
-                println!("  (iscsicli SessionList could not run: {err}; it needs an elevated prompt)");
+                println!(
+                    "  (iscsicli SessionList could not run: {err}; it needs an elevated prompt)"
+                );
                 Vec::new()
             }
         };
@@ -1361,9 +1397,7 @@ fn list_mounts(a: &ListArgs) -> Result<()> {
             if a.all {
                 println!("no iSCSI session is logged in");
             } else {
-                println!(
-                    "no vc-rs volume is attached (pass --all to list every iSCSI session)"
-                );
+                println!("no vc-rs volume is attached (pass --all to list every iSCSI session)");
             }
         } else {
             for session in &ours {
@@ -1416,7 +1450,11 @@ fn device_info(a: &DeviceInfoArgs) -> Result<()> {
     if let Some(path) = &info.volume_path {
         println!("volume path       {}", path.display());
     }
-    println!("size              {} ({} bytes)", human_size(info.size), info.size);
+    println!(
+        "size              {} ({} bytes)",
+        human_size(info.size),
+        info.size
+    );
     println!("sector size       {}", info.sector_size);
     match (info.partition_style.as_deref(), info.partition_number) {
         (Some(style), Some(number)) => println!("partition         {style} partition {number}"),
@@ -1424,7 +1462,11 @@ fn device_info(a: &DeviceInfoArgs) -> Result<()> {
     }
     println!(
         "service partition {}",
-        if info.is_service_partition { "yes" } else { "no" }
+        if info.is_service_partition {
+            "yes"
+        } else {
+            "no"
+        }
     );
     println!(
         "system volume     {}",
@@ -1432,7 +1474,9 @@ fn device_info(a: &DeviceInfoArgs) -> Result<()> {
     );
     println!(
         "filesystem        {}",
-        info.boot_sector_fs.as_deref().unwrap_or("nothing recognisable")
+        info.boot_sector_fs
+            .as_deref()
+            .unwrap_or("nothing recognisable")
     );
     if let Some(ntfs) = &info.ntfs {
         println!("ntfs serial       0x{:08x}", ntfs.serial);
@@ -1443,9 +1487,7 @@ fn device_info(a: &DeviceInfoArgs) -> Result<()> {
         );
         println!(
             "cluster size      {} bytes ({} clusters, {} free)",
-            ntfs.bytes_per_cluster,
-            ntfs.total_clusters,
-            ntfs.free_clusters
+            ntfs.bytes_per_cluster, ntfs.total_clusters, ntfs.free_clusters
         );
         println!(
             "free space        {} ({} bytes)",
@@ -1540,8 +1582,14 @@ fn self_test() -> Result<()> {
         prf.derive(b"vcrs self-test", &salt, 1, &mut again)?;
         prf.derive(b"vcrs self-test!", &salt, 1, &mut other)?;
         anyhow::ensure!(key == again, "{prf}: the derivation is not deterministic");
-        anyhow::ensure!(key != other, "{prf}: a different password gave the same key");
-        anyhow::ensure!(key.iter().any(|byte| *byte != 0), "{prf}: the key is all zero");
+        anyhow::ensure!(
+            key != other,
+            "{prf}: a different password gave the same key"
+        );
+        anyhow::ensure!(
+            key.iter().any(|byte| *byte != 0),
+            "{prf}: the key is all zero"
+        );
         let label = prf.to_string();
         if prf == Prf::Argon2 {
             let (memory_kib, iterations, parallelism) = argon2_params(1);
@@ -1573,7 +1621,11 @@ fn self_test() -> Result<()> {
         anyhow::ensure!(twice == buffer, "{ea}: XTS is not deterministic");
         xts.decrypt(&mut buffer, 7)?;
         anyhow::ensure!(buffer == plain, "{ea}: the XTS round trip changed the data");
-        println!("  {:<26} ok (XTS, {} byte key)", ea.to_string(), ea.key_size() * 2);
+        println!(
+            "  {:<26} ok (XTS, {} byte key)",
+            ea.to_string(),
+            ea.key_size() * 2
+        );
         checks += 1;
     }
 
@@ -1600,7 +1652,8 @@ fn self_test() -> Result<()> {
         };
         let mut header_key = vec![0u8; HEADER_KEY_SIZE];
         prf.derive(b"vcrs self-test", &header.salt, 1, &mut header_key)?;
-        let region = header.encrypt_with_salt(VOLUME_HEADER_SIZE as usize, &header_key, &header.salt)?;
+        let region =
+            header.encrypt_with_salt(VOLUME_HEADER_SIZE as usize, &header_key, &header.salt)?;
         anyhow::ensure!(
             &region[HEADER_ENCRYPTED_DATA_OFFSET..HEADER_ENCRYPTED_DATA_OFFSET + 4] != b"VERA",
             "{ea} + {prf}: the header body is not encrypted"
@@ -1610,7 +1663,10 @@ fn self_test() -> Result<()> {
             "{ea} + {prf}: the magic is not detectable"
         );
         let back = VolumeHeader::decrypt(&region, &header_key, ea, prf)?;
-        anyhow::ensure!(back.master_key == header.master_key, "{ea} + {prf}: the master key was lost");
+        anyhow::ensure!(
+            back.master_key == header.master_key,
+            "{ea} + {prf}: the master key was lost"
+        );
         anyhow::ensure!(
             back.volume_data_size == header.volume_data_size
                 && back.encrypted_area_start == header.encrypted_area_start
@@ -1623,6 +1679,50 @@ fn self_test() -> Result<()> {
 
     println!("all {checks} checks passed");
     Ok(())
+}
+
+/// Detach every iSCSI target vc-rs serves: VeraCrypt's `/dismount` without a
+/// volume unmounts all of its volumes, and this is the same idea for the
+/// targets one or more `vcrs mount` processes are serving.
+#[cfg(windows)]
+fn dismount_all() -> Result<()> {
+    let output = std::process::Command::new("iscsicli")
+        .args(["SessionList", "1"])
+        .output();
+    let targets: Vec<String> = match output {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            parse_sessions(&text)
+                .into_iter()
+                .filter(|s| s.target.starts_with(VCRS_IQN_PREFIX))
+                .map(|s| s.target)
+                .collect()
+        }
+        Ok(output) => {
+            println!(
+                "  iscsicli SessionList failed: {} (it needs an elevated prompt)",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            Vec::new()
+        }
+        Err(err) => {
+            println!("  iscsicli SessionList could not run: {err} (it needs an elevated prompt)");
+            Vec::new()
+        }
+    };
+    if targets.is_empty() {
+        println!("no vc-rs volume is attached");
+        return Ok(());
+    }
+    for target in targets {
+        iscsi_logout(&target)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn dismount_all() -> Result<()> {
+    bail!("detaching every target needs the Microsoft iSCSI Initiator (Windows only)");
 }
 
 /// The initiator identifies a login by its *session id*, not by the target name,
@@ -1642,18 +1742,24 @@ fn iscsi_logout(iqn: &str) -> Result<()> {
                  Remove-PartitionAccessPath -DiskNumber $_.DiskNumber -PartitionNumber $_.PartitionNumber \
                      -AccessPath ($_.DriveLetter + ':\') -ErrorAction SilentlyContinue }; \
              Set-Disk -Number $_.Number -IsOffline $true -ErrorAction SilentlyContinue }";
-        run_tool("releasing the disk", "powershell", &["-NoProfile", "-Command", release]);
+        run_tool(
+            "releasing the disk",
+            "powershell",
+            &["-NoProfile", "-Command", release],
+        );
 
         // 2. log the session out, then 3. forget the static target.
-        match std::process::Command::new("iscsicli").arg("SessionList").arg("1").output() {
+        match std::process::Command::new("iscsicli")
+            .arg("SessionList")
+            .arg("1")
+            .output()
+        {
             Ok(out) => {
                 let text = String::from_utf8_lossy(&out.stdout);
                 match session_id_for_target(&text, iqn) {
-                    Some(id) => run_tool(
-                        "LogoutTarget",
-                        "iscsicli",
-                        &["LogoutTarget", id.as_str()],
-                    ),
+                    Some(id) => {
+                        run_tool("LogoutTarget", "iscsicli", &["LogoutTarget", id.as_str()])
+                    }
                     None => println!("  no session for {iqn} (already logged out?)"),
                 }
             }
@@ -1730,7 +1836,10 @@ fn open_rw(path: &Path, creds: &PasswordArgs, volume_type: Option<VolumeType>) -
 fn parse_ea(s: &str) -> Result<EncryptionAlgorithm> {
     EncryptionAlgorithm::from_name(s).with_context(|| {
         let names: Vec<&str> = EncryptionAlgorithm::ALL.iter().map(|e| e.name()).collect();
-        format!("unknown encryption algorithm {s:?}; known: {}", names.join(", "))
+        format!(
+            "unknown encryption algorithm {s:?}; known: {}",
+            names.join(", ")
+        )
     })
 }
 
@@ -1757,7 +1866,8 @@ fn parse_sector_size(s: &str) -> Result<u32, String> {
 }
 
 /// Parse `123`, `123K`, `64M`, `4G` (binary suffixes).
-fn parse_size(s: &str) -> Result<u64, String> {    let s = s.trim();
+fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
     let (digits, mult) = match s.chars().last() {
         Some('k' | 'K') => (&s[..s.len() - 1], 1024u64),
         Some('m' | 'M') => (&s[..s.len() - 1], 1024 * 1024),
@@ -1765,8 +1875,12 @@ fn parse_size(s: &str) -> Result<u64, String> {    let s = s.trim();
         Some('t' | 'T') => (&s[..s.len() - 1], 1024u64.pow(4)),
         _ => (s, 1),
     };
-    let n: u64 = digits.trim().parse().map_err(|e| format!("invalid size {s:?}: {e}"))?;
-    n.checked_mul(mult).ok_or_else(|| format!("size {s:?} is too large"))
+    let n: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid size {s:?}: {e}"))?;
+    n.checked_mul(mult)
+        .ok_or_else(|| format!("size {s:?} is too large"))
 }
 
 fn parse_hex(s: &str) -> Result<Vec<u8>> {
@@ -1787,7 +1901,11 @@ fn print_header(volume: &Volume, show_master_key: bool) {
     println!("  version           {}", h.version);
     println!("  required min      0x{:04x}", h.required_min_version);
     println!("  volume type       {:?}", h.volume_type);
-    println!("  encryption        {} ({} bytes of key)", h.ea.name(), h.ea.key_size());
+    println!(
+        "  encryption        {} ({} bytes of key)",
+        h.ea.name(),
+        h.ea.key_size()
+    );
     println!("  hash (PRF)        {}", h.prf.name());
     println!("  sector size       {}", h.sector_size);
     println!("  volume data size  {} bytes", h.volume_data_size);
@@ -1798,7 +1916,10 @@ fn print_header(volume: &Volume, show_master_key: bool) {
     println!("  creation time     {}", h.creation_time);
     println!("  modification time {}", h.modification_time);
     println!("  salt              {}", hex(&h.salt));
-    println!("  master key        {}", format_master_key(show_master_key, &h.master_key));
+    println!(
+        "  master key        {}",
+        format_master_key(show_master_key, &h.master_key)
+    );
     println!("layout:");
     println!("  host size         {} bytes", volume.host_size);
     println!("  data offset       {}", volume.data_offset);
@@ -1813,7 +1934,10 @@ fn format_master_key(show: bool, master_key: &[u8]) -> String {
     if show {
         hex(master_key)
     } else {
-        format!("<{} bytes, pass --show-master-key to print>", master_key.len())
+        format!(
+            "<{} bytes, pass --show-master-key to print>",
+            master_key.len()
+        )
     }
 }
 
@@ -1827,7 +1951,11 @@ fn dump_header_region(args: &HeaderArgs) -> Result<()> {
             .context("layout has no backup header")?,
         false => 0,
     };
-    let size = if args.short { VOLUME_HEADER_SIZE_LEGACY } else { VOLUME_HEADER_SIZE };
+    let size = if args.short {
+        VOLUME_HEADER_SIZE_LEGACY
+    } else {
+        VOLUME_HEADER_SIZE
+    };
     let bytes = vcrs_core::volume::read_region(&args.path, base, size as usize)?;
     println!("# {} bytes at offset {base}", bytes.len());
     print_hex_dump(0, &bytes[..VOLUME_HEADER_SIZE_LEGACY as usize]);
@@ -1847,7 +1975,11 @@ fn print_hex_dump(base: u64, data: &[u8]) {
         let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
         let mut ascii = String::new();
         for b in chunk {
-            ascii.push(if (0x20..0x7f).contains(b) { *b as char } else { '.' });
+            ascii.push(if (0x20..0x7f).contains(b) {
+                *b as char
+            } else {
+                '.'
+            });
         }
         println!("{addr:08x}  {:<47}  {ascii}", hex.join(" "));
     }
@@ -1883,9 +2015,7 @@ fn restore_headers(a: &RestoreHeadersArgs) -> Result<()> {
             (Some(size), _) => size,
             (None, VolumeType::Normal) => VolumeLayout::V2Normal
                 .max_data_size(host_size)
-                .with_context(|| {
-                    format!("{} is too small to hold a volume", a.path.display())
-                })?,
+                .with_context(|| format!("{} is too small to hold a volume", a.path.display()))?,
             (None, VolumeType::Hidden) => bail!(
                 "rebuilding a hidden volume's header needs --data-size: its data area does not sit \
                  where an ordinary volume's would"
@@ -2062,8 +2192,56 @@ fn human_size(bytes: u64) -> String {
 mod tests {
     use super::{
         format_master_key, human_size, parse_sector_size, parse_sessions, session_id_for_target,
-        IscsiSession,
+        Cli, Command, IscsiSession,
     };
+    use clap::Parser;
+
+    #[test]
+    fn mount_can_open_the_backup_header() {
+        // VeraCrypt's "Use backup header embedded in volume if available"
+        // (`/mountoption headerbak`), for a container whose primary header is
+        // damaged.
+        let cmd = Cli::parse_from(["vcrs", "mount", "vol.hc", "--backup"]);
+        let Command::Mount(args) = cmd.command else {
+            panic!("expected the mount subcommand")
+        };
+        assert!(args.backup);
+        assert!(!args.read_only);
+
+        let cmd = Cli::parse_from(["vcrs", "mount", "vol.hc"]);
+        let Command::Mount(args) = cmd.command else {
+            panic!("expected the mount subcommand")
+        };
+        assert!(!args.backup, "the primary header is the default");
+    }
+
+    #[test]
+    fn dismount_takes_one_iqn_or_all_of_them() {
+        // `/dismount <letter>` vs `/dismount` in VeraCrypt.
+        let cmd = Cli::parse_from(["vcrs", "dismount", "--iscsi", "iqn.x:y"]);
+        let Command::Dismount(args) = cmd.command else {
+            panic!("expected the dismount subcommand")
+        };
+        assert_eq!(args.iscsi.as_deref(), Some("iqn.x:y"));
+        assert!(!args.all);
+
+        let cmd = Cli::parse_from(["vcrs", "dismount", "--all"]);
+        let Command::Dismount(args) = cmd.command else {
+            panic!("expected the dismount subcommand")
+        };
+        assert!(args.all);
+        assert!(args.iscsi.is_none());
+
+        // bare `--iscsi` still means the default IQN
+        let cmd = Cli::parse_from(["vcrs", "dismount", "--iscsi"]);
+        let Command::Dismount(args) = cmd.command else {
+            panic!("expected the dismount subcommand")
+        };
+        assert_eq!(args.iscsi.as_deref(), Some("iqn.2025-12.io.vcrs:volume"));
+
+        // the two ways of naming targets cannot be combined
+        assert!(Cli::try_parse_from(["vcrs", "dismount", "--all", "--iscsi", "iqn.x:y"]).is_err());
+    }
 
     #[test]
     fn lists_every_session_in_the_list() {
@@ -2131,7 +2309,10 @@ mod tests {
         let key = [0xab, 0xcd];
         assert_eq!(format_master_key(true, &key), "abcd");
         let hidden = format_master_key(false, &key);
-        assert!(!hidden.contains("abcd"), "the key must not appear: {hidden}");
+        assert!(
+            !hidden.contains("abcd"),
+            "the key must not appear: {hidden}"
+        );
         assert!(hidden.contains("2 bytes") && hidden.contains("--show-master-key"));
     }
 

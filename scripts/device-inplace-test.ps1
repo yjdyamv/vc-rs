@@ -18,9 +18,16 @@
         vcrs decrypt-in-place V:      take it back to a plain filesystem
 
     VeraCrypt's own mount of the finished partition is attempted when VeraCrypt
-    is installed; it is reported as SKIPPED when this machine cannot mount
-    anything at all (a security product filtering the volume stack, for
-    instance), and the round trip itself is verified without it.
+    is installed; it is reported as SKIPPED when VeraCrypt is not installed and
+    as CONTROL-FAILED when this machine cannot mount a known-good container
+    either (a security product filtering the volume stack, for instance). The
+    round trip itself is verified either way.
+
+    Note for hosts that surface only one VeraCrypt mount at a time: a second
+    concurrent mount returns success from VeraCrypt but never gets a drive
+    letter, so step 4 dismounts every VeraCrypt volume before it starts, waits
+    for its own exit code instead of trusting `$LASTEXITCODE` of a GUI process,
+    and picks free drive letters instead of hardcoded ones.
 
     Must run elevated: raw device I/O and diskpart need administrator rights.
 
@@ -53,6 +60,9 @@ function Check($name, $ok) {
 }
 function Sha($p) { (Get-FileHash -Algorithm SHA256 $p).Hash.ToLower() }
 function Vol() { "$Letter`:" }
+# a drive letter that exists as a volume (Test-Path fails on a volume Windows could not
+# mount a filesystem on, and VeraCrypt always assigns the letter a moment later)
+function HasLetter($l) { [bool](Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$l`:'" -ErrorAction SilentlyContinue) }
 function FsName() {
     $v = Get-Volume -DriveLetter $Letter -ErrorAction SilentlyContinue
     if ($v) { $v.FileSystem } else { '<none>' }
@@ -69,6 +79,29 @@ function Run([string[]] $argv) {
     $code = $LASTEXITCODE
     $out | ForEach-Object { Say "  $_" }
     return $code
+}
+# VeraCrypt is a GUI process: & returns immediately and $LASTEXITCODE is meaningless,
+# so it is always started with -Wait and its real exit code is returned (0 = mounted).
+function Vc([string[]] $vcArgs) {
+    $p = Start-Process -FilePath $VeraCrypt -ArgumentList $vcArgs -Wait -PassThru
+    return $p.ExitCode
+}
+function VcDismountAll() {
+    Vc @('/dismount', '/quit', '/silent') | Out-Null
+    Start-Sleep -Seconds 3
+}
+# A letter no volume currently uses. Stale HKLM:\SYSTEM\MountedDevices entries are
+# fine -- they do not stop VeraCrypt from assigning the letter.
+function FreeLetter([string[]] $avoid) {
+    $used = @(Get-CimInstance Win32_LogicalDisk -ErrorAction SilentlyContinue |
+        Where-Object { $_.DeviceID -match '^[A-Z]:$' } |
+        ForEach-Object { $_.DeviceID.Substring(0, 1) })
+    foreach ($c in ([int][char]'Z')..([int][char]'D')) {
+        $l = [string][char]$c
+        if (($l -eq $Letter) -or ($avoid -contains $l) -or ($used -contains $l)) { continue }
+        return $l
+    }
+    return $null
 }
 
 if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -169,8 +202,20 @@ Say "  big.bin sha256: $bigBefore"
 
 Say ''
 Say '== step 1: what would be encrypted? =='
-& $Vcrs device-info (Vol) 2>&1 | ForEach-Object { Say "  $_" }
+$info = & $Vcrs device-info (Vol) 2>&1
+$info | ForEach-Object { Say "  $_" }
 Check 'device-info' ($LASTEXITCODE -eq 0)
+
+# the NT device path (\Device\HarddiskVolumeNN) is the form VeraCrypt prefers for a
+# partition; the drive letter is what a human types. Try both.
+$ntPath = $null
+foreach ($line in $info) {
+    foreach ($token in ([string]$line -split '\s+')) {
+        if ($token -like '\Device\*') { $ntPath = $token; break }
+    }
+    if ($ntPath) { break }
+}
+Say "  NT device path: $ntPath"
 
 Say ''
 Say '== step 2: encrypt the partition in place =='
@@ -194,40 +239,72 @@ Check 'info-through-device' ((Run @('info', (Vol), '-p', $Password)) -eq 0)
 Say ''
 Say '== step 4: VeraCrypt mounts the finished partition (optional) =='
 $vcResult = 'SKIPPED'
-if (Test-Path $VeraCrypt) {
-    # control first: can this machine mount anything at all right now?
-    $control = Join-Path $Root 'testdata\smoke.vc'
-    if (Test-Path $control) {
-        & $VeraCrypt /volume $control /letter Y /password PwSmoke /pim 1 /quit /silent | Out-Null
-        Start-Sleep -Seconds 4
-        $controlOk = Test-Path 'Y:\'
-        if ($controlOk) { & $VeraCrypt /dismount Y /quit /silent | Out-Null; Start-Sleep -Seconds 3 }
-        if ($controlOk) {
-            & $VeraCrypt /volume (Vol) /letter Z /password $Password /quit /silent | Out-Null
-            $mounted = $false
-            for ($i = 0; $i -lt 30; $i++) { if (Test-Path 'Z:\') { $mounted = $true; break }; Start-Sleep -Seconds 1 }
-            if ($mounted) {
-                $hello = (Get-Content 'Z:\hello.txt' -Raw -ErrorAction SilentlyContinue)
-                $big = Sha 'Z:\big.bin'
-                Say "  Z:\hello.txt = '$hello'"
-                Check 'veracrypt-mounted-the-partition' $true
-                Check 'veracrypt-read-hello' ($hello -eq 'hello from the device test')
-                Check 'veracrypt-read-big-bin' ($big -eq $bigBefore)
-                & $VeraCrypt /dismount Z /quit /silent | Out-Null
-                Start-Sleep -Seconds 3
-                $vcResult = 'MOUNTED'
-            } else {
-                Check 'veracrypt-mounted-the-partition' $false
-                $vcResult = 'FAILED'
-            }
-        } else {
-            Say '  VeraCrypt cannot mount even testdata\smoke.vc here (exit 1), so its own'
-            Say '  mount of the partition cannot be judged: check for security software'
-            Say '  filtering the volume stack (its driver is: sc query veracrypt) and retry.'
-        }
-    }
-} else {
+if (-not (Test-Path $VeraCrypt)) {
     Say "  VeraCrypt is not installed at $VeraCrypt"
+} else {
+    # start from a clean slate: this host surfaces only the first VeraCrypt mount,
+    # so a leftover volume would eat the partition mount's only slot
+    VcDismountAll
+
+    # control first: can this machine mount anything at all right now?
+    # (testdata\smoke.vc was created with PIM 0 -- the default -- so no /pim here:
+    #  a wrong PIM is indistinguishable from a broken environment, which cost hours once)
+    $control = Join-Path $Root 'testdata\smoke.vc'
+    $controlLetter = $null
+    $controlOk = $false
+    if (Test-Path $control) {
+        $controlLetter = FreeLetter @()
+        if ($controlLetter) {
+            $code = Vc @('/volume', $control, '/letter', $controlLetter, '/password', 'PwSmoke', '/quit', '/silent')
+            for ($i = 0; $i -lt 30; $i++) { if (HasLetter $controlLetter) { $controlOk = $true; break }; Start-Sleep -Seconds 1 }
+            Say ("  control (testdata\smoke.vc on $controlLetter`:): exit={0} mounted={1} after {2}s" -f $code, $controlOk, $i)
+        } else {
+            Say '  no free drive letter for the control volume'
+        }
+    } else {
+        Say "  no control container at $control"
+    }
+
+    if ($controlOk) {
+        # A partition is mounted by device path: VeraCrypt takes the NT name that
+        # `vcrs device-info` reports, or a \\.\X: path. A bare "V:" is not a volume
+        # path for VeraCrypt (it exits 1), so it is not tried.
+        $candidates = @()
+        if ($ntPath) { $candidates += $ntPath }
+        $candidates += "\\.\$Letter`:"
+        $mounted = $false
+        $mountLetter = $null
+        foreach ($candidate in $candidates) {
+            # free the control volume again before each attempt, and clear a failed
+            # attempt before the next candidate: one VeraCrypt mount at a time
+            VcDismountAll
+            $mountLetter = FreeLetter @($controlLetter)
+            if (-not $mountLetter) { Say '  no free drive letter for the mount'; break }
+            Say "  VeraCrypt /volume $candidate /letter $mountLetter ..."
+            $code = Vc @('/volume', $candidate, '/letter', $mountLetter, '/password', $Password, '/quit', '/silent')
+            for ($i = 0; $i -lt 30; $i++) { if (HasLetter $mountLetter) { $mounted = $true; break }; Start-Sleep -Seconds 1 }
+            Say ("    exit={0} mounted={1} after {2}s" -f $code, $mounted, $i)
+            if ($mounted) { break }
+        }
+        if ($mounted) {
+            $hello = (Get-Content "$mountLetter`:\hello.txt" -Raw -ErrorAction SilentlyContinue)
+            $big = if (Test-Path "$mountLetter`:\big.bin") { Sha "$mountLetter`:\big.bin" } else { '<missing>' }
+            Say "  $mountLetter`:\hello.txt = '$hello'"
+            Check 'veracrypt-mounted-the-partition' $true
+            Check 'veracrypt-read-hello' ("$hello".Trim() -eq 'hello from the device test')
+            Check 'veracrypt-read-big-bin' ($big -eq $bigBefore)
+            VcDismountAll
+            $vcResult = 'MOUNTED'
+        } else {
+            Check 'veracrypt-mounted-the-partition' $false
+            $vcResult = 'FAILED'
+        }
+    } elseif ($controlLetter) {
+        Say '  VeraCrypt cannot mount even testdata\smoke.vc here (its own container), so'
+        Say '  its mount of the partition cannot be judged. Check for security software'
+        Say '  filtering the volume stack (its driver is: sc query veracrypt), then retry.'
+        $vcResult = 'CONTROL-FAILED'
+    }
 }
 Say "  VeraCrypt side: $vcResult"
 
