@@ -848,8 +848,21 @@ struct WriteArgs {
 /// real failure.
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    catch_interrupts();
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            if INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
+                // Not a success: a script must not read "done" out of an in-place
+                // run that stopped a third of the way through. Nothing was torn —
+                // the same command again continues from where it stopped.
+                eprintln!(
+                    "vcrs: interrupted — the run is resumable; run the same command again to \
+                     continue"
+                );
+                std::process::exit(INTERRUPTED_EXIT_CODE);
+            }
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("vcrs: error: {e:#}");
             if e.downcast_ref::<attach::Cancelled>().is_some() {
@@ -1493,22 +1506,80 @@ fn describe_device(device: &vcrs_core::Device, action: &str) -> Result<()> {
 /// encryption, driven against a real partition instead of a container file.
 /// A watcher for a long in-place run: a line every five percent, on stderr so a
 /// pipeline's stdout stays what the command meant to say.
-fn watch_progress() -> impl FnMut(u64, u64) {
+///
+/// It also answers whether to carry on, which is how Ctrl-C stops a run without
+/// tearing a chunk in half.
+fn watch_progress() -> impl FnMut(u64, u64) -> vcrs_core::Control {
+    use std::sync::atomic::Ordering;
+
     let mut said = 0u64;
+    let mut told = false;
     let started = std::time::Instant::now();
+    // From here until the process ends, Ctrl-C means "stop at the next chunk",
+    // which the handler only does for these long runs.
+    INTERRUPTIBLE.store(true, Ordering::SeqCst);
     move |done: u64, total: u64| {
-        if total == 0 {
-            return;
+        if total > 0 {
+            let percent = done.saturating_mul(100) / total;
+            if percent >= said + 5 || done == total {
+                said = percent;
+                eprintln!(
+                    "  {done} of {total} bytes ({percent}%), {:.0}s",
+                    started.elapsed().as_secs_f64()
+                );
+            }
         }
-        let percent = done.saturating_mul(100) / total;
-        if percent >= said + 5 || done == total {
-            said = percent;
-            eprintln!(
-                "  {done} of {total} bytes ({percent}%), {:.0}s",
-                started.elapsed().as_secs_f64()
-            );
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            if !told {
+                told = true;
+                eprintln!("  Ctrl-C: finishing this chunk, then stopping (again to give up)");
+            }
+            return vcrs_core::Control::Stop;
         }
+        vcrs_core::Control::Continue
     }
+}
+
+/// Set when the user asked the process to stop; the in-place loops look at it once
+/// per chunk.
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set while a run long enough to be worth stopping politely is in progress. For
+/// anything else Ctrl-C should end the process at once, as it always did.
+static INTERRUPTIBLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What a shell reports for a program ended by SIGINT; an interrupted in-place run
+/// exits with it, because it is not a success (even though it is resumable).
+const INTERRUPTED_EXIT_CODE: i32 = 130;
+
+/// How many times Ctrl-C has been pressed.
+static INTERRUPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Let the first Ctrl-C ask for a clean stop instead of killing the process where
+/// it stands.
+///
+/// A run half way through a chunk has to finish that chunk: an interrupted
+/// in-place run is resumable (its header says where it got to), but a torn chunk
+/// is not. A second Ctrl-C goes to Windows' default handler, which ends the
+/// process at once.
+fn catch_interrupts() {
+    #[cfg(windows)]
+    unsafe {
+        winapi::um::consoleapi::SetConsoleCtrlHandler(Some(interrupted), 1);
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn interrupted(_kind: u32) -> i32 {
+    use std::sync::atomic::Ordering;
+
+    if !INTERRUPTIBLE.load(Ordering::SeqCst) {
+        // Not a long run: let Windows end the process, exactly as before.
+        return 0;
+    }
+    INTERRUPTS.fetch_add(1, Ordering::SeqCst);
+    INTERRUPTED.store(true, Ordering::SeqCst);
+    i32::from(INTERRUPTS.load(Ordering::SeqCst) < 2)
 }
 
 fn encrypt_device(a: &EncryptInPlaceArgs, ea: EncryptionAlgorithm, prf: Prf) -> Result<()> {
@@ -2451,5 +2522,22 @@ mod tests {
             let err = parse_sector_size(bad).expect_err("{bad} should be refused");
             assert!(!err.is_empty());
         }
+    }
+
+    #[test]
+    fn an_interrupt_asks_the_run_to_stop_after_the_chunk() {
+        use std::sync::atomic::Ordering;
+
+        crate::INTERRUPTS.store(0, Ordering::SeqCst);
+        crate::INTERRUPTED.store(false, Ordering::SeqCst);
+        let mut watch = crate::watch_progress();
+        assert_eq!(watch(1024, 2048), vcrs_core::Control::Continue);
+
+        // As the Ctrl-C handler would leave it.
+        crate::INTERRUPTED.store(true, Ordering::SeqCst);
+        assert_eq!(watch(2048, 2048), vcrs_core::Control::Stop);
+
+        crate::INTERRUPTED.store(false, Ordering::SeqCst);
+        assert_eq!(watch(3072, 4096), vcrs_core::Control::Continue);
     }
 }

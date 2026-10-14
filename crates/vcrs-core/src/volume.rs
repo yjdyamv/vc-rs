@@ -64,33 +64,46 @@ pub struct InPlaceState {
     pub remaining: u64,
 }
 
+/// What a [`Watch`] tells the run to do after a chunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Control {
+    /// Carry on with the next chunk.
+    Continue,
+    /// Stop here. The volume is left in the state its header describes, which is
+    /// the resumable state an interrupted run leaves, exactly as with `stop_after`.
+    Stop,
+}
+
 /// A watcher for a long in-place run.
 ///
 /// An in-place transformation takes minutes to hours (a 500 GB volume is hours),
 /// so a caller that wants to show a percentage builds one of these around a
-/// closure and is called back after every [`IN_PLACE_CHUNK_SIZE`] chunk. Everyone
-/// else passes `None`.
+/// closure and is called back after every [`IN_PLACE_CHUNK_SIZE`] chunk. The
+/// callback also answers whether to carry on, which is how a caller stops a run
+/// from the outside (a Ctrl-C handler, say) without tearing a chunk in half.
+/// Everyone else passes `None`.
 pub struct Watch<'a> {
-    callback: &'a mut dyn FnMut(u64, u64),
+    callback: &'a mut dyn FnMut(u64, u64) -> Control,
 }
 
 impl<'a> Watch<'a> {
     /// Watch a run through this callback, which is told the bytes done and the
-    /// total once per chunk.
-    pub fn new(callback: &'a mut dyn FnMut(u64, u64)) -> Self {
+    /// total once per chunk and says whether to go on.
+    pub fn new(callback: &'a mut dyn FnMut(u64, u64) -> Control) -> Self {
         Self { callback }
     }
 
-    /// Tell the watcher how far the run has come.
-    pub fn report(&mut self, done: u64, total: u64) {
-        (self.callback)(done, total);
+    /// Tell the watcher how far the run has come, and ask it what to do next.
+    pub fn report(&mut self, done: u64, total: u64) -> Control {
+        (self.callback)(done, total)
     }
 }
 
 /// Pass the progress on to the caller's watcher, if it wanted one.
-fn report(progress: Option<&mut Watch<'_>>, done: u64, total: u64) {
-    if let Some(watch) = progress {
-        watch.report(done, total);
+fn report(progress: Option<&mut Watch<'_>>, done: u64, total: u64) -> Control {
+    match progress {
+        Some(watch) => watch.report(done, total),
+        None => Control::Continue,
     }
 }
 
@@ -1413,7 +1426,9 @@ pub fn encrypt_in_place_stopping_after(
         since_update += chunk;
         header.encrypted_area_start = data_offset;
         header.encrypted_area_length = encrypted_length;
-        report(progress.as_mut(), encrypted_length, data_size);
+        if report(progress.as_mut(), encrypted_length, data_size) == Control::Stop {
+            break;
+        }
 
         if since_update >= IN_PLACE_HEADER_UPDATE_INTERVAL || encrypted_length == data_size {
             // VeraCrypt's FastVolumeHeaderUpdate: same salt and key, new lengths.
@@ -1644,7 +1659,9 @@ pub fn decrypt_in_place_stopping_after(
         since_update += chunk;
         header.encrypted_area_start = start;
         header.encrypted_area_length = remaining;
-        report(progress.as_mut(), processed, total);
+        if report(progress.as_mut(), processed, total) == Control::Stop {
+            break;
+        }
 
         if since_update >= IN_PLACE_HEADER_UPDATE_INTERVAL || remaining == 0 {
             // VeraCrypt's FastVolumeHeaderUpdate: same salt and key, new lengths.
@@ -1991,7 +2008,9 @@ pub fn encrypt_device_in_place(
             .map_err(|e| device_io_error("writing the device", dest, e))?;
         start = dest;
         done += chunk;
-        report(progress.as_mut(), done, total);
+        if report(progress.as_mut(), done, total) == Control::Stop {
+            break;
+        }
         if done - last_update >= IN_PLACE_HEADER_UPDATE_INTERVAL || done == total {
             // VeraCrypt's FastVolumeHeaderUpdate: the same salt and key, so the
             // run can be resumed from the backup header at any point.
@@ -2124,7 +2143,9 @@ pub fn decrypt_device_in_place(
         write_all_at(file, start - VOLUME_HEADER_GROUP_SIZE, &buffer).map_err(Error::Io)?;
         start += chunk;
         done -= chunk;
-        report(progress.as_mut(), total - done, total);
+        if report(progress.as_mut(), total - done, total) == Control::Stop {
+            break;
+        }
         if last_update - done >= IN_PLACE_HEADER_UPDATE_INTERVAL || done == 0 {
             header.encrypted_area_start = start;
             header.encrypted_area_length = done;

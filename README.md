@@ -399,8 +399,11 @@ the terminal it was started from, instead of handing that half to a detached cop
 itself (which is what lets `vcrs mount --letter` give your prompt straight back).
 
 The exit code says what happened, on Windows' terms: `0` it worked, `1` it did not, `2`
-the command line was wrong (clap), and `1223` — Windows' `ERROR_CANCELLED` — the
-elevation prompt was declined, so a script can tell the user's "no" from a real failure.
+the command line was wrong (clap), `1223` — Windows' `ERROR_CANCELLED` — the
+elevation prompt was declined, so a script can tell the user's "no" from a real failure,
+and `130` — the shell's number for SIGINT — an in-place run the user stopped with Ctrl-C.
+That last one is not a success even though it is resumable, so a script does not read
+"done" out of a run that stopped a third of the way through.
 
 Five things to know:
 
@@ -487,7 +490,17 @@ Long runs say where they are: `encrypt-in-place` and `decrypt-in-place` (the par
 forms too) print a line every five percent — `  20971520 of 50069504 bytes (41%), 3s` — on
 **stderr**, so a script's stdout stays what the command meant to say. The core passes that
 out through `vcrs_core::Watch` (`Watch::new(&mut |done, total| …)`, then `Some(&mut watch)`
-to the call), which is also what a GUI drives a progress bar with.
+to the call), which is also what a GUI drives a progress bar with — the callback answers
+`Control::Continue` or `Control::Stop`, so the stop travels the same channel as the
+progress.
+
+Ctrl-C stops one of those runs at a **chunk boundary**, never half way through one
+(`IN_PLACE_CHUNK_SIZE` is 2 MiB, so the wait is well under a second): the first press asks
+for a clean stop and prints `paused: …` with the hint to run the same command again, a
+second press goes to Windows' own handler and ends the process where it stands — which can
+leave the chunk it was in the middle of half written, so the first press is the one to use.
+A run stopped that way exits `130`; the header and the data still agree, and the same
+command again carries on from there.
 
 `crates/vcrs-core/tests/in_place.rs` covers the full run, the byte-identical resume and the
 refusal to overwrite a non-zero tail (a plain image's last 128 KiB must be free space, and

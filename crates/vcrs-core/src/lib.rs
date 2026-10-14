@@ -61,7 +61,7 @@ pub use volume::{
     encrypt_device_in_place, encrypt_in_place, encrypt_in_place_stopping_after,
     looks_quick_formatted, read_header_area, read_header_group, restore_headers,
     restore_headers_from_embedded, restore_headers_from_master_key, random_bytes, CreateOptions,
-    DecryptOutcome, DeviceInPlaceOptions, DeviceInPlaceOutcome, InPlaceState, OpenOptions,
+    Control, DecryptOutcome, DeviceInPlaceOptions, DeviceInPlaceOutcome, InPlaceState, OpenOptions,
     ProtectedRange, RestoreHeaderOptions, Volume, Watch, IN_PLACE_CHUNK_SIZE,
     IN_PLACE_HEADER_UPDATE_INTERVAL, MIN_IN_PLACE_DATA_SIZE,
 };
