@@ -415,6 +415,11 @@ pub(crate) fn dismount_volume(letter: char, wait: std::time::Duration) -> Result
     let result = locked.and_then(|()| {
         control(handle, winapi::um::winioctl::FSCTL_DISMOUNT_VOLUME)
             .map_err(|err| err.context(format!("taking the filesystem off {letter}:")))
+            // VeraCrypt's unmount refreshes the volume's properties immediately after the
+            // dismount, and the mount manager needs that to see the volume as gone: without
+            // it the session still counts as "currently being used" when the logout comes,
+            // and the logout is refused.
+            .and_then(|()| control(handle, winapi::um::winioctl::IOCTL_DISK_UPDATE_PROPERTIES))
     });
     unsafe { winapi::um::handleapi::CloseHandle(handle) };
     result
@@ -533,6 +538,20 @@ fn open_disk(number: u32, write: bool) -> Result<winapi::um::winnt::HANDLE> {
 
 /// Whether Windows has this disk offline.
 #[cfg(windows)]
+/// Tell Windows the medium is gone, the way VeraCrypt's unmount does for a device-hosted
+/// volume: our disk is presented as removable, so ejecting it makes the storage stack drop
+/// the disk and its volumes at once. That is what the iSCSI session needs before it can be
+/// logged out — Windows otherwise answers "a device on that session is currently being used"
+/// even after the disk device has been removed from the device tree.
+pub(crate) fn eject_media(number: u32) -> Result<()> {
+    let handle = open_disk(number, true)?;
+    let result = control(handle, winapi::um::winioctl::IOCTL_STORAGE_EJECT_MEDIA);
+    unsafe {
+        winapi::um::handleapi::CloseHandle(handle);
+    }
+    result.map_err(|err| err.context(format!("ejecting the medium of disk {number}")))
+}
+
 pub(crate) fn disk_is_offline(number: u32) -> Result<bool> {
     let handle = open_disk(number, false)?;
     let mut attributes = GetDiskAttributes {

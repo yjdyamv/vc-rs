@@ -27,6 +27,12 @@ pub(crate) const VCRS_IQN_PREFIX: &str = "iqn.2025-12.io.vcrs:";
 /// How long to wait for Windows to let go of a disk ("<letter>: is in use").
 const RELEASE_WAIT: Duration = Duration::from_secs(2);
 
+/// How long to wait for the disk devices to disappear once they have been removed, so
+/// that the logout that follows sees a storage stack Windows is done with. The removal
+/// is asynchronous: `pnputil` returns, the device goes off the list, and only then can
+/// the session go.
+const DEVICE_WAIT: Duration = Duration::from_secs(4);
+
 /// How long to wait for whatever has the volume open to close it, so that the
 /// filesystem can be taken off and the session logged out. The lock succeeds at
 /// once on a volume nobody is using, so this only costs time when it really is in
@@ -529,6 +535,12 @@ fn release(
         if let Err(err) = win32::set_disk_offline(*number, true) {
             report.line(&format!("  could not take disk {number} offline: {err:#}"));
         }
+        // Eject the medium the way VeraCrypt's unmount does: the disk is presented as
+        // removable, so this makes the storage stack drop the disk and its volumes —
+        // and it must happen while the target is still serving them.
+        if let Err(err) = win32::eject_media(*number) {
+            report.line(&format!("  could not eject disk {number}: {err:#}"));
+        }
     }
 
     // Windows acts on that a moment later, so the letters are asked for again until
@@ -580,6 +592,30 @@ fn release(
                         device.instance_id
                     )),
                 }
+            }
+            // Windows removes the device a moment after `pnputil` returns. Waiting for
+            // the list to come back empty is what the logout needs: while Windows still
+            // holds a device of this session, the session is "currently being used".
+            let deadline = std::time::Instant::now() + DEVICE_WAIT;
+            loop {
+                match win32::disk_devices(attach::DISK_NAME) {
+                    Ok(devices) if devices.is_empty() => break,
+                    Ok(devices) => {
+                        if std::time::Instant::now() >= deadline {
+                            report.line(&format!(
+                                "  {} vc-rs disk device(s) are still listed",
+                                devices.len()
+                            ));
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(250));
             }
         }
         Err(err) => report.line(&format!("  could not list the disk devices: {err:#}")),
@@ -649,7 +685,10 @@ fn target_disks(target: &Target, disks: &[DiskInfo]) -> Result<Vec<u32>> {
 /// so a refusal is about timing, not about the request. A session whose target is
 /// already gone comes back as "already logged out", which is the outcome wanted.
 fn logout(session: &Session, report: &mut Report) -> bool {
-    for attempt in 0..3 {
+    // Six tries with 800 ms between them: Windows finishes dropping the device a moment
+    // after `pnputil` returns, and until it has, the session answers "currently being
+    // used" — which is a state that passes, not a failure to report.
+    for attempt in 0..6 {
         match attach::iscsicli(&["LogoutTarget", session.id.as_str()]) {
             Ok(_) => {
                 report.line(&format!("logged out {} ({})", session.iqn, session.id));
@@ -662,7 +701,7 @@ fn logout(session: &Session, report: &mut Report) -> bool {
                     return true;
                 }
                 let busy = text.contains("currently being used");
-                if !busy || attempt == 2 {
+                if !busy || attempt == 5 {
                     report.line(&format!("could not log out {}: {text}", session.iqn));
                     return false;
                 }
@@ -698,7 +737,8 @@ fn clear_leftover_sessions(out: &mut Detached, refused: &[Session], report: &mut
     if left > 0 {
         out.notes.push(format!(
             "{left} vc-rs session(s) are still logged in: Windows would not let them go while the \
-             volume was in use; mounting that volume again clears the leftover"
+             volume was in use (something inside it was still open); mounting that volume again \
+             clears the leftover"
         ));
     }
 }
