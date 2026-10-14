@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 vcrs-core = { path = "../vcrs-core" }
 vcrs-mount = { path = "../vcrs-mount" }
+vcrs-host = { path = "../vcrs-host" }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 log.workspace = true

@@ -34,7 +34,8 @@ iSCSI 发起程序（加 `--letter S` 就在同一条命令里挂到指定盘符
 | --- | --- |
 | `crates/vcrs-core` | The format: header serialization/encryption, KDFs, XTS mode, volume create/open, data I/O. No platform dependencies. |
 | `crates/vcrs-mount` | Mount layer: FAT formatting inside the volume, plus an iSCSI target that presents the decrypted data area to Windows as a raw disk (any filesystem Windows supports). |
-| `crates/vcrs-cli` | The `vcrs` command line tool. |
+| `crates/vcrs-host` | The Windows half of hosting: putting a served volume on a drive letter (the iSCSI login, the wait for the disk, the letter, the flush and the logout), the background server that keeps serving after the prompt comes back, and the cached elevated agent behind both — callable in-process, which is what a GUI would use. |
+| `crates/vcrs-cli` | The `vcrs` command line tool: a clap front end over `vcrs-host`. |
 | `docs/` | Design notes: `mounting-options.md` (why iSCSI, what the alternatives were), `device-in-place.md` (VeraCrypt's `/encdev` and what Windows plumbing it needs). |
 | `docs/research` | Notes taken while reading the VeraCrypt sources (format layout, keyfiles, Dokan capabilities, Botan API). |
 | `vendor/iscsi-target` | Local fork of the iSCSI target crate with Microsoft-initiator fixes (`PATCHES.md` documents each one). |

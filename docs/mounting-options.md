@@ -140,10 +140,10 @@ request through a named pipe specified with `-f`”，参考实现是仓库里�
 
 方案 A **已实现并验证，是唯一的挂载后端**，实现在 `crates/vcrs-mount/src/iscsi.rs`
 （CLI：`vcrs mount` / `vcrs dismount --iscsi <iqn>`）。发起程序那一半（把 target 登录进来、
-并把磁盘放到指定盘符）在 `crates/vcrs-cli/src/attach.rs`：`vcrs mount --letter S` 一条命令
+并把磁盘放到指定盘符）在 `crates/vcrs-host/src/attach.rs`：`vcrs mount --letter S` 一条命令
 做完“服务 + 挂载”，`vcrs attach` 单独执行挂载那一半（`iscsicli` 带 requireAdministrator
 清单，所以这一步必须提权，`vcrs mount --letter` 会自己弹一次 UAC）。提权**十分钟只弹一次**：
-第一次提权的那次运行会留下一个 agent（`crates/vcrs-cli/src/agent.rs`，一个无窗口的
+第一次提权的那次运行会留下一个 agent（`crates/vcrs-host/src/agent.rs`，一个无窗口的
 `vcrs agent --serve`，用命名管道收活），之后十分钟内的 `vcrs mount --letter` /
 `vcrs dismount` 都交给它，不再弹 UAC，也不会在卸载过程中闪出提权窗口；
 `vcrs agent --status` / `--stop` 可以查看或提前放它走。
@@ -159,7 +159,7 @@ request through a named pipe specified with `-f`”，参考实现是仓库里�
 注销会话。少了这一步，卷一旦在用，Windows 就会用 “The session cannot be logged out since a
 device on that session is currently being used.” 拒绝登出，留下只能靠下次挂载清理的残留会话。
 
-盘符、磁盘离线、设备卸载这些步骤已经全部改成直接调 Win32（`crates/vcrs-cli/src/win32.rs`：
+盘符、磁盘离线、设备卸载这些步骤已经全部改成直接调 Win32（`crates/vcrs-host/src/win32.rs`：
 SCM 服务、`IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS`、`SetVolumeMountPointW` /
 `DeleteVolumeMountPointW`、`IOCTL_DISK_SET_DISK_ATTRIBUTES`、setupapi + `pnputil`、
 `iscsicli` 列会话），不再为每一件小事起一个 PowerShell（每次启动 PowerShell 固定要

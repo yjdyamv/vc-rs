@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/vcrs-core", "crates/vcrs-cli", "crates/vcrs-mount"]
+members = ["crates/vcrs-core", "crates/vcrs-cli", "crates/vcrs-host", "crates/vcrs-mount"]
 
 [workspace.package]
 version = "0.1.0"

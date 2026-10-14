@@ -866,6 +866,7 @@ dependencies = [
  "serde",
  "serde_json",
  "vcrs-core",
+ "vcrs-host",
  "vcrs-mount",
  "winapi",
 ]
@@ -880,6 +881,19 @@ dependencies = [
  "log",
  "thiserror 2.0.21",
  "zeroize",
+]
+
+[[package]]
+name = "vcrs-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+ "serde",
+ "serde_json",
+ "vcrs-core",
+ "vcrs-mount",
+ "winapi",
 ]
 
 [[package]]
