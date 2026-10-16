@@ -208,6 +208,36 @@ fn a_plain_image_is_not_decrypted() {
     std::fs::remove_file(path).ok();
 }
 
+/// An in-place image needs room for *two* header groups. The check has to run
+/// before the size arithmetic does: an image of 128..256 KiB used to overflow
+/// `file_size - 2 * header group` and abort instead of reporting a bad image.
+#[test]
+fn an_image_smaller_than_two_header_groups_is_refused() {
+    for size in [HEADER_GROUP, HEADER_GROUP + 512, 2 * HEADER_GROUP - 512] {
+        let path = std::env::temp_dir().join(format!("vcrs-inplace-small-{size}.hc"));
+        std::fs::write(&path, vec![0u8; size as usize]).unwrap();
+        let err = encrypt_in_place(
+            &path,
+            PASSWORD,
+            PIM,
+            EncryptionAlgorithm::Aes,
+            Prf::Sha512,
+            None,
+        )
+        .expect_err("an image this small cannot hold two header groups");
+        assert!(
+            err.to_string().contains("at least 262144 bytes"),
+            "unexpected error for a {size} byte image: {err}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            size,
+            "the refused image has to be left untouched"
+        );
+        std::fs::remove_file(path).ok();
+    }
+}
+
 #[test]
 fn a_container_survives_a_decryption_round_trip() {
     let (path, image) = plain_image("vcrs-inplace-roundtrip.hc", 7);

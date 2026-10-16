@@ -897,7 +897,7 @@ impl Volume {
         let new_data_size = layout
             .max_data_size(new_host_size)
             .ok_or_else(|| Error::InvalidParameter("the new host is too small".into()))?;
-        if new_data_size < self.data_size + MIN_EXPAND_BYTES {
+        if new_data_size < self.data_size.saturating_add(MIN_EXPAND_BYTES) {
             return Err(Error::InvalidParameter(format!(
                 "a container has to grow by at least {MIN_EXPAND_BYTES} bytes of data area \
                  (old data area {}, requested {new_data_size})",
@@ -947,7 +947,7 @@ impl Volume {
         //    so no stale, decryptable header survives.
         wipe_region(
             &self.file,
-            old_host_size - VOLUME_HEADER_GROUP_SIZE,
+            old_host_size.saturating_sub(VOLUME_HEADER_GROUP_SIZE),
             VOLUME_HEADER_GROUP_SIZE,
         )?;
 
@@ -1375,6 +1375,16 @@ pub fn encrypt_in_place_stopping_after(
             "the image must be at least {VOLUME_HEADER_GROUP_SIZE} bytes, got {file_size}"
         ))
     })?;
+    // Both header groups have to fit: while the run is going on the backup one
+    // sits at the end of the image, and once it finishes the primary one takes
+    // the first 128 KiB of what is now the data area. Without this an image of
+    // 128..256 KiB would overflow the `file_size - 2 * group` below.
+    if file_size < TOTAL_VOLUME_HEADERS_SIZE {
+        return Err(Error::InvalidParameter(format!(
+            "the image must be at least {TOTAL_VOLUME_HEADERS_SIZE} bytes so that the primary and \
+             the backup header group both fit, got {file_size}"
+        )));
+    }
     let create_options = CreateOptions {
         ea,
         prf,
@@ -1699,7 +1709,7 @@ pub fn decrypt_in_place_stopping_after(
     let data_size = header.volume_data_size;
     let mut start = header.encrypted_area_start;
     let mut remaining = header.encrypted_area_length;
-    let image_size = data_size + VOLUME_HEADER_GROUP_SIZE;
+    let image_size = data_size.saturating_add(VOLUME_HEADER_GROUP_SIZE);
     if remaining > data_size || start < VOLUME_HEADER_GROUP_SIZE || start.saturating_add(remaining) != image_size {
         return Err(Error::InvalidParameter(format!(
             "{} reports an inconsistent in-place encrypted area (start {start}, length {remaining}, \
@@ -1976,7 +1986,7 @@ pub fn encrypt_device_in_place(
     let password = Zeroizing::new(options.effective_password(Some(&info.path))?);
     let mut random = options.random_supply()?;
 
-    let backup_offset = device_size - VOLUME_HEADER_GROUP_SIZE;
+    let backup_offset = info.backup_header_offset();
     let mut region = vec![0u8; VOLUME_HEADER_SIZE as usize];
     read_exact_at(file, backup_offset, &mut region)
         .map_err(|e| device_io_error("reading the backup header", backup_offset, e))?;
@@ -2256,7 +2266,7 @@ pub fn decrypt_device_in_place(
     let file = device.file();
     let password = Zeroizing::new(options.effective_password(Some(&info.path))?);
 
-    let backup_offset = device_size - VOLUME_HEADER_GROUP_SIZE;
+    let backup_offset = info.backup_header_offset();
     let mut region = vec![0u8; VOLUME_HEADER_SIZE as usize];
     read_exact_at(file, backup_offset, &mut region).map_err(Error::Io)?;
     let mut header = open_in_place_header(&region, &password, options.pim, options.prf).ok_or(
