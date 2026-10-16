@@ -165,6 +165,16 @@ SCM 服务、`IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS`、`SetVolumeMountPointW` /
 `iscsicli` 列会话），不再为每一件小事起一个 PowerShell（每次启动 PowerShell 固定要
 0.3–0.7 秒，第一次用 Storage 模块还要 2 秒以上）。实测：经 agent 重新挂载约 1.5 秒，卸载
 约 10–11 秒（此前一次挂载/卸载分别是 20–49 秒和 91 秒）。
+
+创建和扩容也走同一套进度：`vcrs create` / `vcrs create-hidden` / `vcrs expand` 在填数据区时每
+5% 往 stderr 打一行，Ctrl-C 会在块边界停下并返回 130（`Interrupted`）。半填充的数据区不是
+VeraCrypt 认可的“已格式化”卷，所以命令会说明这一点、把文件留给用户处理；`expand` 中途停下可以
+安全重跑（新的头部字段只在填充完成后才写入，半长大的文件仍然描述旧尺寸）。实测：192 MiB 全格式化
+create 22 秒，128 MiB 容器扩到 256 MiB 约 13 秒。
+
+给程序用的输出是 `--json`（全局参数）：`vcrs list`（会话/后台服务进程/磁盘快照）、`vcrs info`、
+`vcrs header`、`vcrs test`、`vcrs device-info`。退出码：0 成功、1 失败、2 命令行错、1223 用户拒
+绝提权、130 Ctrl-C 中断。
 `iscsi-target` 1.0.0 以 `vendor/iscsi-target` 打补丁形式引入（补丁说明见
 `vendor/iscsi-target/PATCHES.md`）：
 
