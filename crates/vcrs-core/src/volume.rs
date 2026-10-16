@@ -1700,7 +1700,7 @@ pub fn decrypt_in_place_stopping_after(
     let mut start = header.encrypted_area_start;
     let mut remaining = header.encrypted_area_length;
     let image_size = data_size + VOLUME_HEADER_GROUP_SIZE;
-    if remaining > data_size || start < VOLUME_HEADER_GROUP_SIZE || start + remaining != image_size {
+    if remaining > data_size || start < VOLUME_HEADER_GROUP_SIZE || start.saturating_add(remaining) != image_size {
         return Err(Error::InvalidParameter(format!(
             "{} reports an inconsistent in-place encrypted area (start {start}, length {remaining}, \
              data area {data_size})",
@@ -1895,6 +1895,19 @@ fn slot_has_data(region: &[u8]) -> bool {
     salt.iter().any(|byte| *byte != 0)
 }
 
+/// The start and the length of an in-place encrypted area both come out of the
+/// header, so they have to describe an area that stays inside the data area:
+/// the group at the front belongs to the volume header (the boundary between
+/// the plaintext and the ciphertext never moves past it), the encrypted area
+/// can never be longer than the data area, and the boundary never moves past
+/// the data area's end. Without this a crafted header makes the move loops step
+/// before the start of the device or walk past its end.
+fn in_place_area_is_sane(start: u64, length: u64, data_size: u64) -> bool {
+    start >= VOLUME_HEADER_GROUP_SIZE
+        && start <= VOLUME_HEADER_GROUP_SIZE.saturating_add(data_size)
+        && length <= data_size
+}
+
 fn open_in_place_header(
     region: &[u8],
     password: &[u8],
@@ -1996,7 +2009,13 @@ pub fn encrypt_device_in_place(
                     data_size
                 )));
             }
-            if header
+            // The fields come out of the header, so besides adding up they have
+            // to stay inside the device at all.
+            if !in_place_area_is_sane(
+                header.encrypted_area_start,
+                header.encrypted_area_length,
+                data_size,
+            ) || header
                 .encrypted_area_start
                 .saturating_add(header.encrypted_area_length)
                 != backup_offset
@@ -2260,6 +2279,25 @@ pub fn decrypt_device_in_place(
             info.path.display(),
             header.encrypted_area_length,
             total
+        )));
+    }
+
+    // The loop below reads from `start` and writes to `start -
+    // VOLUME_HEADER_GROUP_SIZE`, so the area has to stay inside the device and
+    // has to be the one this kind of run always leaves behind: the boundary plus
+    // the encrypted part always add up to the header group plus the data area.
+    if !in_place_area_is_sane(
+        header.encrypted_area_start,
+        header.encrypted_area_length,
+        total,
+    ) || header.encrypted_area_start.saturating_add(header.encrypted_area_length)
+        != VOLUME_HEADER_GROUP_SIZE.saturating_add(total)
+    {
+        return Err(Error::InvalidParameter(format!(
+            "{} reports an inconsistent in-place encrypted area (start {}, length {}, data area {total})",
+            info.path.display(),
+            header.encrypted_area_start,
+            header.encrypted_area_length
         )));
     }
 
@@ -3241,8 +3279,8 @@ pub fn looks_quick_formatted(path: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::slot_has_data;
-    use crate::header::HEADER_SALT_SIZE;
+    use super::{in_place_area_is_sane, slot_has_data};
+    use crate::header::{HEADER_SALT_SIZE, VOLUME_HEADER_GROUP_SIZE};
 
     #[test]
     fn an_empty_slot_has_no_data() {
@@ -3267,6 +3305,36 @@ mod tests {
         let mut region = vec![0u8; HEADER_SALT_SIZE * 2];
         region[HEADER_SALT_SIZE] = 0xff;
         assert!(!slot_has_data(&region));
+    }
+
+    #[test]
+    fn an_in_place_area_has_to_stay_inside_the_device() {
+        let data_size = 8 * VOLUME_HEADER_GROUP_SIZE;
+        // A fresh run starts at the boundary behind the data area and has
+        // encrypted nothing yet.
+        assert!(in_place_area_is_sane(
+            data_size + VOLUME_HEADER_GROUP_SIZE,
+            0,
+            data_size
+        ));
+        // A finished run covers the whole data area and starts right after the
+        // header group.
+        assert!(in_place_area_is_sane(
+            VOLUME_HEADER_GROUP_SIZE,
+            data_size,
+            data_size
+        ));
+        // Everything else would make the loops step before the start of the
+        // device or walk past its end.
+        assert!(!in_place_area_is_sane(0, VOLUME_HEADER_GROUP_SIZE, data_size));
+        assert!(!in_place_area_is_sane(VOLUME_HEADER_GROUP_SIZE - 1, 1, data_size));
+        assert!(!in_place_area_is_sane(VOLUME_HEADER_GROUP_SIZE, data_size + 1, data_size));
+        assert!(!in_place_area_is_sane(
+            VOLUME_HEADER_GROUP_SIZE + data_size + 1,
+            0,
+            data_size
+        ));
+        assert!(!in_place_area_is_sane(u64::MAX, 1, data_size));
     }
 }
 
