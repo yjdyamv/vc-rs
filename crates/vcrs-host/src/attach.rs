@@ -1191,6 +1191,20 @@ pub fn validate_portal(address: &str) -> Result<()> {
 }
 
 fn split_address(address: &str) -> (String, u16) {
+    // A bare IPv6 address is nothing but colons, so `rsplit_once(':')` would read its
+    // last group as the port: `--address ::1` used to come out as the host `::` (every
+    // interface) and the port `1`.  A string that parses as an address in full is
+    // therefore an address without a port, in the bare form and in the bracketed form
+    // with the port left out.  An address *with* a port stays unambiguous only when
+    // the brackets are there (`[::1]:3260`), which is what the RFCs require.
+    let bare = address.trim();
+    let unbracketed = bare
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(bare);
+    if let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() {
+        return (ip.to_string(), 3260);
+    }
     match address.rsplit_once(':') {
         Some((host, port)) => match port.parse() {
             Ok(port) => (host.trim_matches(['[', ']']).to_string(), port),
@@ -1367,6 +1381,9 @@ mod tests {
         assert!(validate_portal("127.0.0.1:3260").is_ok());
         assert!(validate_portal("127.0.0.1").is_ok());
         assert!(validate_portal("[::1]:3260").is_ok());
+        // A bare or bracket-only IPv6 address carries no port, which is fine.
+        assert!(validate_portal("::1").is_ok());
+        assert!(validate_portal("[::1]").is_ok());
         assert!(validate_portal("iscsi.example.com").is_ok());
         // The old injection, and assorted nonsense.
         assert!(validate_portal("127.0.0.1 & calc").is_err());
@@ -1388,6 +1405,12 @@ mod tests {
         );
         assert_eq!(split_address("127.0.0.1"), ("127.0.0.1".to_string(), 3260));
         assert_eq!(split_address("[::1]:3260"), ("::1".to_string(), 3260));
+        // A bare or bracket-only IPv6 address has no port in it: reading its last
+        // group as one would make `::1` mean the host `::` and the port `1`.
+        assert_eq!(split_address("::1"), ("::1".to_string(), 3260));
+        assert_eq!(split_address("[::1]"), ("::1".to_string(), 3260));
+        assert_eq!(split_address("fe80::1"), ("fe80::1".to_string(), 3260));
+        assert_eq!(split_address("::"), ("::".to_string(), 3260));
     }
 
     #[test]
