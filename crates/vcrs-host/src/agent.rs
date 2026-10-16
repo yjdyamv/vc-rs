@@ -244,6 +244,12 @@ mod pipe {
     /// The agent reads a request line; a few kilobytes is generous.
     const BUFFER: usize = 64 * 1024;
 
+    /// The longest request the agent will read off the pipe. The pipe is writable
+    /// by anything running as this user, and the reader used to grow a buffer
+    /// until it saw a newline — so one caller that never sends one could pin the
+    /// memory of the elevated process. A real request is a handful of paths.
+    const MAX_REQUEST: usize = 64 * 1024;
+
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(std::iter::once(0)).collect()
     }
@@ -489,6 +495,12 @@ mod pipe {
             bytes.extend_from_slice(&buffer[..read as usize]);
             if bytes.contains(&b'\n') {
                 break;
+            }
+            if bytes.len() > MAX_REQUEST {
+                anyhow::bail!(
+                    "the request on the agent pipe is over {MAX_REQUEST} bytes and has no newline; \
+                     refusing it"
+                );
             }
         }
         Ok(String::from_utf8_lossy(&bytes).trim().to_string())

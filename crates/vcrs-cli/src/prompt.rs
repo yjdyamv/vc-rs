@@ -7,7 +7,7 @@
 //! is not a terminal the old refusal is kept instead, so a script that forgot a
 //! password fails rather than waiting forever.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 /// Ask for a password, or fail with `missing` when there is nobody to ask.
 pub fn password(missing: &str) -> Result<Vec<u8>> {
@@ -35,6 +35,33 @@ pub fn new_password(missing: &str) -> Result<Vec<u8>> {
         anyhow::bail!("the two passwords differ");
     }
     Ok(first)
+}
+
+/// Read a secret that is not a password — a master key, in hex — from a pipe or
+/// from the terminal with the echo off. Unlike a password this has to be
+/// readable from a pipe, because keeping it out of the process list is the whole
+/// point of the flag.
+pub fn secret_line(label: &str, missing: &str) -> Result<String> {
+    let text = if at_a_terminal() {
+        use std::io::Write as _;
+        eprint!("{label}");
+        std::io::stderr().flush().ok();
+        let text = read_hidden()?;
+        eprintln!();
+        text
+    } else {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .context("reading the value from standard input")?;
+        line.trim_end_matches(['\r', '\n']).to_string()
+    };
+    if text.is_empty() {
+        anyhow::bail!("{missing}");
+    }
+    Ok(text)
 }
 
 fn ask(label: &str) -> Result<Vec<u8>> {

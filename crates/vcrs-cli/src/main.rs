@@ -696,7 +696,7 @@ struct BackupHeadersArgs {
 
 /// Restores a header from one of the three sources.
 #[derive(Args)]
-#[command(group = clap::ArgGroup::new("source").required(true).args(["from", "embedded", "master_key"]))]
+#[command(group = clap::ArgGroup::new("source").required(true).args(["from", "embedded", "master_key", "master_key_stdin"]))]
 struct RestoreHeadersArgs {
     /// Volume file whose header is restored.
     path: PathBuf,
@@ -711,10 +711,15 @@ struct RestoreHeadersArgs {
     /// header copy is lost. The data area itself is untouched.
     #[arg(long, value_name = "HEX")]
     master_key: Option<String>,
+    /// Read the master key, in hex, from standard input instead of the command
+    /// line. Anything that can read this process's command line can read the key,
+    /// and the master key opens the data area on its own.
+    #[arg(long, conflicts_with = "master_key")]
+    master_key_stdin: bool,
     /// Size of the volume's data area when rebuilding from a master key. An
     /// ordinary volume's data area is `container size - 262144` and is computed
     /// automatically; a hidden volume's has to be given here.
-    #[arg(long, value_name = "SIZE", value_parser = parse_size, requires = "master_key")]
+    #[arg(long, value_name = "SIZE", value_parser = parse_size)]
     data_size: Option<u64>,
     /// Encryption algorithm the master key belongs to.
     #[arg(long, default_value = "AES")]
@@ -1166,7 +1171,7 @@ fn run() -> Result<()> {
             let mut buf = vec![0u8; a.length as usize];
             volume.read_data(a.offset, &mut buf)?;
             if let Some(out) = a.out {
-                std::fs::write(&out, &buf)?;
+                write_private(&out, &buf)?;
                 println!("wrote {} bytes to {}", buf.len(), out.display());
             } else {
                 print_hex_dump(a.offset, &buf);
@@ -2021,7 +2026,7 @@ fn create_keyfile(a: &CreateKeyfileArgs) -> Result<()> {
         }
         None => vcrs_core::random_bytes(KEYFILE_SIZE)?,
     };
-    std::fs::write(&a.path, &bytes)
+    write_private(&a.path, &bytes)
         .with_context(|| format!("writing the keyfile {}", a.path.display()))?;
     println!(
         "wrote a {KEYFILE_SIZE} byte keyfile to {}",
@@ -2512,6 +2517,30 @@ fn parse_size(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("size {s:?} is too large"))
 }
 
+/// Write a file that only its owner can read, where the platform has modes.
+///
+/// A keyfile and a `read --out` dump are as sensitive as the password that goes
+/// with them, so the umask of whatever shell or service started `vcrs` should not
+/// decide who else gets to read them. An existing file keeps the mode it has.
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
 fn parse_hex(s: &str) -> Result<Vec<u8>> {
     let s = s.trim().trim_start_matches("0x");
     if s.len() % 2 != 0 {
@@ -2698,7 +2727,33 @@ fn default_header_backup_path(path: &Path) -> PathBuf {
 fn restore_headers(a: &RestoreHeadersArgs) -> Result<()> {
     let volume_type = a.kind.volume_type().unwrap_or(VolumeType::Normal);
 
-    if let Some(key) = &a.master_key {
+    if a.data_size.is_some() && a.master_key.is_none() && !a.master_key_stdin {
+        bail!(
+            "--data-size says how big the volume's data area was, so it only means something \
+             together with --master-key or --master-key-stdin"
+        );
+    }
+
+    // The master key opens the data area on its own, so the command line is the
+    // worst place to put it: any process that can read this one's command line
+    // (Task Manager, WMI, an audit log) gets the volume with it.
+    let master_key = match (&a.master_key, a.master_key_stdin) {
+        (Some(key), _) => {
+            eprintln!(
+                "warning: --master-key puts the master key in this process's command line, where\n  \
+                 any process that can read it sees it, and in the shell's history. Use\n  \
+                 --master-key-stdin to read it from a pipe or from the terminal without echo."
+            );
+            Some(key.clone())
+        }
+        (None, true) => Some(prompt::secret_line(
+            "Master key (hex, not shown): ",
+            "no master key was given",
+        )?),
+        (None, false) => None,
+    };
+
+    if let Some(key) = &master_key {
         let master_key = parse_hex(key)?;
         let host_size = std::fs::metadata(&a.path)
             .with_context(|| format!("reading {}", a.path.display()))?
@@ -2746,7 +2801,7 @@ fn restore_headers(a: &RestoreHeadersArgs) -> Result<()> {
     } else if a.embedded {
         vcrs_core::restore_headers_from_embedded(&a.path, volume_type, verify.as_ref())?
     } else {
-        bail!("pass --from <FILE>, --embedded or --master-key <HEX>")
+        bail!("pass --from <FILE>, --embedded, --master-key <HEX> or --master-key-stdin")
     };
 
     match volume {
@@ -2884,6 +2939,35 @@ fn human_size(bytes: u64) -> String {
 mod tests {
     use super::{format_master_key, human_size, parse_sector_size, Cli, Command};
     use clap::Parser;
+
+    #[test]
+    fn the_master_key_can_come_from_stdin() {
+        // The master key opens the data area on its own, so it should not have to
+        // be typed into the process list.
+        let cmd = Cli::parse_from(["vcrs", "restore-headers", "vol.hc", "--master-key-stdin"]);
+        let Command::RestoreHeaders(args) = cmd.command else {
+            panic!("expected the restore-headers subcommand")
+        };
+        assert!(args.master_key_stdin && args.master_key.is_none());
+
+        let cmd = Cli::parse_from(["vcrs", "restore-headers", "vol.hc", "--master-key", "00ff"]);
+        let Command::RestoreHeaders(args) = cmd.command else {
+            panic!("expected the restore-headers subcommand")
+        };
+        assert_eq!(args.master_key.as_deref(), Some("00ff"));
+
+        // One source is required, and the two spellings of the master key do not mix.
+        assert!(Cli::try_parse_from(["vcrs", "restore-headers", "vol.hc"]).is_err());
+        assert!(Cli::try_parse_from([
+            "vcrs",
+            "restore-headers",
+            "vol.hc",
+            "--master-key",
+            "00ff",
+            "--master-key-stdin"
+        ])
+        .is_err());
+    }
 
     #[test]
     fn mount_can_open_the_backup_header() {

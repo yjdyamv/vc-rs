@@ -219,7 +219,12 @@ fn is_hidden(_metadata: &std::fs::Metadata) -> bool {
 fn is_same_file(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
-        _ => false,
+        // When a name cannot be resolved (a dangling link, a path the process may
+        // not traverse) the two spellings still compare equal as written. This is
+        // the direction that keeps the container from being read back as its own
+        // keyfile; an unresolvable *keyfile* side is left to the read that follows,
+        // which reports the real error.
+        _ => a == b,
     }
 }
 
