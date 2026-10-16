@@ -1188,12 +1188,23 @@ fn run() -> Result<()> {
         Command::Header(a) => dump_header_region(&a, json),
         Command::Read(a) => {
             let volume = open_ro(&a.path, &a.password, a.kind.volume_type())?;
-            let mut buf = vec![0u8; a.length as usize];
-            volume.read_data(a.offset, &mut buf)?;
+            check_read_range(volume.data_size, a.offset, a.length)?;
             if let Some(out) = a.out {
-                write_private(&out, &buf)?;
-                println!("wrote {} bytes to {}", buf.len(), out.display());
+                use std::io::Write as _;
+                let mut sink = std::io::BufWriter::new(create_private(&out)?);
+                let mut buf = vec![0u8; READ_CHUNK];
+                let mut done = 0u64;
+                while done < a.length {
+                    let want = std::cmp::min(READ_CHUNK as u64, a.length - done) as usize;
+                    volume.read_data(a.offset + done, &mut buf[..want])?;
+                    sink.write_all(&buf[..want])?;
+                    done += want as u64;
+                }
+                sink.flush()?;
+                println!("wrote {} bytes to {}", a.length, out.display());
             } else {
+                let mut buf = vec![0u8; a.length as usize];
+                volume.read_data(a.offset, &mut buf)?;
                 print_hex_dump(a.offset, &buf);
             }
             Ok(())
@@ -1761,6 +1772,11 @@ fn run() -> Result<()> {
 /// The keyfiles VeraCrypt writes are `VolumePassword::MaxSize` = 128 bytes of
 /// random data (see `CoreBase::CreateKeyfile` in src/Core/CoreBase.cpp).
 const KEYFILE_SIZE: usize = 128;
+
+/// How much of a `read --out` is decrypted and written at a time. A range is
+/// streamed instead of being held in memory, so the size of the read is not
+/// decided by what fits in RAM.
+const READ_CHUNK: usize = 1024 * 1024;
 
 /// Prints what an in-place transformation of a partition is about to do (and,
 /// without `--yes`, is all that happens).
@@ -2541,28 +2557,44 @@ fn parse_size(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("size {s:?} is too large"))
 }
 
-/// Write a file that only its owner can read, where the platform has modes.
+/// Open (and truncate) a file that only its owner can read, where the platform
+/// has modes.
 ///
 /// A keyfile and a `read --out` dump are as sensitive as the password that goes
 /// with them, so the umask of whatever shell or service started `vcrs` should not
 /// decide who else gets to read them. An existing file keeps the mode it has.
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+fn create_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(bytes)
+        options.mode(0o600);
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)
+    options.open(path)
+}
+
+/// Write a file only its owner can read; see [`create_private`].
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    create_private(path)?.write_all(bytes)
+}
+
+/// Check a `read` request against the volume before it decides an allocation.
+///
+/// `--length` is whatever the caller typed: turning a terabyte straight into a
+/// `Vec` used to abort the process ("memory allocation of 999999999999 bytes
+/// failed") instead of reporting the mistake. The data-area read is sector
+/// granular anyway, so a request that reaches past the end could never succeed.
+fn check_read_range(data_size: u64, offset: u64, length: u64) -> Result<()> {
+    let available = data_size.saturating_sub(offset);
+    if length > available {
+        bail!(
+            "cannot read {length} bytes at data offset {offset}: only {available} bytes are left \
+             in the volume's data area ({data_size} bytes in total)"
+        );
     }
+    Ok(())
 }
 
 fn parse_hex(s: &str) -> Result<Vec<u8>> {
@@ -2961,8 +2993,29 @@ fn human_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_master_key, human_size, parse_sector_size, Cli, Command};
+    use super::{
+        check_read_range, format_master_key, human_size, parse_sector_size, Cli, Command,
+    };
     use clap::Parser;
+
+    #[test]
+    fn a_read_longer_than_the_data_area_is_refused() {
+        assert!(check_read_range(65536, 0, 65536).is_ok());
+        assert!(check_read_range(65536, 0, 0).is_ok());
+        assert!(check_read_range(65536, 65536, 0).is_ok());
+
+        let err = check_read_range(65536, 0, 999_999_999_999).unwrap_err();
+        assert!(
+            err.to_string().contains("only 65536 bytes are left"),
+            "unexpected error: {err}"
+        );
+
+        // Past the end there is nothing left to read, and the arithmetic must not
+        // wrap when the offset itself is absurd.
+        assert!(check_read_range(65536, 999_999_999_999, 1).is_err());
+        assert!(check_read_range(65536, u64::MAX, 1).is_err());
+        assert!(check_read_range(u64::MAX, 0, u64::MAX).is_ok());
+    }
 
     #[test]
     fn the_master_key_can_come_from_stdin() {
