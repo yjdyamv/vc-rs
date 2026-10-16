@@ -865,6 +865,14 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
+            // A run the user stopped is not a failure of the command, so it gets
+            // the shell's SIGINT number instead. Whatever the command left behind
+            // is described by the lines it printed before this (and by the error
+            // itself, which names the state the file is in).
+            if interrupted_error(&e) {
+                eprintln!("vcrs: interrupted at your request (Ctrl-C)");
+                std::process::exit(INTERRUPTED_EXIT_CODE);
+            }
             eprintln!("vcrs: error: {e:#}");
             if e.downcast_ref::<attach::Cancelled>().is_some() {
                 // `std::process::exit` keeps the whole 32-bit code; an `ExitCode`
@@ -874,6 +882,16 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// True when the error is the one an interrupted run leaves behind: the data-area
+/// fill stops at a chunk boundary and reports `Interrupted` (see
+/// `randomize_data_area`), which is the user's request rather than a failure.
+fn interrupted_error(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<vcrs_core::Error>(),
+        Some(vcrs_core::Error::Io(err)) if err.kind() == std::io::ErrorKind::Interrupted
+    )
 }
 
 fn run() -> Result<()> {
@@ -931,7 +949,11 @@ fn run() -> Result<()> {
                 random_source: a.random_source.clone(),
             };
             let started = std::time::Instant::now();
-            let volume = Volume::create(&a.path, a.size, &options)?;
+            // A full format writes every byte of the data area, so the watcher
+            // reports how far it has come (and a Ctrl-C stops it at a chunk).
+            let mut reporter = watch_progress();
+            let watch = vcrs_core::Watch::new(&mut reporter);
+            let volume = Volume::create_with_progress(&a.path, a.size, &options, Some(watch))?;
             println!(
                 "created {} ({}, {:.2} MiB) in {:.2}s",
                 a.path.display(),
@@ -964,7 +986,9 @@ fn run() -> Result<()> {
                 random_source: a.random_source.clone(),
             };
             let started = std::time::Instant::now();
-            let volume = Volume::create_hidden(&a.path, a.size, &options)
+            let mut reporter = watch_progress();
+            let watch = vcrs_core::Watch::new(&mut reporter);
+            let volume = Volume::create_hidden_with_progress(&a.path, a.size, &options, Some(watch))
                 .context("creating a hidden volume inside the existing container")?;
             println!(
                 "created a {} hidden volume in {} in {:.2}s",
@@ -1040,7 +1064,9 @@ fn run() -> Result<()> {
             let old_host_size = volume.host_size;
             let old_data_size = volume.data_size;
             let started = std::time::Instant::now();
-            volume.expand(a.size, &password, a.password.pim)?;
+            let mut reporter = watch_progress();
+            let watch = vcrs_core::Watch::new(&mut reporter);
+            volume.expand_with_progress(a.size, &password, a.password.pim, Some(watch))?;
             volume.flush()?;
             println!(
                 "expanded {} from {old_host_size} to {} bytes in {:.2}s",

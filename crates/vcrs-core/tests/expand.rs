@@ -69,6 +69,45 @@ fn salt_of(region: &[u8]) -> Vec<u8> {
     region[..SALT].to_vec()
 }
 
+/// A run the user stops at a chunk boundary says `Interrupted` and leaves the
+/// container describing its old size, so the same command can be run again. The
+/// alternative would be a container that claims to be 20 MiB with most of it
+/// still unwritten.
+#[test]
+fn a_stopped_expand_can_be_repeated() {
+    let path = dummy_path("stopped");
+    let mut volume = Volume::create(&path, OLD_HOST, &options("stopped")).expect("create");
+    volume.flush().expect("flush");
+
+    let mut calls = 0u32;
+    let mut watcher = |_done: u64, _total: u64| {
+        calls += 1;
+        if calls == 1 {
+            vcrs_core::Control::Continue
+        } else {
+            vcrs_core::Control::Stop
+        }
+    };
+    let watch = vcrs_core::Watch::new(&mut watcher);
+    let error = volume
+        .expand_with_progress(NEW_HOST, b"stopped", 1, Some(watch))
+        .expect_err("the watcher asked to stop");
+    assert!(
+        matches!(error, Error::Io(ref e) if e.kind() == std::io::ErrorKind::Interrupted),
+        "{error}"
+    );
+    assert_eq!(
+        volume.host_size, OLD_HOST,
+        "the header still describes the old size"
+    );
+
+    // Nothing was torn: the same expand runs to the end now.
+    volume.expand(NEW_HOST, b"stopped", 1).expect("expand");
+    assert_eq!(volume.host_size, NEW_HOST);
+
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn expanding_preserves_the_data_and_rewrites_both_headers() -> vcrs_core::Result<()> {
     let path = dummy_path("main");

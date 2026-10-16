@@ -496,12 +496,19 @@ done so far). VeraCrypt refuses to mount such a volume (`ERR_NONSYS_INPLACE_ENC_
   and why it mounts like any other volume afterwards.
 
 Long runs say where they are: `encrypt-in-place` and `decrypt-in-place` (the partition
-forms too) print a line every five percent — `  20971520 of 50069504 bytes (41%), 3s` — on
+forms too), and the data-area fill of `create`, `create-hidden` and `expand`, print a line
+every five percent — `  20971520 of 50069504 bytes (41%), 3s` — on
 **stderr**, so a script's stdout stays what the command meant to say. The core passes that
 out through `vcrs_core::Watch` (`Watch::new(&mut |done, total| …)`, then `Some(&mut watch)`
 to the call), which is also what a GUI drives a progress bar with — the callback answers
 `Control::Continue` or `Control::Stop`, so the stop travels the same channel as the
-progress.
+progress. `create`, `create-hidden` and `expand` fill their data area through the same
+watcher, so they report progress the same way; stopping one of *those* is an error rather
+than a pause (`Interrupted`, exit code `130`), because a container whose data area was only
+half filled is not one VeraCrypt would call formatted — the command says so and leaves the
+file for the user to delete (`create` starts over on the next run). An interrupted `expand`
+is safe to repeat: the new header fields are only written after the fill, so a half-grown
+container still describes its old size.
 
 Ctrl-C stops one of those runs at a **chunk boundary**, never half way through one
 (`IN_PLACE_CHUNK_SIZE` is 2 MiB, so the wait is well under a second): the first press asks

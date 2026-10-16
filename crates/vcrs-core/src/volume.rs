@@ -300,6 +300,21 @@ impl Volume {
     /// `host_size` is the size of the whole container file; the usable volume
     /// size is `host_size - 262144`.
     pub fn create(path: &Path, host_size: u64, options: &CreateOptions) -> Result<Volume> {
+        Self::create_with_progress(path, host_size, options, None)
+    }
+
+    /// The same, telling a watcher how far the fill of the data area has come.
+    ///
+    /// A full format writes every byte of the data area (VeraCrypt's default), so
+    /// a large container takes a while; [`Watch`] is told the bytes written once
+    /// per megabyte and can stop the run. [`Volume::create`] is this call without
+    /// a watcher.
+    pub fn create_with_progress(
+        path: &Path,
+        host_size: u64,
+        options: &CreateOptions,
+        progress: Option<Watch<'_>>,
+    ) -> Result<Volume> {
         let layout = VolumeLayout::V2Normal;
         validate_sector_size(options.sector_size)?;
         if host_size % DATA_UNIT_SIZE as u64 != 0 {
@@ -377,7 +392,14 @@ impl Volume {
         write_fake_hidden_region(&file, HIDDEN_SLOT_OFFSET, host_size, host_size, options, &mut random)?;
 
         if options.full_format {
-            randomize_data_area(&file, data_offset, volume_size, options.ea, &mut random)?;
+            randomize_data_area(
+                &file,
+                data_offset,
+                volume_size,
+                options.ea,
+                &mut random,
+                progress,
+            )?;
         }
 
         // Backup header: VeraCrypt encrypts it with a *fresh* random salt (and
@@ -404,6 +426,16 @@ impl Volume {
     /// `hidden_size` is the size of the hidden volume; the host file must
     /// already be large enough (`>= hidden_size + 262144`).
     pub fn create_hidden(path: &Path, hidden_size: u64, options: &CreateOptions) -> Result<Volume> {
+        Self::create_hidden_with_progress(path, hidden_size, options, None)
+    }
+
+    /// The same, with a watcher over the hidden data area's fill.
+    pub fn create_hidden_with_progress(
+        path: &Path,
+        hidden_size: u64,
+        options: &CreateOptions,
+        progress: Option<Watch<'_>>,
+    ) -> Result<Volume> {
         let layout = VolumeLayout::V2Hidden;
         validate_sector_size(options.sector_size)?;
         let mut random = random_supply(options)?;
@@ -465,7 +497,14 @@ impl Volume {
         write_header_region(&file, backup_offset, &header, &password, options.pim, &backup_salt)?;
 
         if options.full_format {
-            randomize_data_area(&file, data_offset, volume_size, options.ea, &mut random)?;
+            randomize_data_area(
+                &file,
+                data_offset,
+                volume_size,
+                options.ea,
+                &mut random,
+                progress,
+            )?;
         }
 
         file.sync_all()?;
@@ -787,6 +826,21 @@ impl Volume {
     /// validates it -- with a wrong `password` the headers end up encrypted under
     /// a key nobody knows.
     pub fn expand(&mut self, new_host_size: u64, password: &[u8], pim: i32) -> Result<()> {
+        self.expand_with_progress(new_host_size, password, pim, None)
+    }
+
+    /// The same, with a watcher over the fill of the newly grown area.
+    ///
+    /// An interrupted expand is safe to repeat: the new header fields are only
+    /// written once the area has been filled, so a container that was left
+    /// half-filled still describes its old size.
+    pub fn expand_with_progress(
+        &mut self,
+        new_host_size: u64,
+        password: &[u8],
+        pim: i32,
+        progress: Option<Watch<'_>>,
+    ) -> Result<()> {
         let layout = self.layout;
         if !matches!(layout, VolumeLayout::V2Normal) {
             return Err(Error::Unsupported(format!(
@@ -842,6 +896,7 @@ impl Volume {
             new_host_size - old_host_size,
             self.header.ea,
             &mut RandomSupply::system(),
+            progress,
         )?;
 
         // 3. The new header fields; the master key does not change.
@@ -1197,6 +1252,7 @@ fn randomize_data_area(
     data_size: u64,
     ea: EncryptionAlgorithm,
     random: &mut RandomSupply,
+    mut progress: Option<Watch<'_>>,
 ) -> Result<()> {
     let throwaway = random.bytes(ea.key_size() * 2)?;
     let xts = Xts::new(ea, &throwaway)?;
@@ -1214,6 +1270,17 @@ fn randomize_data_area(
         xts.encrypt(slice, (data_offset + written) / DATA_UNIT_SIZE as u64)?;
         write_all_at(file, data_offset + written, slice)?;
         written += len as u64;
+        if report(progress.as_mut(), written, data_size) == Control::Stop {
+            // A data area that is only half filled is not a volume: the part that
+            // was never written reads as zeros instead of ciphertext, which is
+            // exactly what a full format exists to avoid. The callers decide what
+            // that means for the file they were writing.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "the run was interrupted before the data area was filled",
+            )
+            .into());
+        }
     }
     Ok(())
 }
