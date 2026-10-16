@@ -710,3 +710,11 @@ SRUM database, and — for `--letter` mounts — the container-derived or random
 Microsoft iSCSI Initiator's registry list and event log. Assume that *when* a container was
 used is recoverable on Windows even with timestamp preservation on; what the flag buys is
 that the container's own timestamp does not testify to it.
+
+Two more things are deliberately not defended against, because they cannot be fixed inside
+this program. A crash dump (WER or a manual one) contains the process's memory, including
+the pages `VirtualLock`ed for the master key, and only a policy outside the process can stop
+dumps from being written. And the unlock itself is observable: a larger PIM or a slower KDF
+makes `--password`-based opens measurably slower, so a local process that can time them
+learns something about the volume's parameters (the PIM is not stored in the header, but it
+is not hidden by timing either).
