@@ -371,6 +371,16 @@ fn read_password(
             });
         }
         let mut buf = stdin_all().to_vec();
+        if prompt::at_a_terminal() {
+            // The flag is meant for a pipe, where the bytes never touch the
+            // screen. Typed at a terminal it is read with the echo on, which is
+            // exactly what the prompt exists to avoid.
+            eprintln!(
+                "warning: --password-stdin is reading from the terminal, where the echo is on, \
+                 so the password is on the screen as you type it; leave the flag out to be \
+                 asked for it with the echo off, or pipe it in"
+            );
+        }
         if buf.last() == Some(&b'\n') {
             buf.pop();
             if buf.last() == Some(&b'\r') {

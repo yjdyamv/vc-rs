@@ -85,7 +85,7 @@ fn ask(label: &str) -> Result<Vec<u8>> {
 }
 
 /// True when there is a console on stdin, i.e. somebody is there to answer.
-fn at_a_terminal() -> bool {
+pub fn at_a_terminal() -> bool {
     platform::at_a_terminal()
 }
 
