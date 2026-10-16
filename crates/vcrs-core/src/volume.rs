@@ -1832,6 +1832,14 @@ pub struct DeviceInPlaceOptions {
     pub prf: Prf,
     /// See [`CreateOptions::random_source`].
     pub random_source: Option<PathBuf>,
+    /// Start over even though the device's backup header slot already holds
+    /// something.
+    ///
+    /// A slot that does not open with these credentials is either an interrupted
+    /// run made with another password/PIM/keyfile set or the filesystem's own
+    /// leftovers, and the device alone cannot tell the two apart: starting over
+    /// in the first case destroys that run, so a caller has to say so on purpose.
+    pub force_fresh: bool,
 }
 
 impl DeviceInPlaceOptions {
@@ -1877,6 +1885,16 @@ impl DeviceInPlaceOutcome {
 /// The header a partition carries while it is being transformed, if the
 /// password opens it. This has to try every header hash and algorithm: on a
 /// resumed run the volume's own header is the only record of what they are.
+/// True when a header slot looks written to, i.e. its salt is not all zero.
+///
+/// An all-zero salt is what an untouched slot looks like; anything else means
+/// something already put a header there, which for a device that does not open
+/// may be an interrupted run rather than the filesystem's leftovers.
+fn slot_has_data(region: &[u8]) -> bool {
+    let salt = &region[..HEADER_SALT_SIZE.min(region.len())];
+    salt.iter().any(|byte| *byte != 0)
+}
+
 fn open_in_place_header(
     region: &[u8],
     password: &[u8],
@@ -1950,6 +1968,22 @@ pub fn encrypt_device_in_place(
     read_exact_at(file, backup_offset, &mut region)
         .map_err(|e| device_io_error("reading the backup header", backup_offset, e))?;
     let existing = open_in_place_header(&region, &password, options.pim, options.prf);
+    // A slot that does not open is only a fresh start when it is also empty. The
+    // device path has no other way to tell an interrupted run made with other
+    // credentials from the bytes the filesystem left at the end of the
+    // partition, and treating the former as a fresh start would shrink NTFS and
+    // write a new master key over a run that is still recoverable.
+    if existing.is_none() && !options.force_fresh && slot_has_data(&region) {
+        return Err(Error::Unsupported(format!(
+            "the backup header slot of {} already holds something, but it does not open with this \
+             password, PIM and keyfiles. Either an interrupted in-place run was made with other \
+             credentials (starting over would make it unrecoverable), or the partition's last {} \
+             bytes were not empty before the run. Look at it first, then pass --force-fresh to \
+             start over and overwrite it",
+            info.path.display(),
+            VOLUME_HEADER_GROUP_SIZE
+        )));
+    }
 
     let (mut header, backup_salt, mut start, mut done, initial_done, fresh) = match existing {
         Some(header) if header.is_non_system_inplace_enc() => {
@@ -3203,6 +3237,37 @@ pub fn looks_quick_formatted(path: &Path) -> Result<bool> {
         }
     }
     Ok(seen > 0 && zero * 2 >= seen)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::slot_has_data;
+    use crate::header::HEADER_SALT_SIZE;
+
+    #[test]
+    fn an_empty_slot_has_no_data() {
+        assert!(!slot_has_data(&[0u8; HEADER_SALT_SIZE]));
+        // A short region (a truncated read) is judged on what there is.
+        assert!(!slot_has_data(&[]));
+        assert!(!slot_has_data(&[0u8; 4]));
+    }
+
+    #[test]
+    fn one_non_zero_byte_of_salt_is_enough_to_shout() {
+        let mut salt = [0u8; HEADER_SALT_SIZE];
+        salt[HEADER_SALT_SIZE - 1] = 1;
+        assert!(slot_has_data(&salt));
+        assert!(slot_has_data(&[0u8, 0, 7]));
+    }
+
+    #[test]
+    fn only_the_salt_is_looked_at() {
+        // The header body is encrypted and the rest of the slot is random, but
+        // the decision is made on the salt alone, so bytes past it do not count.
+        let mut region = vec![0u8; HEADER_SALT_SIZE * 2];
+        region[HEADER_SALT_SIZE] = 0xff;
+        assert!(!slot_has_data(&region));
+    }
 }
 
 /// Read raw host bytes without decrypting them (diagnostics, tests, CLI).

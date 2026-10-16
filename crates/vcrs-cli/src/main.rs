@@ -659,6 +659,16 @@ struct EncryptInPlaceArgs {
     /// path is only described, never written to; container files ignore this.
     #[arg(long)]
     yes: bool,
+    /// Start over even though the partition's backup header slot already holds
+    /// something that this password, PIM and keyfile set do not open.
+    ///
+    /// Only for a partition whose last 128 KiB were already in use before the
+    /// run: without the switch such a slot is refused, because it is otherwise
+    /// indistinguishable from an interrupted run made with other credentials
+    /// that starting over would destroy. Container files ignore this (they
+    /// always refuse a slot that does not open).
+    #[arg(long)]
+    force_fresh: bool,
     #[command(flatten)]
     password: PasswordArgs,
 }
@@ -1893,6 +1903,7 @@ fn encrypt_device(a: &EncryptInPlaceArgs, ea: EncryptionAlgorithm, prf: Prf) -> 
         ea,
         prf,
         random_source: a.random_source.clone(),
+        force_fresh: a.force_fresh,
     };
     println!(
         "encrypting {} in place ({} byte data area): the run can be interrupted and resumed",
@@ -1958,6 +1969,9 @@ fn decrypt_device(a: &DecryptInPlaceArgs) -> Result<()> {
         ea: EncryptionAlgorithm::Aes,
         prf: Prf::Sha512,
         random_source: None,
+        // Only the encryption path starts from scratch; a decryption reads the
+        // header it needs, so the switch has no meaning here.
+        force_fresh: false,
     };
     let started = std::time::Instant::now();
     let mut reporter = watch_progress();
