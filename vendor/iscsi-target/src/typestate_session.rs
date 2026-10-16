@@ -1045,6 +1045,70 @@ fn sn_in_window(sn: u32, exp_sn: u32, max_sn: u32) -> bool {
 mod tests {
     use super::*;
 
+    /// A login that skips Security Negotiation and asks for a full session in one
+    /// step (CSG=1, NSG=3, Transit=1).  This is the shortcut that used to reach
+    /// `FullFeaturePhase` without any authentication.
+    fn a_shortcut_login() -> IscsiPdu {
+        let data = serialize_text_parameters(&[
+            ("InitiatorName".to_string(), "iqn.1991-05.com.microsoft:test".to_string()),
+            ("TargetName".to_string(), "iqn.2025-12.io.vcrs:test".to_string()),
+            ("SessionType".to_string(), "Normal".to_string()),
+        ]);
+        IscsiPdu::login_request([0x11; 6], 0, 0, 1, 0, 1, 3, true, data)
+    }
+
+    fn an_operational_session(
+        auth_config: AuthConfig,
+        chap_completed: bool,
+    ) -> TypestateSession<LoginOperationalNegotiation> {
+        let mut session: TypestateSession<LoginOperationalNegotiation> = TypestateSession {
+            data: SessionData::default(),
+            _state: PhantomData,
+        };
+        session.data.auth_config = auth_config;
+        session.data.chap_completed = chap_completed;
+        session
+    }
+
+    /// A target that requires CHAP must not hand out a session to an initiator
+    /// that skipped Security Negotiation and therefore never authenticated.
+    #[test]
+    fn a_login_that_skips_security_negotiation_cannot_skip_chap() {
+        let session = an_operational_session(
+            AuthConfig::Chap { credentials: crate::auth::ChapCredentials::new("vcrs", "secret") },
+            false,
+        );
+        let (any_session, responses) = session
+            .process_login(&a_shortcut_login(), "iqn.2025-12.io.vcrs:test")
+            .unwrap();
+        assert!(
+            matches!(any_session, AnySession::Failed(_)),
+            "a target configured for CHAP accepted a login that never authenticated"
+        );
+        assert_eq!(responses.len(), 1, "the initiator has to be told why");
+    }
+
+    #[test]
+    fn a_login_that_skips_security_negotiation_works_without_chap() {
+        let session = an_operational_session(AuthConfig::None, false);
+        let (any_session, _) = session
+            .process_login(&a_shortcut_login(), "iqn.2025-12.io.vcrs:test")
+            .unwrap();
+        assert!(matches!(any_session, AnySession::FullFeaturePhase(_)));
+    }
+
+    #[test]
+    fn a_login_that_skips_security_negotiation_works_after_chap() {
+        let session = an_operational_session(
+            AuthConfig::Chap { credentials: crate::auth::ChapCredentials::new("vcrs", "secret") },
+            true,
+        );
+        let (any_session, _) = session
+            .process_login(&a_shortcut_login(), "iqn.2025-12.io.vcrs:test")
+            .unwrap();
+        assert!(matches!(any_session, AnySession::FullFeaturePhase(_)));
+    }
+
     #[test]
     fn test_typestate_creation() {
         let session: TypestateSession<Free> = TypestateSession::new();
