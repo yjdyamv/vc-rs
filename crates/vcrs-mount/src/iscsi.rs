@@ -840,9 +840,13 @@ pub fn mount_iscsi_with(
     match on_ready {
         Some(on_ready) => on_ready(&mount, disk_size),
         None => {
-            println!(
-                "attach it from an ELEVATED prompt (the Microsoft iSCSI Initiator needs admin):"
-            );
+            // The trap this wording exists for: `vcrs mount` without `--letter`
+            // serves the volume but does not log the initiator in, so no drive
+            // letter appears until something runs the two commands below. Say so
+            // before printing them.
+            println!("nothing is attached yet, so no drive letter has appeared: this command only");
+            println!("serves the volume. `vcrs mount <volume> --letter Y` does the rest of the work");
+            println!("(it asks for one elevation prompt); by hand, from an ELEVATED prompt:");
             println!(
                 "    iscsicli AddTarget {} vcrs {} {} 0 0 0 0 0 8 0 0 \"\" \"\" 0 0",
                 mount.target_name(),
