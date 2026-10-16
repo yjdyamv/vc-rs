@@ -221,27 +221,29 @@ pub fn attach(options: &AttachOptions) -> Result<Attached> {
 /// This is what `vcrs mount --letter Y` calls: from a normal prompt it produces
 /// one UAC prompt and nothing else to do; from an elevated prompt it attaches
 /// straight away.
-pub fn attach_with_elevation(options: &AttachOptions) -> Result<()> {
+pub fn attach_with_elevation(options: &AttachOptions, json: bool) -> Result<()> {
     if elevated() {
         attach(options)?;
         return Ok(());
     }
 
     // An agent an earlier prompt left behind does the work with no prompt at all.
-    if let Some((_, text)) = crate::agent::try_run(&attach_arguments(options, None)) {
-        return judge(&text, "attach");
+    if let Some((_, text)) = crate::agent::try_run(&attach_arguments(options, None, json)) {
+        return finish(&text, "attach", json);
     }
 
     let exe = std::env::current_exe().context("finding this program's own path")?;
     let log = temp_log_path();
     // A log left behind by an earlier run is not this run's answer.
     let _ = std::fs::remove_file(&log);
-    let args = attach_arguments(options, Some(&log));
-    println!(
+    let args = attach_arguments(options, Some(&log), json);
+    // Guidance for a person goes to stderr, so a caller reading stdout sees only
+    // the answer (`--json` asks for nothing else).
+    eprintln!(
         "attaching {} needs an elevated prompt (iscsicli carries a requireAdministrator manifest):",
         options.iqn
     );
-    println!(
+    eprintln!(
         "  approving the Windows prompt that is about to appear …  (or run `vcrs attach {}` \
          yourself from an elevated prompt)",
         options.iqn
@@ -249,7 +251,7 @@ pub fn attach_with_elevation(options: &AttachOptions) -> Result<()> {
     start_elevated(&exe, &args, &log)?;
     let text = wait_for_log(&log);
     let _ = std::fs::remove_file(&log);
-    judge(&text, "attach")
+    finish(&text, "attach", json)
 }
 
 /// How long an elevated run may take before its verdict is given up on.
@@ -281,6 +283,45 @@ pub fn wait_for_log(log: &Path) -> String {
 /// marker that child leaves behind: [`DONE`] when it finished, [`FAILED`] when it
 /// gave up. Nothing else in the log can be trusted on its own — the lines around
 /// them are progress, and a worker that was killed mid-way leaves neither.
+/// What an elevated run puts in front of the JSON document it sends back.
+///
+/// The log file is the only channel it has (its console is hidden and the caller
+/// replays the file), so the document travels as one marked line among the lines
+/// written for a person, and [`take_json`] picks it out again.
+pub const JSON_MARKER: &str = "vcrs-json:";
+
+/// The machine-readable document an elevated run sent back, if it sent one.
+pub fn take_json(text: &str) -> Option<&str> {
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix(JSON_MARKER))
+}
+
+/// Send the caller a machine-readable document through the log file.
+pub fn report_json(log: Option<&Path>, document: &serde_json::Value) {
+    let line = format!("{JSON_MARKER}{document}");
+    println!("{line}");
+    if let Some(path) = log {
+        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+}
+
+/// Show what an elevated run left behind, and fail if it failed.
+///
+/// With `json` the caller asked for a machine-readable answer: the lines written
+/// for a person are dropped and only the document is printed. A run that failed
+/// has no document, so its verdict is shown instead — which is what says why.
+pub fn finish(text: &str, what: &str, json: bool) -> Result<()> {
+    if json {
+        if let Some(document) = take_json(text) {
+            println!("{document}");
+            return Ok(());
+        }
+    }
+    judge(text, what)
+}
+
 pub fn judge(text: &str, what: &str) -> Result<()> {
     print!("{text}");
     if text.contains(FAILED) {
@@ -331,7 +372,7 @@ fn describe(attached: &Attached) -> String {
 }
 
 /// Everything needed to re-run this program as `vcrs attach …`.
-fn attach_arguments(options: &AttachOptions, log: Option<&Path>) -> Vec<String> {
+fn attach_arguments(options: &AttachOptions, log: Option<&Path>, json: bool) -> Vec<String> {
     let mut args = vec![
         "attach".to_string(),
         "--iqn".to_string(),
@@ -352,6 +393,9 @@ fn attach_arguments(options: &AttachOptions, log: Option<&Path>) -> Vec<String> 
     if let Some(log) = log {
         args.push("--log".to_string());
         args.push(log.display().to_string());
+    }
+    if json {
+        args.push("--json".to_string());
     }
     args
 }
@@ -1073,16 +1117,31 @@ fn split_address(address: &str) -> (String, u16) {
 /// Output that goes to the terminal and, for an elevated child, to a log file.
 pub struct Report {
     log: Option<std::fs::File>,
+    quiet: bool,
 }
 
 impl Report {
     pub fn new(path: Option<&Path>) -> Self {
         let log = path.and_then(|path| std::fs::File::create(path).ok());
-        Self { log }
+        Self {
+            log,
+            quiet: false,
+        }
+    }
+
+    /// The same report without the lines written for a person.
+    ///
+    /// A run whose answer is a machine-readable document sets this, so the lines
+    /// do not wrap the document in noise. They still go into the log, which is
+    /// where the document is picked out of.
+    pub fn quiet(&mut self) {
+        self.quiet = true;
     }
 
     pub fn line(&mut self, text: &str) {
-        println!("{text}");
+        if !self.quiet {
+            println!("{text}");
+        }
         if let Some(log) = &mut self.log {
             let _ = writeln!(log, "{text}");
         }
@@ -1106,7 +1165,7 @@ mod tests {
 
     #[test]
     fn the_child_gets_the_same_request_plus_a_log() {
-        let args = attach_arguments(&options(), Some(Path::new(r"C:\Temp\vcrs.log")));
+        let args = attach_arguments(&options(), Some(Path::new(r"C:\Temp\vcrs.log")), false);
         assert_eq!(
             args,
             vec![
@@ -1132,8 +1191,12 @@ mod tests {
                 ..options()
             },
             None,
+            false,
         );
         assert!(!without.iter().any(|a| a == "--letter" || a == "--log"));
+        // `--json` travels down to the elevated half (it is what makes that half
+        // send its document back instead of lines).
+        assert!(attach_arguments(&options(), None, true).contains(&"--json".to_string()));
     }
 
     #[test]

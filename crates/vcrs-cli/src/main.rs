@@ -24,8 +24,8 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
     /// Print a machine-readable JSON document instead of the usual lines, for
-    /// the commands that have one: `list`, `info`, `header`, `test` and
-    /// `device-info`.
+    /// the commands that have one: `list`, `info`, `header`, `test`,
+    /// `device-info`, `mount`, `attach` and `dismount`.
     #[arg(long, global = true)]
     json: bool,
 }
@@ -1267,7 +1267,27 @@ fn run() -> Result<()> {
                 iscsi.target_name = format!("{}-hidden", iscsi.target_name);
             }
             match a.letter {
-                None => vcrs_mount::mount_iscsi(&a.path, &options, &iscsi)?,
+                None => {
+                    if json {
+                        // Nothing is mounted yet and the command keeps serving, so
+                        // the document says what a caller needs to attach it.
+                        let hook = |mount: &vcrs_mount::IscsiMount, disk_size: u64| {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "attached": false,
+                                    "iqn": mount.target_name(),
+                                    "address": format!("{}", mount.addr()),
+                                    "disk_size": disk_size,
+                                    "mount_point": serde_json::Value::Null,
+                                })
+                            );
+                        };
+                        vcrs_mount::mount_iscsi_with(&a.path, &options, &iscsi, Some(&hook))?
+                    } else {
+                        vcrs_mount::mount_iscsi(&a.path, &options, &iscsi)?
+                    }
+                }
                 Some(letter) => {
                     // Refuse a letter that cannot work before a target is left
                     // running behind it.
@@ -1279,6 +1299,11 @@ fn run() -> Result<()> {
                         // target moves to a detached copy of this program, which
                         // `vcrs dismount` stops again.
                         let mut report = attach::Report::new(None);
+                        if json {
+                            // The document is the answer, so the lines about the
+                            // serving process would only wrap it in noise.
+                            report.quiet();
+                        }
                         let server = serve::spawn(
                             &iscsi.target_name,
                             &options.password,
@@ -1294,13 +1319,18 @@ fn run() -> Result<()> {
                             wait: attach::DISK_WAIT,
                             log: None,
                         };
-                        match attach::attach_with_elevation(&request) {
+                        match attach::attach_with_elevation(&request, json) {
                             Ok(()) => {
                                 serve::remember(&server)?;
-                                println!(
-                                    "{letter}: is mounted. `vcrs dismount --letter {letter}` (or \
-                                     `vcrs dismount`) takes it off again."
-                                );
+                                // With `--json` the document the elevated half sent
+                                // back is already the answer; this sentence is for a
+                                // person reading the output.
+                                if !json {
+                                    println!(
+                                        "{letter}: is mounted. `vcrs dismount --letter {letter}` (or \
+                                         `vcrs dismount`) takes it off again."
+                                    );
+                                }
                                 return Ok(());
                             }
                             Err(err) => {
@@ -1328,7 +1358,7 @@ fn run() -> Result<()> {
                             wait: attach::DISK_WAIT,
                             log: None,
                         };
-                        if let Err(err) = attach::attach_with_elevation(&request) {
+                        if let Err(err) = attach::attach_with_elevation(&request, json) {
                             println!("\ncould not attach the volume: {err:#}");
                             println!("the target keeps serving it; attach it by hand with");
                             println!(
@@ -1363,18 +1393,38 @@ fn run() -> Result<()> {
                 wait: std::time::Duration::from_secs(a.wait),
                 log: a.log,
             };
-            if let Err(err) = attach::attach(&request) {
-                // The elevated child gets a console of its own, so the process
-                // that asked for it reads this file back: a failure has to be
-                // in it, or all the parent sees is a bare exit code.
-                if let Some(path) = &log {
-                    use std::io::Write as _;
-                    if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
-                        let _ = writeln!(file, "vcrs: error: {err:#}");
-                        let _ = writeln!(file, "{}", attach::FAILED);
+            let attached = match attach::attach(&request) {
+                Ok(attached) => attached,
+                Err(err) => {
+                    // The elevated child gets a console of its own, so the process
+                    // that asked for it reads this file back: a failure has to be
+                    // in it, or all the parent sees is a bare exit code.
+                    if let Some(path) = &log {
+                        use std::io::Write as _;
+                        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+                            let _ = writeln!(file, "vcrs: error: {err:#}");
+                            let _ = writeln!(file, "{}", attach::FAILED);
+                        }
                     }
+                    return Err(err);
                 }
-                return Err(err);
+            };
+            if json {
+                // The caller asked for a document, and the log is the only channel
+                // an elevated run has: it travels in there under a marker.
+                let letter = attached.letter.map(|letter| letter.to_string());
+                attach::report_json(
+                    log.as_deref(),
+                    &serde_json::json!({
+                        "attached": true,
+                        "iqn": request.iqn,
+                        "address": request.address,
+                        "mount_point": letter.as_deref().map(|letter| format!("{letter}:")),
+                        "disk": attached.disk,
+                        "partition": attached.partition,
+                        "note": attached.note,
+                    }),
+                );
             }
             attach::mark_done(log.as_deref());
             Ok(())
@@ -1409,7 +1459,7 @@ fn run() -> Result<()> {
                 }
             };
             let options = detach::DetachOptions { target, log: a.log };
-            detach::detach_with_elevation(&options)?;
+            detach::detach_with_elevation(&options, json)?;
             Ok(())
         }
         Command::Agent(a) => {
@@ -1464,18 +1514,45 @@ fn run() -> Result<()> {
             };
             let options = detach::DetachOptions { target, log: a.log };
             let mut report = attach::Report::new(log.as_deref());
-            if let Err(err) = detach::detach(&options, &mut report) {
-                // The elevated child gets a console of its own, so the process
-                // that asked for it reads this file back: a failure has to be
-                // in it, or all the parent sees is a bare exit code.
-                if let Some(path) = &log {
-                    use std::io::Write as _;
-                    if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
-                        let _ = writeln!(file, "vcrs: error: {err:#}");
-                        let _ = writeln!(file, "{}", attach::FAILED);
+            if json {
+                // The document is the answer, so the lines written for a person are
+                // kept out of stdout (they still go into the log, which is where the
+                // caller picks the document out of).
+                report.quiet();
+            }
+            let outcome = match detach::detach(&options, &mut report) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    // The elevated child gets a console of its own, so the process
+                    // that asked for it reads this file back: a failure has to be
+                    // in it, or all the parent sees is a bare exit code.
+                    if let Some(path) = &log {
+                        use std::io::Write as _;
+                        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+                            let _ = writeln!(file, "vcrs: error: {err:#}");
+                            let _ = writeln!(file, "{}", attach::FAILED);
+                        }
                     }
+                    return Err(err);
                 }
-                return Err(err);
+            };
+            if json {
+                let letters: Vec<String> = outcome
+                    .letters
+                    .iter()
+                    .map(|letter| format!("{letter}:"))
+                    .collect();
+                attach::report_json(
+                    log.as_deref(),
+                    &serde_json::json!({
+                        "targets": outcome.targets,
+                        "letters": letters,
+                        "stopped": outcome.stopped,
+                        "sessions": outcome.sessions,
+                        "devices": outcome.devices,
+                        "notes": outcome.notes,
+                    }),
+                );
             }
             attach::mark_done(log.as_deref());
             Ok(())
@@ -2689,18 +2766,19 @@ mod tests {
         assert!(hidden.contains("2 bytes") && hidden.contains("--show-master-key"));
     }
 
-    #[test]
     /// `--json` is a global flag, so clap must accept it on every command that
     /// has a JSON form -- otherwise the flag would be rejected before the
     /// command runs and the document would never be printed.
     #[test]
     fn the_inspect_commands_accept_json() {
-        let cases: [&[&str]; 5] = [
+        let cases: [&[&str]; 7] = [
             &["vcrs", "list", "--json"],
             &["vcrs", "info", "some.vc", "--json"],
             &["vcrs", "header", "some.vc", "--json"],
             &["vcrs", "test", "--json"],
             &["vcrs", "device-info", "\\\\?\\E:", "--json"],
+            &["vcrs", "mount", "some.vc", "--letter", "Y", "--json"],
+            &["vcrs", "dismount", "--letter", "Y", "--json"],
         ];
         for case in cases {
             let cli = Cli::try_parse_from(case).unwrap_or_else(|err| panic!("{case:?}: {err}"));
@@ -2708,6 +2786,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn sector_sizes_are_validated_like_veracrypt_does() {
         for good in ["512", "1024", "2048", "4096", " 4096 "] {
             assert!(parse_sector_size(good).is_ok(), "{good} should be accepted");

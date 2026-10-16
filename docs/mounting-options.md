@@ -173,8 +173,11 @@ VeraCrypt 认可的“已格式化”卷，所以命令会说明这一点、把�
 create 22 秒，128 MiB 容器扩到 256 MiB 约 13 秒。
 
 给程序用的输出是 `--json`（全局参数）：`vcrs list`（会话/后台服务进程/磁盘快照）、`vcrs info`、
-`vcrs header`、`vcrs test`、`vcrs device-info`。退出码：0 成功、1 失败、2 命令行错、1223 用户拒
-绝提权、130 Ctrl-C 中断。
+`vcrs header`、`vcrs test`、`vcrs device-info`，以及挂载三件套 `vcrs mount`（盘符、Windows 给的磁
+盘、以及之后用来卸载的 target；不带 `--letter` 时给出调用方自己登录发起程序所需的信息）、
+`vcrs attach`、`vcrs dismount`（释放的盘符、停掉的服务进程、登出的会话、清掉的设备）。给人看的
+内容（提权提示、进度行、serve 横幅）全部走 **stderr**，所以 stdout 要么是普通行、要么是一个
+JSON 文档，不会混在一起。退出码：0 成功、1 失败、2 命令行错、1223 用户拒绝提权、130 Ctrl-C 中断。
 `iscsi-target` 1.0.0 以 `vendor/iscsi-target` 打补丁形式引入（补丁说明见
 `vendor/iscsi-target/PATCHES.md`）：
 

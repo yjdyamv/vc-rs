@@ -819,7 +819,7 @@ pub fn mount_iscsi_with(
     install_ctrl_handler();
     let device = ScsiVolume::open(volume_path, open, opts)?;
     let disk_size = device.disk_size();
-    println!(
+    eprintln!(
         "serving {} ({} bytes of data area, {} byte sectors, {}) as a {} byte disk",
         volume_path.display(),
         device.data_size(),
@@ -828,15 +828,15 @@ pub fn mount_iscsi_with(
         device.disk_size(),
     );
     if opts.disk_mode == DiskMode::Partitioned {
-        println!(
+        eprintln!(
             "the data area is presented as one partition starting at LBA {} (a synthetic MBR; \
              the container itself keeps its VeraCrypt layout)",
             device.data_start_lba(),
         );
     }
     let mount = IscsiMount::start(device, opts)?;
-    println!("iSCSI target ready: {} on {}", mount.target_name(), mount.addr());
-    println!();
+    eprintln!("iSCSI target ready: {} on {}", mount.target_name(), mount.addr());
+    eprintln!();
     match on_ready {
         Some(on_ready) => on_ready(&mount, disk_size),
         None => {
@@ -844,41 +844,41 @@ pub fn mount_iscsi_with(
             // serves the volume but does not log the initiator in, so no drive
             // letter appears until something runs the two commands below. Say so
             // before printing them.
-            println!("nothing is attached yet, so no drive letter has appeared: this command only");
-            println!("serves the volume. `vcrs mount <volume> --letter Y` does the rest of the work");
-            println!("(it asks for one elevation prompt); by hand, from an ELEVATED prompt:");
-            println!(
+            eprintln!("nothing is attached yet, so no drive letter has appeared: this command only");
+            eprintln!("serves the volume. `vcrs mount <volume> --letter Y` does the rest of the work");
+            eprintln!("(it asks for one elevation prompt); by hand, from an ELEVATED prompt:");
+            eprintln!(
                 "    iscsicli AddTarget {} vcrs {} {} 0 0 0 0 0 8 0 0 \"\" \"\" 0 0",
                 mount.target_name(),
                 portal_host(&mount.addr()),
                 portal_port(&mount.addr()),
             );
-            println!("    iscsicli QLoginTarget {}", mount.target_name());
-            println!();
-            println!("(a *static* target is registered because the target crate cannot complete the");
-            println!(" initiator's multi-PDU login during a portal *scan*; the two empty strings are");
-            println!(" the CHAP user/password and the trailing 0 means 'no authentication')");
-            println!("(both commands must reach iscsicli with those two arguments still empty, which is");
-            println!(" why the `cmd /c` hop with literal \"\" is used in scripts/vc-iscsi-e2e.ps1)");
-            println!();
-            println!("Windows then shows the volume as a partitioned disk: the data area appears as a");
-            println!("single partition (the container itself keeps its VeraCrypt layout).");
-            println!("detach it again with:");
-            println!("    iscsicli QLogoutTarget {}", mount.target_name());
-            println!("    iscsicli LogoutTarget <SessionId>      (see: iscsicli SessionList 1)");
-            println!("    iscsicli RemoveTarget {}", mount.target_name());
-            println!(
+            eprintln!("    iscsicli QLoginTarget {}", mount.target_name());
+            eprintln!();
+            eprintln!("(a *static* target is registered because the target crate cannot complete the");
+            eprintln!(" initiator's multi-PDU login during a portal *scan*; the two empty strings are");
+            eprintln!(" the CHAP user/password and the trailing 0 means 'no authentication')");
+            eprintln!("(both commands must reach iscsicli with those two arguments still empty, which is");
+            eprintln!(" why the `cmd /c` hop with literal \"\" is used in scripts/vc-iscsi-e2e.ps1)");
+            eprintln!();
+            eprintln!("Windows then shows the volume as a partitioned disk: the data area appears as a");
+            eprintln!("single partition (the container itself keeps its VeraCrypt layout).");
+            eprintln!("detach it again with:");
+            eprintln!("    iscsicli QLogoutTarget {}", mount.target_name());
+            eprintln!("    iscsicli LogoutTarget <SessionId>      (see: iscsicli SessionList 1)");
+            eprintln!("    iscsicli RemoveTarget {}", mount.target_name());
+            eprintln!(
                 "    (or: vcrs dismount --iscsi {} -- it also takes the disk offline first,",
                 mount.target_name()
             );
-            println!("     because Windows refuses to log out a session whose disk is still in use)");
+            eprintln!("     because Windows refuses to log out a session whose disk is still in use)");
         }
     }
-    println!();
+    eprintln!();
     if opts.idle_timeout.is_zero() {
-        println!("this process keeps serving the volume until you press Ctrl-C.");
+        eprintln!("this process keeps serving the volume until you press Ctrl-C.");
     } else {
-        println!(
+        eprintln!(
             "this process keeps serving the volume until you press Ctrl-C, and stops by itself\n\
              {} s after the last initiator logs out (pass --idle-timeout 0 to keep serving\n\
              through a logout, e.g. while Windows reboots).",

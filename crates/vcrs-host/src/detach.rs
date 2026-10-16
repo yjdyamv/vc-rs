@@ -76,6 +76,12 @@ pub struct Detached {
     pub targets: Vec<String>,
     /// The drive letters that were released.
     pub letters: Vec<char>,
+    /// The serving processes that were stopped on the way.
+    pub stopped: Vec<u32>,
+    /// The disk devices Windows was made to forget.
+    pub devices: Vec<String>,
+    /// The sessions that were logged out, by session id.
+    pub sessions: Vec<String>,
     /// Things the user has to know about (a disk Windows still lists, a
     /// session that was already gone, …).
     pub notes: Vec<String>,
@@ -236,6 +242,8 @@ pub fn detach(options: &DetachOptions, report: &mut Report) -> Result<Detached> 
     let released = release(&numbers, &letters, &pids, report)?;
     trace(report, "letting go, stopping and forgetting", stage);
     out.letters.extend(released.letters);
+    out.stopped.extend(released.stopped.iter().copied());
+    out.devices.extend(released.devices.iter().cloned());
 
     // 2. The serving processes were stopped by `release` above. The initiator refuses
     //    to log out a session while its target is alive and Windows has the volume in
@@ -283,6 +291,7 @@ pub fn detach(options: &DetachOptions, report: &mut Report) -> Result<Detached> 
     for session in &to_logout {
         if logout(session, report) {
             out.targets.push(session.iqn.clone());
+            out.sessions.push(session.id.clone());
         } else {
             refused.push(session.clone());
         }
@@ -320,6 +329,7 @@ pub fn detach(options: &DetachOptions, report: &mut Report) -> Result<Detached> 
             if !out.targets.contains(&session.iqn) {
                 out.targets.push(session.iqn.clone());
             }
+            out.sessions.push(session.id.clone());
         } else {
             still_refused.push(session.clone());
         }
@@ -393,7 +403,7 @@ fn trace(report: &mut Report, what: &str, since: std::time::Instant) {
     }
 }
 
-pub fn detach_with_elevation(options: &DetachOptions) -> Result<()> {
+pub fn detach_with_elevation(options: &DetachOptions, json: bool) -> Result<()> {
     let exe = std::env::current_exe().context("finding this program's own path")?;
     if attach::elevated() {
         let mut report = Report::new(options.log.as_deref());
@@ -402,20 +412,22 @@ pub fn detach_with_elevation(options: &DetachOptions) -> Result<()> {
     }
 
     // An agent an earlier prompt left behind does the work with no prompt at all.
-    if let Some((_, text)) = crate::agent::try_run(&detach_arguments(options, None)) {
-        return attach::judge(&text, "dismount");
+    if let Some((_, text)) = crate::agent::try_run(&detach_arguments(options, None, json)) {
+        return attach::finish(&text, "dismount", json);
     }
 
     let log = attach::temp_log_path();
     // A log left behind by an earlier run is not this run's answer, and reading it
     // as it grows is how the run's verdict comes back (see `attach::wait_for_log`).
     let _ = std::fs::remove_file(&log);
-    let args = detach_arguments(options, Some(&log));
-    println!(
+    let args = detach_arguments(options, Some(&log), json);
+    // Guidance for a person goes to stderr, so a caller reading stdout sees only
+    // the answer (`--json` asks for nothing else).
+    eprintln!(
         "detaching {} needs an elevated prompt (iscsicli carries a requireAdministrator manifest):",
         options.target.describe()
     );
-    println!(
+    eprintln!(
         "  approving the Windows prompt that is about to appear …  (or run `vcrs dismount {}` \
          yourself from an elevated prompt)",
         target_argument(&options.target)
@@ -423,11 +435,11 @@ pub fn detach_with_elevation(options: &DetachOptions) -> Result<()> {
     attach::start_elevated(&exe, &args, &log)?;
     let text = attach::wait_for_log(&log);
     let _ = std::fs::remove_file(&log);
-    attach::judge(&text, "dismount")
+    attach::finish(&text, "dismount", json)
 }
 
 /// Everything needed to re-run this program as `vcrs detach …`.
-fn detach_arguments(options: &DetachOptions, log: Option<&Path>) -> Vec<String> {
+fn detach_arguments(options: &DetachOptions, log: Option<&Path>, json: bool) -> Vec<String> {
     let mut args = vec!["detach".to_string()];
     match &options.target {
         Target::All => args.push("--all".to_string()),
@@ -443,6 +455,9 @@ fn detach_arguments(options: &DetachOptions, log: Option<&Path>) -> Vec<String> 
     if let Some(log) = log {
         args.push("--log".to_string());
         args.push(log.display().to_string());
+    }
+    if json {
+        args.push("--json".to_string());
     }
     args
 }
@@ -469,6 +484,8 @@ pub struct Released {
     pub letters: Vec<char>,
     /// The serving processes this step found alive and stopped.
     pub stopped: Vec<u32>,
+    /// The disk devices that were taken out of the device tree.
+    pub devices: Vec<String>,
 }
 
 /// Let go of the volumes, take the disks offline, stop the serving processes and get the
@@ -579,14 +596,18 @@ fn release(
     // 4. The disk devices the storage stack still holds. `pnputil` is a plain program
     //    (the earlier version called it from inside a PowerShell, which cost a whole
     //    shell every time).
+    let mut taken: Vec<String> = Vec::new();
     match win32::disk_devices(attach::DISK_NAME) {
         Ok(devices) => {
             for device in devices {
                 match remove_device(&device.instance_id) {
-                    Ok(()) => report.line(&format!(
-                        "  took the disk device {} away",
-                        device.instance_id
-                    )),
+                    Ok(()) => {
+                        taken.push(device.instance_id.clone());
+                        report.line(&format!(
+                            "  took the disk device {} away",
+                            device.instance_id
+                        ));
+                    }
                     Err(err) => report.line(&format!(
                         "  could not take the disk device {} away: {err:#}",
                         device.instance_id
@@ -624,6 +645,7 @@ fn release(
     Ok(Released {
         letters: gone,
         stopped,
+        devices: taken,
     })
 }
 
@@ -830,10 +852,14 @@ mod tests {
             target: Target::All,
             log: None,
         };
-        assert_eq!(detach_arguments(&all, None), vec!["detach", "--all"]);
+        assert_eq!(detach_arguments(&all, None, false), vec!["detach", "--all"]);
         assert_eq!(
-            detach_arguments(&all, Some(&log)),
+            detach_arguments(&all, Some(&log), false),
             vec!["detach", "--all", "--log", r"C:\Temp\vcrs-detach-1.log"]
+        );
+        assert_eq!(
+            detach_arguments(&all, None, true),
+            vec!["detach", "--all", "--json"]
         );
 
         let by_iqn = DetachOptions {
@@ -841,7 +867,7 @@ mod tests {
             log: None,
         };
         assert_eq!(
-            detach_arguments(&by_iqn, None),
+            detach_arguments(&by_iqn, None, false),
             vec!["detach", "--iqn", "iqn.2025-12.io.vcrs:secret"]
         );
 
@@ -850,7 +876,7 @@ mod tests {
             log: None,
         };
         assert_eq!(
-            detach_arguments(&by_letter, None),
+            detach_arguments(&by_letter, None, false),
             vec!["detach", "--letter", "Y"]
         );
         assert_eq!(target_argument(&by_letter.target), "--letter Y");

@@ -410,9 +410,15 @@ For a program, `--json` prints a machine-readable document instead of the usual 
 `vcrs list --json` (the same snapshot as the text form — the iSCSI sessions, the background
 servers, and the disks Windows has), `vcrs info --json` (the volume header and the layout,
 with the master key still hidden unless `--show-master-key` is given), `vcrs header --json`
-(the header bytes as hex), `vcrs test --json` (every self-test check with its result), and
+(the header bytes as hex), `vcrs test --json` (every self-test check with its result),
 `vcrs device-info --json` (the device, its filesystem, and what an in-place run would have to
-work with). The flag is global, so it can be written anywhere on the command line.
+work with), and the mounting commands: `vcrs mount --json` (the mount point, the disk
+Windows gave it and the target to detach later — or, without `--letter`, what a caller needs
+to log the initiator in itself), `vcrs attach --json` and `vcrs dismount --json` (the letters
+released, the serving processes stopped, the sessions logged out and the devices forgotten).
+The flag is global, so it can be written anywhere on the command line. Everything that is
+meant for a person — the elevation note, the progress lines, the serving banner — goes to
+**stderr**, so stdout carries either lines or one document, never both.
 
 Five things to know:
 
