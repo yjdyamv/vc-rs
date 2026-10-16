@@ -35,6 +35,8 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use zeroize::Zeroizing;
+
 use crate::{Error, Result};
 
 /// `KEYFILE_POOL_LEGACY_SIZE`: pool size for passwords up to 64 bytes.
@@ -90,7 +92,7 @@ pub fn apply_keyfiles(
         return Ok(password.to_vec());
     }
 
-    let pool = keyfile_pool(keyfiles, password.len(), volume)?;
+    let pool = Zeroizing::new(keyfile_pool(keyfiles, password.len(), volume)?);
     let mut out = vec![0u8; password.len().max(pool.len())];
     out[..password.len()].copy_from_slice(password);
     for (byte, mask) in out[..pool.len()].iter_mut().zip(pool.iter()) {
@@ -173,7 +175,9 @@ fn process_file(pool: &mut [u8], path: &Path) -> Result<()> {
     let mut crc: u32 = 0xFFFF_FFFF;
     let mut write_pos = 0usize;
     let mut total: u64 = 0;
-    let mut buffer = vec![0u8; 64 * 1024];
+    // A keyfile is secret material, so the staging buffer is wiped rather than
+    // handed back to the allocator with the last block of the file in it.
+    let mut buffer = Zeroizing::new(vec![0u8; 64 * 1024]);
 
     'read: loop {
         let read = file.read(&mut buffer)?;

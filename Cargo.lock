@@ -944,6 +944,7 @@ dependencies = [
  "vcrs-host",
  "vcrs-mount",
  "winapi",
+ "zeroize",
 ]
 
 [[package]]

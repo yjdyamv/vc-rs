@@ -8,6 +8,7 @@
 //! password fails rather than waiting forever.
 
 use anyhow::{Context, Result};
+use zeroize::Zeroize;
 
 /// Ask for a password, or fail with `missing` when there is nobody to ask.
 pub fn password(missing: &str) -> Result<Vec<u8>> {
@@ -23,17 +24,21 @@ pub fn new_password(missing: &str) -> Result<Vec<u8>> {
     if !at_a_terminal() {
         anyhow::bail!("{missing}");
     }
-    let first = ask("New password (not shown): ")?;
+    let mut first = ask("New password (not shown): ")?;
     if first.is_empty() {
+        first.zeroize();
         anyhow::bail!(
             "the new password would be empty — type one, or pass the empty password with \
              --password \"\" if that is really what you want"
         );
     }
-    let again = ask("Repeat the new password: ")?;
+    let mut again = ask("Repeat the new password: ")?;
     if first != again {
+        first.zeroize();
+        again.zeroize();
         anyhow::bail!("the two passwords differ");
     }
+    again.zeroize();
     Ok(first)
 }
 
@@ -56,7 +61,9 @@ pub fn secret_line(label: &str, missing: &str) -> Result<String> {
             .lock()
             .read_line(&mut line)
             .context("reading the value from standard input")?;
-        line.trim_end_matches(['\r', '\n']).to_string()
+        let text = line.trim_end_matches(['\r', '\n']).to_string();
+        line.zeroize();
+        text
     };
     if text.is_empty() {
         anyhow::bail!("{missing}");
@@ -68,9 +75,13 @@ fn ask(label: &str) -> Result<Vec<u8>> {
     use std::io::Write as _;
     eprint!("{label}");
     std::io::stderr().flush().ok();
-    let text = read_hidden()?;
+    let mut text = read_hidden()?;
     eprintln!();
-    Ok(text.into_bytes())
+    // Turning the `String` into `Vec<u8>` copies it, so wipe the `String` rather
+    // than leave the typed password in a block the allocator gets back.
+    let bytes = text.as_bytes().to_vec();
+    text.zeroize();
+    Ok(bytes)
 }
 
 /// True when there is a console on stdin, i.e. somebody is there to answer.

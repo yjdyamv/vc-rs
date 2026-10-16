@@ -363,7 +363,7 @@ impl Volume {
         let master_key = random_master_key(options.ea, &mut random)?;
         // Keyfiles are mixed into the password *before* any key derivation; the
         // backup header is then derived from the same bytes with a fresh salt.
-        let password = options.effective_password(Some(path))?;
+        let password = Zeroizing::new(options.effective_password(Some(path))?);
         let header = VolumeHeader {
             version: VOLUME_HEADER_VERSION,
             required_min_version: TC_VOLUME_MIN_REQUIRED_PROGRAM_VERSION,
@@ -466,7 +466,7 @@ impl Volume {
             .max_data_size(hidden_size)
             .ok_or_else(|| Error::InvalidParameter("hidden size too small".into()))?;
         let data_offset = layout.creation_data_offset(host_size, hidden_size)?;
-        let password = options.effective_password(Some(path))?;
+        let password = Zeroizing::new(options.effective_password(Some(path))?);
 
         let header = VolumeHeader {
             version: VOLUME_HEADER_VERSION,
@@ -559,7 +559,7 @@ impl Volume {
             None
         };
         // The keyfile pool is mixed in once; every trial below derives from it.
-        let password = options.effective_password(Some(path))?;
+        let password = Zeroizing::new(options.effective_password(Some(path))?);
 
         let mut layouts: Vec<VolumeLayout> = Vec::new();
         match options.volume_type {
@@ -1960,7 +1960,7 @@ pub fn encrypt_device_in_place(
     let device_size = info.size;
     let data_size = info.data_area_size();
     let file = device.file();
-    let password = options.effective_password(Some(&info.path))?;
+    let password = Zeroizing::new(options.effective_password(Some(&info.path))?);
     let mut random = options.random_supply()?;
 
     let backup_offset = device_size - VOLUME_HEADER_GROUP_SIZE;
@@ -2235,7 +2235,7 @@ pub fn decrypt_device_in_place(
     validate_sector_size(info.sector_size)?;
     let device_size = info.size;
     let file = device.file();
-    let password = options.effective_password(Some(&info.path))?;
+    let password = Zeroizing::new(options.effective_password(Some(&info.path))?);
 
     let backup_offset = device_size - VOLUME_HEADER_GROUP_SIZE;
     let mut region = vec![0u8; VOLUME_HEADER_SIZE as usize];
@@ -2859,7 +2859,7 @@ pub fn restore_headers_from_embedded(
         // take the primary one, the same choice a plain copy makes.
         None => primary,
         Some(options) => {
-            let password = options.effective_password(Some(path))?;
+            let password = Zeroizing::new(options.effective_password(Some(path))?);
             if decrypt_header_region(&primary, &password, options, volume_type).is_some() {
                 primary
             } else {
@@ -2922,7 +2922,7 @@ fn restore_header_region(
         return Ok(None);
     };
 
-    let password = options.effective_password(Some(path))?;
+    let password = Zeroizing::new(options.effective_password(Some(path))?);
     let Some(header) = decrypt_header_region(region, &password, options, volume_type) else {
         return Err(Error::InvalidHeader(format!(
             "the header from {source} does not open with those credentials (it is not a {} volume's \
@@ -3111,7 +3111,7 @@ pub fn restore_headers_from_master_key(
         salt: Vec::new(),
         master_key: master_key.to_vec(),
     };
-    let password = options.effective_password(Some(path))?;
+    let password = Zeroizing::new(options.effective_password(Some(path))?);
     let primary_salt = random_bytes(HEADER_SALT_SIZE)?;
     write_header_region_verified(
         &file,
