@@ -98,7 +98,8 @@ fn read_hidden() -> Result<String> {
 mod platform {
     use anyhow::{bail, Context, Result};
     use std::io::BufRead as _;
-    use winapi::um::consoleapi::{GetConsoleMode, SetConsoleMode};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use winapi::um::consoleapi::{GetConsoleMode, SetConsoleCtrlHandler, SetConsoleMode};
     use winapi::um::processenv::GetStdHandle;
     use winapi::um::winbase::STD_INPUT_HANDLE;
 
@@ -106,6 +107,27 @@ mod platform {
     /// otherwise need. Declared here for the same reason as the other constants
     /// this crate spells out.
     const ENABLE_ECHO_INPUT: u32 = 0x0004;
+
+    /// The console mode to put back, and whether the echo is off at this moment.
+    /// `Ctrl-C` at the prompt would otherwise end the process with the console
+    /// still set the way the prompt left it — and the console belongs to the
+    /// screen, not to this process, so the shell that comes back would have no
+    /// echo until somebody turned it on again.
+    static SAVED_MODE: AtomicU32 = AtomicU32::new(0);
+    static ECHO_IS_OFF: AtomicBool = AtomicBool::new(false);
+    static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+    /// Put the echo back on an interrupt, then answer `FALSE` so the default
+    /// handler still ends the process the way `Ctrl-C` normally ends it.
+    unsafe extern "system" fn on_console_event(_event: u32) -> i32 {
+        if ECHO_IS_OFF.swap(false, Ordering::SeqCst) {
+            SetConsoleMode(
+                GetStdHandle(STD_INPUT_HANDLE),
+                SAVED_MODE.load(Ordering::SeqCst),
+            );
+        }
+        0
+    }
 
     pub(super) fn at_a_terminal() -> bool {
         let mut mode = 0;
@@ -121,10 +143,19 @@ mod platform {
         if unsafe { SetConsoleMode(handle, mode & !ENABLE_ECHO_INPUT) } == 0 {
             bail!("Windows would not switch the echo off for the password");
         }
+        SAVED_MODE.store(mode, Ordering::SeqCst);
+        ECHO_IS_OFF.store(true, Ordering::SeqCst);
+        if !HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
+            unsafe { SetConsoleCtrlHandler(Some(on_console_event), 1) };
+        }
         let mut line = String::new();
         let read = std::io::stdin().lock().read_line(&mut line);
-        // Whatever happened, the console goes back the way it was.
-        unsafe { SetConsoleMode(handle, mode) };
+        // The console goes back the way it was, unless the interrupt handler
+        // already did it on the way out — the flag is what keeps the two from
+        // both restoring (and from restoring twice).
+        if ECHO_IS_OFF.swap(false, Ordering::SeqCst) {
+            unsafe { SetConsoleMode(handle, SAVED_MODE.load(Ordering::SeqCst)) };
+        }
         read.context("reading the password")?;
         Ok(line.trim_end_matches(['\r', '\n']).to_string())
     }
@@ -135,6 +166,32 @@ mod platform {
     use anyhow::{bail, Result};
     use std::io::BufRead as _;
     use std::os::fd::AsRawFd as _;
+    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+
+    /// The terminal settings to put back, and whether the echo is off at this
+    /// moment. `Ctrl-C` at the prompt would otherwise end the process with the
+    /// terminal still in no-echo mode, and a terminal keeps its settings when
+    /// the process that changed it dies: the shell that comes back is unusable
+    /// until somebody runs `stty sane`.
+    static ORIGINAL: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_mut());
+    static ECHO_IS_OFF: AtomicBool = AtomicBool::new(false);
+
+    /// Put the echo back, then take the default action so the process ends the
+    /// way `Ctrl-C` normally ends it.
+    extern "C" fn on_sigint(_signal: libc::c_int) {
+        if ECHO_IS_OFF.swap(false, Ordering::SeqCst) {
+            let original = ORIGINAL.load(Ordering::SeqCst);
+            if !original.is_null() {
+                // Only async-signal-safe calls here. The value behind the
+                // pointer was written once, before the handler was installed.
+                unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, original) };
+            }
+        }
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::raise(libc::SIGINT);
+        }
+    }
 
     pub(super) fn at_a_terminal() -> bool {
         unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
@@ -151,9 +208,23 @@ mod platform {
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) } != 0 {
             bail!("the terminal would not switch the echo off for the password");
         }
+        if ORIGINAL.load(Ordering::SeqCst).is_null() {
+            // Leaked on purpose: the signal handler has to be able to read the
+            // settings, and those outlive this call. One of these per process,
+            // and only for a run that prompts at all.
+            ORIGINAL.store(Box::leak(Box::new(original)), Ordering::SeqCst);
+            let handler = on_sigint as extern "C" fn(libc::c_int);
+            unsafe {
+                libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
+            }
+        }
+        ECHO_IS_OFF.store(true, Ordering::SeqCst);
         let mut line = String::new();
         let read = std::io::stdin().lock().read_line(&mut line);
-        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
+        // Unless the handler already put it back on the way out.
+        if ECHO_IS_OFF.swap(false, Ordering::SeqCst) {
+            unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
+        }
         read?;
         Ok(line.trim_end_matches(['\r', '\n']).to_string())
     }
