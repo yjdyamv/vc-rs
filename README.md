@@ -406,6 +406,14 @@ and `130` — the shell's number for SIGINT — an in-place run the user stopped
 That last one is not a success even though it is resumable, so a script does not read
 "done" out of a run that stopped a third of the way through.
 
+For a program, `--json` prints a machine-readable document instead of the usual lines:
+`vcrs list --json` (the same snapshot as the text form — the iSCSI sessions, the background
+servers, and the disks Windows has), `vcrs info --json` (the volume header and the layout,
+with the master key still hidden unless `--show-master-key` is given), `vcrs header --json`
+(the header bytes as hex), `vcrs test --json` (every self-test check with its result), and
+`vcrs device-info --json` (the device, its filesystem, and what an in-place run would have to
+work with). The flag is global, so it can be written anywhere on the command line.
+
 Five things to know:
 
 1. A *freshly created* container has no filesystem inside, so Windows asks to format the

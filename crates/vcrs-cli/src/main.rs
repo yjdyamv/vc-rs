@@ -23,8 +23,9 @@ use vcrs_cli::{agent, attach, detach, prompt, serve, status};
 struct Cli {
     #[command(subcommand)]
     command: Command,
-    /// Print a machine-readable JSON document instead of the usual lines, for the
-    /// commands that have one (`vcrs list --json`).
+    /// Print a machine-readable JSON document instead of the usual lines, for
+    /// the commands that have one: `list`, `info`, `header`, `test` and
+    /// `device-info`.
     #[arg(long, global = true)]
     json: bool,
 }
@@ -977,10 +978,14 @@ fn run() -> Result<()> {
         Command::Info(a) => {
             let options = a.password.open_options(a.kind.volume_type(), a.backup)?;
             let volume = Volume::open(&a.path, &options)?;
-            print_header(&volume, a.show_master_key);
+            if json {
+                print_json(&header_json(&volume, a.show_master_key))?;
+            } else {
+                print_header(&volume, a.show_master_key);
+            }
             Ok(())
         }
-        Command::Header(a) => dump_header_region(&a),
+        Command::Header(a) => dump_header_region(&a, json),
         Command::Read(a) => {
             let volume = open_ro(&a.path, &a.password, a.kind.volume_type())?;
             let mut buf = vec![0u8; a.length as usize];
@@ -1196,8 +1201,8 @@ fn run() -> Result<()> {
         }
         Command::CreateKeyfile(a) => create_keyfile(&a),
         Command::List(a) => list_mounts(&a, json),
-        Command::Test(_) => self_test(),
-        Command::DeviceInfo(a) => device_info(&a),
+        Command::Test(_) => self_test(json),
+        Command::DeviceInfo(a) => device_info(&a, json),
         Command::Mount(a) => {
             let options = a.password.open_options(a.kind.volume_type(), a.backup)?;
 
@@ -1814,11 +1819,65 @@ fn list_mounts(a: &ListArgs, json: bool) -> Result<()> {
 /// `vcrs device-info`: describe a partition or volume and whether VeraCrypt-style
 /// in-place encryption could run on it. Read-only (the optional shrink probe
 /// only asks the filesystem a question and immediately withdraws it).
-fn device_info(a: &DeviceInfoArgs) -> Result<()> {
+fn device_info(a: &DeviceInfoArgs, json: bool) -> Result<()> {
     // The shrink probe is a filesystem control code, which needs a handle with
     // write access; without the probe a read-only handle is enough.
     let device = vcrs_core::Device::open(&a.device, a.probe_shrink)?;
     let info = device.info().clone();
+
+    // The probe is the only part that talks to the filesystem, and both output
+    // forms want its answer, so it runs before either one is written.
+    let probe = if a.probe_shrink && info.ntfs.is_some() {
+        Some(device.probe_shrink(info.data_area_size()))
+    } else {
+        None
+    };
+
+    if json {
+        let mut document = serde_json::json!({
+            "device": info.path.display().to_string(),
+            "volume_path": info
+                .volume_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            "size": info.size,
+            "sector_size": info.sector_size,
+            "partition_style": info.partition_style,
+            "partition_number": info.partition_number,
+            "service_partition": info.is_service_partition,
+            "system_volume": info.is_system_volume,
+            "filesystem": info.boot_sector_fs,
+            "ntfs": info.ntfs.as_ref().map(|ntfs| serde_json::json!({
+                "serial": ntfs.serial,
+                "bytes_per_cluster": ntfs.bytes_per_cluster,
+                "total_clusters": ntfs.total_clusters,
+                "free_clusters": ntfs.free_clusters,
+                "filesystem_size": ntfs.filesystem_size(),
+                "free_bytes": ntfs.free_bytes(),
+            })),
+            "data_area_size": info.data_area_size(),
+            "data_area_start": vcrs_core::header::VOLUME_HEADER_GROUP_SIZE,
+            "backup_header_offset": info.backup_header_offset(),
+            "min_device_size": vcrs_core::device::MIN_DEVICE_SIZE,
+            "in_place_possible": info.blocker().is_none(),
+            "in_place_blocker": info.blocker(),
+            "shrink_bytes": info.shrink_bytes(),
+        });
+        if a.probe_shrink {
+            document["shrink_probe"] = match &probe {
+                None => serde_json::Value::String("skipped (the filesystem is not NTFS)".to_string()),
+                Some(Ok(vcrs_core::ShrinkProbe::Ready)) => {
+                    serde_json::Value::String("ready".to_string())
+                }
+                Some(Ok(vcrs_core::ShrinkProbe::NeedsClusterMove)) => {
+                    serde_json::Value::String("clusters would have to move".to_string())
+                }
+                Some(Err(e)) => serde_json::Value::String(format!("could not be run: {e}")),
+            };
+        }
+        print_json(&document)?;
+        return Ok(());
+    }
 
     println!("device            {}", info.path.display());
     if let Some(path) = &info.volume_path {
@@ -1917,25 +1976,42 @@ fn device_info(a: &DeviceInfoArgs) -> Result<()> {
             println!("shrink probe: skipped (the filesystem is not NTFS)");
             return Ok(());
         }
-        match device.probe_shrink(info.data_area_size()) {
-            Ok(vcrs_core::ShrinkProbe::Ready) => println!(
+        match &probe {
+            Some(Ok(vcrs_core::ShrinkProbe::Ready)) => println!(
                 "shrink probe: NTFS can give up its tail right now (no clusters would have to move)"
             ),
-            Ok(vcrs_core::ShrinkProbe::NeedsClusterMove) => println!(
+            Some(Ok(vcrs_core::ShrinkProbe::NeedsClusterMove)) => println!(
                 "shrink probe: clusters are allocated in the tail; they would have to be moved \
                  (VeraCrypt does that, or `defrag <drive> /X` before the run)"
             ),
-            Err(e) => println!("shrink probe: could not be run ({e})"),
+            Some(Err(e)) => println!("shrink probe: could not be run ({e})"),
+            None => {}
         }
     }
 
     Ok(())
 }
 
-fn self_test() -> Result<()> {
+fn self_test(json: bool) -> Result<()> {
     use vcrs_core::prf::{argon2_params, HEADER_KEY_SIZE, SALT_SIZE};
 
-    println!("vcrs self-test");
+    // Every check reports one row. `--json` collects the same rows into a
+    // document instead of printing them, so a caller can tell at a glance which
+    // check failed.
+    let mut rows: Vec<(String, String)> = Vec::new();
+    macro_rules! pass {
+        ($label:expr, $detail:expr) => {{
+            let label: String = $label.to_string();
+            let detail: String = $detail.to_string();
+            if !json {
+                println!("  {label:<26} {detail}");
+            }
+            rows.push((label, detail));
+        }};
+    }
+    if !json {
+        println!("vcrs self-test");
+    }
     let mut checks = 0usize;
 
     let crc_data: Vec<u8> = (0u8..32).collect();
@@ -1944,7 +2020,7 @@ fn self_test() -> Result<()> {
         crc == 0x9126_7E8A && vcrs_core::crc32(b"123456789") == 0xCBF4_3926,
         "crc32 self-test failed: {crc:#010x} where VeraCrypt's own test wants 0x91267e8a"
     );
-    println!("  crc32                      ok (VeraCrypt's own check value)");
+    pass!("crc32", "ok (VeraCrypt's own check value)");
     checks += 1;
 
     let salt = [0x42u8; SALT_SIZE];
@@ -1965,18 +2041,19 @@ fn self_test() -> Result<()> {
             "{prf}: the key is all zero"
         );
         let label = prf.to_string();
-        if prf == Prf::Argon2 {
+        let detail = if prf == Prf::Argon2 {
             let (memory_kib, iterations, parallelism) = argon2_params(1);
-            println!(
-                "  {label:<26} ok (PIM 1: {memory_kib} KiB, {iterations} passes, parallelism {parallelism})"
-            );
+            format!(
+                "ok (PIM 1: {memory_kib} KiB, {iterations} passes, parallelism {parallelism})"
+            )
         } else {
-            println!(
-                "  {label:<26} ok ({} iterations at PIM 1, {} at PIM 0)",
+            format!(
+                "ok ({} iterations at PIM 1, {} at PIM 0)",
                 prf.iterations(1),
                 prf.iterations(0)
-            );
-        }
+            )
+        };
+        pass!(label, detail);
         checks += 1;
     }
 
@@ -1995,10 +2072,9 @@ fn self_test() -> Result<()> {
         anyhow::ensure!(twice == buffer, "{ea}: XTS is not deterministic");
         xts.decrypt(&mut buffer, 7)?;
         anyhow::ensure!(buffer == plain, "{ea}: the XTS round trip changed the data");
-        println!(
-            "  {:<26} ok (XTS, {} byte key)",
+        pass!(
             ea.to_string(),
-            ea.key_size() * 2
+            format!("ok (XTS, {} byte key)", ea.key_size() * 2)
         );
         checks += 1;
     }
@@ -2047,11 +2123,22 @@ fn self_test() -> Result<()> {
                 && back.sector_size == header.sector_size,
             "{ea} + {prf}: the header fields were lost"
         );
-        println!("  header round trip          ok ({ea} + {prf})");
+        pass!("header round trip", format!("ok ({ea} + {prf})"));
         checks += 1;
     }
 
-    println!("all {checks} checks passed");
+    if json {
+        print_json(&serde_json::json!({
+            "ok": true,
+            "checks": checks,
+            "rows": rows
+                .iter()
+                .map(|(name, result)| serde_json::json!({ "name": name, "result": result }))
+                .collect::<Vec<_>>(),
+        }))?;
+    } else {
+        println!("all {checks} checks passed");
+    }
     Ok(())
 }
 
@@ -2156,6 +2243,52 @@ fn print_header(volume: &Volume, show_master_key: bool) {
     println!("  data size         {} bytes", volume.data_size);
 }
 
+/// The fields `print_header` prints, as a JSON document (`vcrs info --json`).
+fn header_json(volume: &Volume, show_master_key: bool) -> serde_json::Value {
+    let h = &volume.header;
+    serde_json::json!({
+        "magic": "VERA",
+        "version": h.version,
+        "required_min_version": h.required_min_version,
+        "volume_type": format!("{:?}", h.volume_type),
+        "encryption": h.ea.name(),
+        "key_bytes": h.ea.key_size(),
+        "hash": h.prf.name(),
+        "sector_size": h.sector_size,
+        "volume_data_size": h.volume_data_size,
+        "encrypted_area_start": h.encrypted_area_start,
+        "encrypted_area_length": h.encrypted_area_length,
+        "hidden_volume_data_size": h.hidden_volume_data_size,
+        "flags": h.flags,
+        "creation_time": h.creation_time,
+        "modification_time": h.modification_time,
+        "salt": hex(&h.salt),
+        // The master key decrypts the data area without the password, so it
+        // only appears when the caller asked for it -- exactly as in the text
+        // form.
+        "master_key": if show_master_key {
+            serde_json::Value::String(hex(&h.master_key))
+        } else {
+            serde_json::Value::Null
+        },
+        "host_size": volume.host_size,
+        "data_offset": volume.data_offset,
+        "data_size": volume.data_size,
+        // An unfinished in-place run leaves this behind; it is what a caller has
+        // to look at to know whether a resume is needed.
+        "in_place": volume.in_place().map(|state| serde_json::json!({
+            "encrypted_length": state.encrypted_length,
+            "remaining": state.remaining,
+        })),
+    })
+}
+
+/// Print a JSON document where the text form would have been printed.
+fn print_json(value: &serde_json::Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
 /// The master key is the one secret that decrypts the data area without the
 /// password (that is why VeraCrypt's rescue disk stores it), so it stays hidden
 /// unless the caller explicitly asks for it. VeraCrypt's format wizard does the
@@ -2171,7 +2304,7 @@ fn format_master_key(show: bool, master_key: &[u8]) -> String {
     }
 }
 
-fn dump_header_region(args: &HeaderArgs) -> Result<()> {
+fn dump_header_region(args: &HeaderArgs, json: bool) -> Result<()> {
     let len = std::fs::metadata(&args.path)?.len();
     let layout = VolumeLayout::V2Normal;
     let base = match args.backup {
@@ -2187,6 +2320,23 @@ fn dump_header_region(args: &HeaderArgs) -> Result<()> {
         VOLUME_HEADER_SIZE
     };
     let bytes = vcrs_core::volume::read_region(&args.path, base, size as usize)?;
+    if json {
+        // The text form prints the first 512 bytes of the region; the JSON form
+        // carries the same bytes as hex, and the whole region when `--short`
+        // already asked for just those 512.
+        let mut document = serde_json::json!({
+            "offset": base,
+            "length": bytes.len(),
+            "backup": args.backup,
+        });
+        if args.short {
+            document["hex"] = serde_json::Value::String(hex(&bytes));
+        } else {
+            document["first_bytes"] = serde_json::Value::String(hex(&bytes[..VOLUME_HEADER_SIZE_LEGACY as usize]));
+        }
+        print_json(&document)?;
+        return Ok(());
+    }
     println!("# {} bytes at offset {base}", bytes.len());
     print_hex_dump(0, &bytes[..VOLUME_HEADER_SIZE_LEGACY as usize]);
     if !args.short {
@@ -2514,6 +2664,24 @@ mod tests {
     }
 
     #[test]
+    /// `--json` is a global flag, so clap must accept it on every command that
+    /// has a JSON form -- otherwise the flag would be rejected before the
+    /// command runs and the document would never be printed.
+    #[test]
+    fn the_inspect_commands_accept_json() {
+        let cases: [&[&str]; 5] = [
+            &["vcrs", "list", "--json"],
+            &["vcrs", "info", "some.vc", "--json"],
+            &["vcrs", "header", "some.vc", "--json"],
+            &["vcrs", "test", "--json"],
+            &["vcrs", "device-info", "\\\\?\\E:", "--json"],
+        ];
+        for case in cases {
+            let cli = Cli::try_parse_from(case).unwrap_or_else(|err| panic!("{case:?}: {err}"));
+            assert!(cli.json, "{case:?}");
+        }
+    }
+
     fn sector_sizes_are_validated_like_veracrypt_does() {
         for good in ["512", "1024", "2048", "4096", " 4096 "] {
             assert!(parse_sector_size(good).is_ok(), "{good} should be accepted");
