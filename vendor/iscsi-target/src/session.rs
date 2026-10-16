@@ -306,6 +306,16 @@ impl IscsiSession {
         self.allowed_initiators = allowed_initiators;
     }
 
+    /// Whether this session is allowed to leave the login phase.
+    ///
+    /// An initiator can put `CSG=1` in its first login PDU and skip the Security
+    /// Negotiation stage entirely. That route reaches `FullFeaturePhase` without the
+    /// target ever being asked for a CHAP response, so when `AuthConfig` requires
+    /// authentication the session has to have completed it before it transits.
+    pub fn login_may_transit(&self) -> bool {
+        !self.auth_config.requires_auth() || self.chap_completed
+    }
+
     /// Handle CHAP authentication during security negotiation
     /// Returns (success, response_params)
     fn handle_chap_auth(&mut self, login_params: &[(String, String)]) -> ScsiResult<(bool, Vec<(String, String)>)> {
@@ -861,8 +871,9 @@ impl IscsiSession {
         }
 
         // Determine response transit flags
-        // Only allow transit if authentication is complete (or not required)
-        let transit = login.transit && auth_complete;
+        // Only allow transit if authentication is complete (or not required), and
+        // never on a session that skipped a required authentication altogether.
+        let transit = login.transit && auth_complete && self.login_may_transit();
         log::debug!("Transition logic: login.transit={}, auth_complete={}, transit={}",
             login.transit, auth_complete, transit);
         let (response_csg, response_nsg, response_transit) = if transit {

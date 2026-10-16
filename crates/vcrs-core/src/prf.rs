@@ -23,12 +23,31 @@ pub const HEADER_KEY_SIZE: usize = 192;
 /// Size of the random per-header salt.
 pub const SALT_SIZE: usize = 64;
 
+/// The largest PIM VeraCrypt's dialogs accept. Above it the count is refused
+/// rather than clamped: a PIM out of range is a typo, and a typo here means a
+/// key derivation weaker than the operator believes they asked for.
+///
+/// (VeraCrypt's own maximum, `MAX_PIM_VALUE` in `src/Common/Pkcs5.h`.)
+pub const MAX_PIM: i32 = 2_147_468;
+
+/// Whether a PIM is one this program will use.
+pub const fn pim_is_valid(pim: i32) -> bool {
+    pim >= 0 && pim <= MAX_PIM
+}
+
 /// The PBKDF2 iteration count for a given PIM.
+///
+/// Saturating, not wrapping: with `[profile.release]` leaving `overflow-checks`
+/// off, `15_000 + pim * 1_000` would wrap for a large PIM and produce a count
+/// *weaker* than the default 500 000 — `pim = 4_294_968` wrapped to 15 704, a
+/// 32-times weaker derivation, with no error anywhere. Callers reject such a PIM
+/// (see [`pim_is_valid`]); this is the second line of defence.
 pub const fn pbkdf2_iterations(pim: i32) -> u32 {
     if pim <= 0 {
         500_000
     } else {
-        15_000 + (pim as u32) * 1_000
+        let pim = pim as u32;
+        15_000u32.saturating_add(pim.saturating_mul(1_000))
     }
 }
 
@@ -39,8 +58,10 @@ pub const fn pbkdf2_iterations(pim: i32) -> u32 {
 pub fn argon2_params(pim: i32) -> (u32, u32, u32) {
     // VeraCrypt clamps a negative PIM to 0 and then maps 0 to the default 12
     // (`get_argon2_params` in src/Common/Pkcs5.c).
-    let pim = if pim <= 0 { 12 } else { pim };
-    let mem_mib = std::cmp::min(64 + (pim - 1) * 32, 1024);
+    let pim = if pim <= 0 { 12 } else { pim.min(MAX_PIM) };
+    // Saturating: the arithmetic here used to be the only thing standing between a
+    // wild PIM and a nonsensical memory/time cost, and it stood on i32 overflow.
+    let mem_mib = std::cmp::min(64i32.saturating_add((pim - 1).saturating_mul(32)), 1024);
     let t = if pim <= 31 {
         3 + (pim - 1) / 3
     } else {

@@ -43,6 +43,7 @@ pub mod error;
 pub mod header;
 pub mod keyfile;
 pub mod layout;
+pub mod memlock;
 pub mod prf;
 pub mod random;
 pub mod volume;
@@ -54,7 +55,7 @@ pub use error::{Error, Result};
 pub use header::{crc32, VolumeHeader, VolumeType};
 pub use keyfile::apply_keyfiles;
 pub use layout::VolumeLayout;
-pub use prf::Prf;
+pub use prf::{pim_is_valid, Prf, MAX_PIM};
 pub use random::RandomSupply;
 pub use volume::{
     backup_headers, decrypt_device_in_place, decrypt_in_place, decrypt_in_place_stopping_after,

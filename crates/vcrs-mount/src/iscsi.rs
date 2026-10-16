@@ -95,6 +95,12 @@ pub const ISCSI_PORT: u16 = 3260;
 /// Default target name (an IQN is required by the initiator).
 pub const DEFAULT_TARGET_NAME: &str = "iqn.2025-12.io.vcrs:volume";
 
+/// The prefix of every name this program generates itself.
+pub const IQN_PREFIX: &str = "iqn.2025-12.io.vcrs:";
+
+/// Bytes of randomness in a generated target name (48 bits, 12 hex digits).
+pub const RANDOM_IQN_BYTES: usize = 6;
+
 /// Start LBA of the synthetic partition: the conventional 1 MiB alignment, which
 /// keeps every filesystem happy (and matches what Windows itself uses).
 pub const DEFAULT_PARTITION_START_LBA: u64 = 2048;
@@ -191,21 +197,54 @@ impl Default for IscsiMountOptions {
 }
 
 impl IscsiMountOptions {
-    /// The default options, with the target name derived from a container path
-    /// so that several volumes can be served at once without name clashes.
+    /// The default options, with a target name that gives nothing away.
+    ///
+    /// The name used to be derived from the container's file name. An IQN is not
+    /// private: it is registered as a *static* target with the Microsoft iSCSI
+    /// Initiator (which requires elevation and keeps the list in the registry), it
+    /// appears in the initiator's event log, in `iscsicli ListTargets`, in this
+    /// program's output and in the `%TEMP%` log the mount leaves behind. A name
+    /// taken from the file turned, for example, `divorce-settlement.vc` into
+    /// `iqn.2025-12.io.vcrs:divorce-settlement`, written into the machine's
+    /// registry where it outlives the container — and a *stable* name also meant
+    /// that two mounts of the same container were linkable to each other.
+    ///
+    /// A name drawn at random per mount keeps the volume identifyable to the
+    /// session using it and to nobody else. Nothing is derived from it and it is
+    /// not a secret; it is only there to be unlinkable. If the system generator is
+    /// unavailable the file name is used as a fallback, because a usable name beats
+    /// failing the mount, and the host layer checks the name it is given either way.
     pub fn for_volume(path: &Path) -> Self {
         let mut opts = IscsiMountOptions::default();
+        if let Some(name) = random_target_name() {
+            opts.target_name = name;
+            return opts;
+        }
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
             let sanitised: String = stem
                 .chars()
                 .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
                 .collect();
             if !sanitised.is_empty() {
-                opts.target_name = format!("iqn.2025-12.io.vcrs:{sanitised}");
+                opts.target_name = format!("{IQN_PREFIX}{sanitised}");
             }
         }
         opts
     }
+}
+
+/// A fresh `iqn.2025-12.io.vcrs:<48 random bits>` name, or `None` when the
+/// system's random generator is not available.
+fn random_target_name() -> Option<String> {
+    use std::fmt::Write as _;
+
+    let bytes = vcrs_core::random_bytes(RANDOM_IQN_BYTES).ok()?;
+    debug_assert_eq!(bytes.len(), RANDOM_IQN_BYTES);
+    let mut hex = String::with_capacity(RANDOM_IQN_BYTES * 2);
+    for byte in bytes {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Some(format!("{IQN_PREFIX}{hex}"))
 }
 
 /// Turns an iSCSI layer failure into a `vcrs-core` error.

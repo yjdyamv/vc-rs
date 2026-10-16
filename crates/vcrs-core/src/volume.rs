@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
+use zeroize::{Zeroize, Zeroizing};
+
 use crate::cipher::EncryptionAlgorithm;
 use crate::keyfile::apply_keyfiles;
 use crate::header::{
@@ -593,7 +595,12 @@ impl Volume {
             }
 
             for prf in &prfs {
-                let mut header_key = vec![0u8; HEADER_KEY_SIZE];
+                let mut header_key = Zeroizing::new(vec![0u8; HEADER_KEY_SIZE]);
+                // Derived header keys are as sensitive as the master key they unwrap,
+                // and this one is rebuilt for every candidate in this loop. The lock is
+                // taken before the key is written into the buffer, so the secret is
+                // never in a page that could be paged out (see `memlock`).
+                crate::memlock::lock(&header_key[..]);
                 prf.derive(&password, &region[..HEADER_SALT_SIZE], options.pim, &mut header_key)?;
 
                 // One 192-byte derived key serves every encryption algorithm
@@ -612,8 +619,14 @@ impl Volume {
                             // A zero-length encrypted area is only plausible for a volume
                             // whose in-place encryption has not written a byte yet.
                             let starting_in_place = header.flags & HEADER_FLAG_NONSYS_INPLACE_ENC != 0;
+                            // `saturating_add` on purpose: both fields come out of the
+                            // (attacker-controlled) header, so a crafted pair could add up
+                            // to less than `host_size` after wrapping `u64` and slip past.
                             if (!starting_in_place && header.encrypted_area_length == 0)
-                                || header.encrypted_area_start + header.encrypted_area_length > host_size
+                                || header
+                                    .encrypted_area_start
+                                    .saturating_add(header.encrypted_area_length)
+                                    > host_size
                             {
                                 log::debug!(
                                     "{layout:?}/{prf}/{ea}: header parsed but area {}+{} is outside the {host_size}-byte host",
@@ -736,7 +749,9 @@ impl Volume {
     /// volume data area.
     pub fn read_data(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         let Some(state) = self.in_place else {
-            return self.read_at(self.data_offset + offset, buf);
+            // The offset is initiator-controlled and this branch has no range check of
+            // its own before the add; `read_at` rejects the wrapped result.
+            return self.read_at(self.data_offset.saturating_add(offset), buf);
         };
         self.check_data_range(offset, buf.len())?;
         // Until the run finishes the volume is half plaintext, half ciphertext,
@@ -766,19 +781,25 @@ impl Volume {
                 remaining: state.remaining,
             });
         }
-        self.write_at(self.data_offset + offset, buf)
+        self.write_at(self.data_offset.saturating_add(offset), buf)
     }
 
     /// Read `count` decrypted sectors starting at volume sector `sector`.
     pub fn read_sectors(&self, sector: u64, count: usize) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; count * DATA_UNIT_SIZE];
-        self.read_data(sector * DATA_UNIT_SIZE as u64, &mut buf)?;
+        // Both numbers come from an initiator's CDB. `count` also decides an
+        // allocation, and a failed allocation aborts the process instead of returning
+        // an error, so it is checked rather than multiplied blindly.
+        let len = count.checked_mul(DATA_UNIT_SIZE).ok_or_else(|| {
+            Error::InvalidParameter(format!("{count} sectors is too many to read at once"))
+        })?;
+        let mut buf = vec![0u8; len];
+        self.read_data(sector.saturating_mul(DATA_UNIT_SIZE as u64), &mut buf)?;
         Ok(buf)
     }
 
     /// Overwrite `data` (a whole number of sectors) at volume sector `sector`.
     pub fn write_sectors(&self, sector: u64, data: &[u8]) -> Result<()> {
-        self.write_data(sector * DATA_UNIT_SIZE as u64, data)
+        self.write_data(sector.saturating_mul(DATA_UNIT_SIZE as u64), data)
     }
 
     /// Turn on VeraCrypt's hidden-volume protection for `range` (host bytes).
@@ -1067,12 +1088,14 @@ impl Volume {
                 "host offset and length must be multiples of {DATA_UNIT_SIZE}, got {host_offset}/{len}"
             )));
         }
-        let end = host_offset + len as u64;
-        if host_offset < self.data_offset || end > self.data_offset + self.data_size {
+        // Saturating: a caller-supplied `host_offset` near `u64::MAX` would otherwise
+        // wrap to a small end and pass the test below.
+        let end = host_offset.saturating_add(len as u64);
+        let area_end = self.data_offset.saturating_add(self.data_size);
+        if host_offset < self.data_offset || end > area_end {
             return Err(Error::InvalidParameter(format!(
-                "range {host_offset}..{end} is outside the volume data area {}..{}",
-                self.data_offset,
-                self.data_offset + self.data_size
+                "range {host_offset}..{end} is outside the volume data area {}..{area_end}",
+                self.data_offset
             )));
         }
         Ok(())
@@ -1088,10 +1111,10 @@ impl Volume {
                 "data offset and length must be multiples of {DATA_UNIT_SIZE}, got {offset}/{len}"
             )));
         }
-        if offset + len as u64 > self.data_size {
+        let end = offset.saturating_add(len as u64);
+        if end > self.data_size {
             return Err(Error::InvalidParameter(format!(
-                "range {offset}..{} is outside the {} byte volume data area",
-                offset + len as u64,
+                "range {offset}..{end} is outside the {} byte volume data area",
                 self.data_size
             )));
         }
@@ -1196,7 +1219,7 @@ fn build_header_region(
     pim: i32,
     salt: &[u8],
 ) -> Result<Vec<u8>> {
-    let mut header_key = vec![0u8; HEADER_KEY_SIZE];
+    let mut header_key = Zeroizing::new(vec![0u8; HEADER_KEY_SIZE]);
     header.prf.derive(password, salt, pim, &mut header_key)?;
     header.encrypt_with_salt(VOLUME_HEADER_SIZE as usize, &header_key, salt)
 }
@@ -1498,6 +1521,11 @@ pub fn encrypt_in_place_stopping_after(
         }
 
         if since_update >= IN_PLACE_HEADER_UPDATE_INTERVAL || encrypted_length == data_size {
+            // The data has to be on the disk before the header that claims it is
+            // ciphertext: with the two in the other order a power cut leaves a
+            // header saying "encrypted up to here" over bytes that are still
+            // plaintext, and a resume skips them for good.
+            file.sync_all()?;
             // VeraCrypt's FastVolumeHeaderUpdate: same salt and key, new lengths.
             write_header_region(&file, backup_offset, &header, password, pim, &backup_salt)?;
             file.sync_all()?;
@@ -1731,6 +1759,10 @@ pub fn decrypt_in_place_stopping_after(
         }
 
         if since_update >= IN_PLACE_HEADER_UPDATE_INTERVAL || remaining == 0 {
+            // See the encrypt path: the data goes to the disk first, the header
+            // that describes it second, so a crash never claims a plaintext byte
+            // as encrypted.
+            file.sync_all()?;
             // VeraCrypt's FastVolumeHeaderUpdate: same salt and key, new lengths.
             write_header_region(file, backup_offset, &header, password, pim, &backup_salt)?;
             file.sync_all()?;
@@ -1746,6 +1778,7 @@ pub fn decrypt_in_place_stopping_after(
 
     let finished = remaining == 0;
     if !finished && since_update > 0 {
+        file.sync_all()?;
         write_header_region(file, backup_offset, &header, password, pim, &backup_salt)?;
         file.sync_all()?;
     }
@@ -1853,7 +1886,7 @@ fn open_in_place_header(
     let prfs = std::iter::once(preferred_prf)
         .chain(Prf::ALL.into_iter().filter(|prf| *prf != preferred_prf));
     for prf in prfs {
-        let mut header_key = vec![0u8; HEADER_KEY_SIZE];
+        let mut header_key = Zeroizing::new(vec![0u8; HEADER_KEY_SIZE]);
         if prf
             .derive(password, &region[..HEADER_SALT_SIZE], pim, &mut header_key)
             .is_err()
@@ -1929,7 +1962,11 @@ pub fn encrypt_device_in_place(
                     data_size
                 )));
             }
-            if header.encrypted_area_start + header.encrypted_area_length != backup_offset {
+            if header
+                .encrypted_area_start
+                .saturating_add(header.encrypted_area_length)
+                != backup_offset
+            {
                 return Err(Error::InvalidParameter(format!(
                     "{} reports an inconsistent in-place encrypted area (start {}, length {}, data area {})",
                     info.path.display(),
@@ -2079,6 +2116,10 @@ pub fn encrypt_device_in_place(
             break;
         }
         if done - last_update >= IN_PLACE_HEADER_UPDATE_INTERVAL || done == total {
+            // The device has to be flushed before the header that claims those
+            // bytes are ciphertext: the reverse order leaves a header over
+            // plaintext after a power cut, and a resume skips that region.
+            file.sync_all().map_err(Error::Io)?;
             // VeraCrypt's FastVolumeHeaderUpdate: the same salt and key, so the
             // run can be resumed from the backup header at any point.
             header.encrypted_area_start = start;
@@ -2214,6 +2255,9 @@ pub fn decrypt_device_in_place(
             break;
         }
         if last_update - done >= IN_PLACE_HEADER_UPDATE_INTERVAL || done == 0 {
+            // See the encrypt path: the moved data lands first, then the header
+            // that records it.
+            file.sync_all().map_err(Error::Io)?;
             header.encrypted_area_start = start;
             header.encrypted_area_length = done;
             write_header_region(file, backup_offset, &header, &password, options.pim, &backup_salt)?;
@@ -2292,7 +2336,7 @@ fn read_backup_header(
     }
     let mut region = vec![0u8; VOLUME_HEADER_SIZE as usize];
     read_exact_at(file, backup_offset, &mut region)?;
-    let mut header_key = vec![0u8; HEADER_KEY_SIZE];
+    let mut header_key = Zeroizing::new(vec![0u8; HEADER_KEY_SIZE]);
     prf.derive(password, &region[..HEADER_SALT_SIZE], pim, &mut header_key)?;
     match VolumeHeader::decrypt(&region, &header_key, ea, prf) {
         Ok(header) => Ok(Some(header)),
@@ -2318,9 +2362,18 @@ fn random_supply(options: &CreateOptions) -> Result<RandomSupply> {
     let Some(path) = options.random_source.as_deref() else {
         return Ok(RandomSupply::system());
     };
+    // The strongest warning in the program, because this switch is the one way the
+    // user can silently destroy the volume's confidentiality: the salt and the
+    // master key are drawn from the stream, so whoever holds this file can decrypt
+    // the data area *without the password* — and because the stream restarts at
+    // block 0 for every container, building two containers from the same file
+    // reuses the XTS keystream at the same offsets, which is a two-time pad.
     log::warn!(
-        "reading the volume's random bytes from {}: this container's key material is reproducible \
-         from that file, so it is only safe for tests and audits",
+        "reading the volume's random bytes from {}: this container's salt and master key are \
+         reproducible from that file, so it is only safe for tests and audits. Anyone who has \
+         {} can decrypt this volume without the password, and building a second container from \
+         the same file would reuse the same keystream",
+        path.display(),
         path.display()
     );
     RandomSupply::from_file(path)
@@ -2331,6 +2384,9 @@ fn random_master_key(ea: EncryptionAlgorithm, random: &mut RandomSupply) -> Resu
     loop {
         let key = random.bytes(key_size * 2)?;
         if key[..key_size] != key[key_size..] {
+            // Locked from the moment it exists: for the rest of the volume's life
+            // this is the only thing that decrypts the data area.
+            crate::memlock::lock(&key);
             return Ok(key);
         }
         log::warn!("generated an XTS key whose halves are equal; retrying");
@@ -2668,6 +2724,12 @@ impl Drop for Volume {
                 log::warn!("could not restore the container's timestamp: {e}");
             }
         }
+        // The master key is the thing that actually decrypts the data area, and it
+        // is the reason a volume can be handed to a helper process without the
+        // password. `README.md` said these were "zeroized where practical"; this is
+        // the practical part. (The XTS key lives inside the Botan block-cipher
+        // objects, which wipe their own state when they are dropped.)
+        self.header.master_key.zeroize();
     }
 }
 
@@ -2887,7 +2949,7 @@ fn decrypt_header_region(
         None => EncryptionAlgorithm::ALL.to_vec(),
     };
     for prf in prfs {
-        let mut header_key = vec![0u8; HEADER_KEY_SIZE];
+        let mut header_key = Zeroizing::new(vec![0u8; HEADER_KEY_SIZE]);
         if prf
             .derive(password, &region[..HEADER_SALT_SIZE], options.pim, &mut header_key)
             .is_err()

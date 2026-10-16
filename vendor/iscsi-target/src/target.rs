@@ -651,6 +651,52 @@ fn handle_scsi_command<D: ScsiBlockDevice>(
     build_scsi_response(data, &cmd, response)
 }
 
+/// The largest single WRITE this target will hold in memory at once.
+///
+/// A real initiator keeps `MaxBurstLength` at 256 KiB by default, so nothing
+/// legitimate comes close to this; it exists because the length comes straight out
+/// of the CDB and WRITE(32) can ask for 4 Gi blocks, which would otherwise be a
+/// many-gigabyte allocation made on behalf of whoever sent the packet.
+const MAX_WRITE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Check the LBA span and size of a WRITE before any of it is trusted.
+///
+/// Everything here comes from the CDB, so the checks run before the buffer below is
+/// allocated from `transfer_length`, and `immediate_len` (the data that arrived in
+/// the command PDU itself) is checked against that same length: it is copied into
+/// that buffer.
+fn check_write_span(
+    lba: u64,
+    transfer_length: u32,
+    block_size: u32,
+    capacity: u64,
+    immediate_len: usize,
+) -> std::result::Result<usize, crate::scsi::SenseData> {
+    if lba.saturating_add(transfer_length as u64) > capacity {
+        return Err(crate::scsi::SenseData::lba_out_of_range(
+            (lba & 0xFFFF_FFFF) as u32,
+        ));
+    }
+    let expected_data_len = (transfer_length as usize).saturating_mul(block_size as usize);
+    if expected_data_len > MAX_WRITE_BYTES {
+        log::error!(
+            "WRITE of {} bytes refused: over the {} byte in-memory limit",
+            expected_data_len,
+            MAX_WRITE_BYTES
+        );
+        return Err(crate::scsi::SenseData::invalid_command());
+    }
+    if immediate_len > expected_data_len {
+        log::error!(
+            "WRITE carried {} bytes of immediate data for a {} byte transfer, refused",
+            immediate_len,
+            expected_data_len
+        );
+        return Err(crate::scsi::SenseData::invalid_command());
+    }
+    Ok(expected_data_len)
+}
+
 fn handle_write_command<D: ScsiBlockDevice>(
     data: &mut SessionData,
     pdu: &IscsiPdu,
@@ -687,11 +733,20 @@ fn handle_write_command<D: ScsiBlockDevice>(
     };
 
     if transfer_length > 0 {
-        let device_guard = device.lock().map_err(|_| IscsiError::Scsi("Device lock poisoned".to_string()))?;
-        let block_size = device_guard.block_size();
-        drop(device_guard);
+        let (block_size, capacity) = {
+            let device_guard = device.lock().map_err(|_| IscsiError::Scsi("Device lock poisoned".to_string()))?;
+            (device_guard.block_size(), device_guard.capacity())
+        };
 
-        let expected_data_len = transfer_length as usize * block_size as usize;
+        let expected_data_len = match check_write_span(lba, transfer_length, block_size, capacity, pdu.data.len()) {
+            Ok(len) => len,
+            Err(sense) => {
+                return Ok(vec![IscsiPdu::scsi_response(
+                    cmd.itt, data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
+                    pdu::scsi_status::CHECK_CONDITION, 0, 0, Some(&sense.to_bytes()),
+                )]);
+            }
+        };
         let bytes_received = pdu.data.len() as u32;
 
         // Check if this is a single-PDU write (all data fits in immediate data)
@@ -865,7 +920,7 @@ fn handle_scsi_data_out<D: ScsiBlockDevice>(
     let block_size = pending.block_size;
     let transfer_length = pending.transfer_length;
     let lba = pending.lba;
-    let total_expected = transfer_length * block_size;
+    let total_expected = transfer_length.saturating_mul(block_size);
 
     // Copy data into buffer at the correct offset
     let start_offset = data_out.buffer_offset as usize;
@@ -1696,11 +1751,20 @@ fn handle_write_command_boxed(
     };
 
     if transfer_length > 0 {
-        let device_guard = device.lock().map_err(|_| IscsiError::Scsi("Device lock poisoned".to_string()))?;
-        let block_size = device_guard.block_size();
-        drop(device_guard);
+        let (block_size, capacity) = {
+            let device_guard = device.lock().map_err(|_| IscsiError::Scsi("Device lock poisoned".to_string()))?;
+            (device_guard.block_size(), device_guard.capacity())
+        };
 
-        let expected_data_len = transfer_length as usize * block_size as usize;
+        let expected_data_len = match check_write_span(lba, transfer_length, block_size, capacity, pdu.data.len()) {
+            Ok(len) => len,
+            Err(sense) => {
+                return Ok(vec![IscsiPdu::scsi_response(
+                    cmd.itt, data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
+                    pdu::scsi_status::CHECK_CONDITION, 0, 0, Some(&sense.to_bytes()),
+                )]);
+            }
+        };
         let bytes_received = pdu.data.len() as u32;
 
         // Check if this is a single-PDU write (all data fits in immediate data)
@@ -1796,7 +1860,7 @@ fn handle_scsi_data_out_boxed(
     let block_size = pending.block_size;
     let transfer_length = pending.transfer_length;
     let lba = pending.lba;
-    let total_expected = transfer_length * block_size;
+    let total_expected = transfer_length.saturating_mul(block_size);
 
     // Copy incoming data into pending buffer
     let offset = data_out.buffer_offset as usize;

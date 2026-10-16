@@ -330,6 +330,11 @@ impl VolumeHeader {
         }
 
         let master_key = key_area[..key_len].to_vec();
+        // The data area's key, and the one secret an examiner would want most: it
+        // decrypts the volume without the password. Keeping it out of the page file
+        // for as long as it lives is the cheapest thing that can be done about
+        // `pagefile.sys` (see `memlock`).
+        crate::memlock::lock(&master_key);
         let hidden_volume_data_size = u64::from_be_bytes(
             plain[OFF_HIDDEN_VOLUME_SIZE..OFF_HIDDEN_VOLUME_SIZE + 8].try_into().unwrap(),
         );

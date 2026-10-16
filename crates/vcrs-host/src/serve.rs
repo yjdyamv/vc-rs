@@ -92,9 +92,25 @@ fn slug(iqn: &str) -> String {
 /// recognisable even if the container is moved later, and two mounted volumes do
 /// not fight over the same port. The password goes in over a pipe rather than on
 /// the command line, so it does not end up in a second process's arguments.
+/// The tag that tells the framed stdin payload from a password that simply *is*
+/// all of stdin. The CLI reads the same constant, so the two cannot drift apart.
+pub const STDIN_SECRETS_TAG: &str = "vcrs-stdin-secrets v1";
+
+/// Hex, for the framed stdin payload: a password may contain a newline, which is
+/// what a line-per-secret payload would otherwise lose.
+fn hex_encode(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 pub fn spawn(
     iqn: &str,
-    password: &[u8],
+    secrets: &[&[u8]],
     letter: Option<char>,
     bind: &str,
     report: &mut Report,
@@ -136,10 +152,18 @@ pub fn spawn(
         letter,
     };
 
-    // The password, and nothing else: `--password-stdin` reads to end of file.
+    // The secrets are framed rather than sent raw: the hidden volume's password has
+    // to reach the child as well, one stdin cannot be read twice, and neither
+    // password may go back into an argument list (see [`child_arguments`]).
     if let Some(mut stdin) = child.stdin.take() {
+        let mut payload = String::from(STDIN_SECRETS_TAG);
+        payload.push('\n');
+        for secret in secrets {
+            payload.push_str(&hex_encode(secret));
+            payload.push('\n');
+        }
         stdin
-            .write_all(password)
+            .write_all(payload.as_bytes())
             .context("giving the background server the password")?;
         stdin.flush().ok();
         // Dropped here, which closes the pipe.
@@ -259,7 +283,16 @@ fn read_state(path: &std::path::Path) -> Option<Server> {
     for line in text.lines() {
         match line.split_once('=') {
             Some(("pid", value)) => pid = value.trim().parse::<u32>().ok(),
-            Some(("log", value)) => log = Some(PathBuf::from(value.trim())),
+            Some(("log", value)) => {
+                let value = PathBuf::from(value.trim());
+                // The state file lives in `%TEMP%`, which the invoking user can write,
+                // so its `log=` line is attacker-controlled input. Without this check a
+                // planted file would make every error message read (and print the tail
+                // of) an arbitrary file — `C:\Windows\System32\config\SAM`, say.
+                if in_temp_dir(&value) {
+                    log = Some(value);
+                }
+            }
             Some(("iqn", value)) => iqn = Some(value.trim().to_string()),
             Some(("letter", value)) => letter = value.trim().chars().next(),
             _ => {}
@@ -280,9 +313,80 @@ fn read_state(path: &std::path::Path) -> Option<Server> {
     })
 }
 
+/// Whether a path is inside this process's temporary directory.
+///
+/// The state files (and the logs they name) are only ever written there, so a path
+/// that points somewhere else was planted. The canonical check is what rejects a
+/// `%TEMP%\..\..\Windows\...` that starts out looking like one of ours.
+fn in_temp_dir(path: &std::path::Path) -> bool {
+    let dir = std::env::temp_dir();
+    if !path.starts_with(&dir) {
+        return false;
+    }
+    match (path.canonicalize(), dir.canonicalize()) {
+        (Ok(path), Ok(dir)) => path.starts_with(&dir),
+        // A log that was already deleted (or a directory we cannot resolve) cannot be
+        // followed anywhere, so the lexical answer stands.
+        _ => true,
+    }
+}
+
 /// Forget a server's state file (after it went away, or after it was stopped).
+///
+/// Its log goes with it: the log names the container (the default target name is
+/// derived from the file name), so leaving it in `%TEMP%` leaves the name of an
+/// encrypted volume on disk after the volume was dismounted. It is only removed
+/// when it really is one of ours — the path comes from the state file, and
+/// removing whatever it named would be an arbitrary file deletion.
 pub fn forget(iqn: &str) {
+    if let Some(server) = read_state(&Server::state_path(iqn)) {
+        if in_temp_dir(&server.log) {
+            let _ = fs::remove_file(&server.log);
+        }
+    }
     let _ = fs::remove_file(Server::state_path(iqn));
+}
+
+/// Whether an open process handle is this program (a `vcrs.exe`).
+///
+/// State files live in `%TEMP%`, a directory the calling user can write, so their
+/// `pid=` line is attacker-controlled input, and without this check a planted
+/// `vcrs-*.server` would turn `vcrs dismount` — which runs elevated, because it has
+/// to touch disks and letters — into "terminate any process on this machine". The
+/// image name is the strongest claim a handle can be asked for without reading the
+/// command line, and it also refuses the ordinary accident of a state file that
+/// outlived its server and a pid that got reused.
+#[cfg(windows)]
+unsafe fn is_this_program(handle: winapi::shared::ntdef::HANDLE) -> bool {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use winapi::shared::minwindef::DWORD;
+    use winapi::um::winbase::QueryFullProcessImageNameW;
+
+    let mut buf = [0u16; 260];
+    let mut len: DWORD = buf.len() as DWORD;
+    // `PROCESS_NAME_WIN32` (0) returns the Win32 path, without the terminator.
+    if unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len) } == 0 {
+        // A process we cannot even name is not one we will end.
+        return false;
+    }
+    let path = OsString::from_wide(&buf[..len as usize]);
+    let Some(name) = std::path::Path::new(&path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+    else {
+        return false;
+    };
+    // Compare against *this* program's own name rather than the literal
+    // "vcrs.exe": the server is a copy of `std::env::current_exe()`, so a renamed
+    // or rebuilt binary still matches, while an unrelated process does not. (The
+    // check fails closed — a process it cannot recognise is left running, and
+    // `dismount` says so instead of pretending it stopped it.)
+    let ours = std::env::current_exe().ok().and_then(|exe| {
+        exe.file_name()
+            .map(|name| name.to_string_lossy().to_string())
+    });
+    ours.is_some_and(|ours| name.eq_ignore_ascii_case(&ours))
 }
 
 /// Stop a background server, waiting first: the target often ends by itself a
@@ -313,6 +417,10 @@ pub fn wait_and_kill(pid: u32, timeout: Duration) -> &'static str {
             // It is gone (or somebody else owns it and we are not elevated, which
             // cannot happen here: the worker runs elevated).
             return "gone";
+        }
+        if !is_this_program(handle) {
+            CloseHandle(handle);
+            return "refused";
         }
         let deadline = std::time::Instant::now() + timeout;
         let mut code: u32;
@@ -367,6 +475,14 @@ pub fn stop(server: &Server, report: &mut Report) -> bool {
             ));
             true
         }
+        "refused" => {
+            report.line(&format!(
+                "the state file for {} names pid {}, which is not a vcrs server; it was left \
+                 alone and the state file was dropped",
+                server.iqn, server.pid
+            ));
+            false
+        }
         other => {
             report.line(&format!(
                 "could not stop the background server (pid {}): {}",
@@ -378,8 +494,23 @@ pub fn stop(server: &Server, report: &mut Report) -> bool {
     }
 }
 
+/// Whether an *option* names a secret that must not be copied into a second,
+/// long-lived process's command line.
+///
+/// This is a *rule* rather than a list of flag names on purpose. The list this
+/// replaces missed `--hidden-password`, `--protection-password` and the attached
+/// `-phunter2` form, and a list is a thing that goes stale the next time a flag is
+/// added; "no password goes into an argument" does not. Only option-like
+/// arguments are considered: a *container* may well be called `secret.vc`.
+/// (`--password-stdin` and friends match too and are dropped, because the parent
+/// adds its own back.)
+fn is_secret_argument(argument: &str) -> bool {
+    let lower = argument.to_ascii_lowercase();
+    lower.contains("password") || lower.contains("secret") || lower.contains("master-key")
+}
+
 /// This program's own `mount` arguments, minus what only the foreground wants,
-/// plus the pinned target name, the pinned portal and `--password-stdin`.
+/// plus the pinned target name, the pinned portal and the stdin secrets.
 fn child_arguments(
     iqn: &str,
     bind: &str,
@@ -391,21 +522,45 @@ fn child_arguments(
         bail!("the background server can only be started from `vcrs mount`");
     }
     let mut out: Vec<OsString> = vec![subcommand.expect("checked above")];
+    // With hidden-volume protection the child needs the hidden password too, and
+    // the only way left to hand it over is the pipe.
+    let mut protect_hidden = false;
     while let Some(arg) = iter.next() {
         let text = arg.to_string_lossy().to_string();
+        if text == "--protect-hidden" {
+            protect_hidden = true;
+        }
         match text.as_str() {
             // The drive letter is dealt with by the parent, and a child that
             // also asked for it would fight over the same session.
-            "--letter" | "--foreground" | "--password" | "-p" | "--target-name" | "--bind" => {
+            "--letter" | "--target-name" | "--bind" => {
                 let _ = iter.next();
             }
-            "--password-stdin" => {}
+            // `--foreground` is a switch and takes no value, so the next argument
+            // must not be swallowed with it. The old filter listed it with the
+            // value-taking options and so ate the argument that followed it —
+            // `vcrs mount --foreground secret.vc` lost the container.
+            "--foreground" => {}
+            // Both are re-added below, from the parent's own knowledge.
+            "--password-stdin" | "--hidden-password-stdin" => {}
+            // `-phunter2` is `--password hunter2` in one token, and bare `-p`
+            // takes the next one.
+            "-p" => {
+                let _ = iter.next();
+            }
+            _ if text.starts_with("-p") && !text.starts_with("--") => {}
             _ if text.starts_with("--letter=")
-                || text.starts_with("--password=")
                 || text.starts_with("--target-name=")
                 || text.starts_with("--bind=") =>
             {
                 // Skip: the value is inside this argument.
+            }
+            _ if text.starts_with('-') && is_secret_argument(&text) => {
+                // A secret's value goes with it, or it would be left behind as a
+                // stray positional — which clap would then read as the volume.
+                if !text.contains('=') && !text.ends_with("-stdin") {
+                    let _ = iter.next();
+                }
             }
             _ => out.push(arg),
         }
@@ -432,7 +587,16 @@ fn child_arguments(
     out.push(OsString::from(iqn));
     out.push(OsString::from("--bind"));
     out.push(OsString::from(bind));
+    // The parent only lets a non-loopback bind through when the user asked for it
+    // (`--allow-remote`), so the child has to be told the same thing — it re-runs
+    // the same validation on the arguments it is given.
+    if !crate::attach::is_loopback_addr(bind) {
+        out.push(OsString::from("--allow-remote"));
+    }
     out.push(OsString::from("--password-stdin"));
+    if protect_hidden {
+        out.push(OsString::from("--hidden-password-stdin"));
+    }
     Ok(out)
 }
 
@@ -547,6 +711,110 @@ mod tests {
     }
 
     #[test]
+    fn no_secret_reaches_the_child_through_its_arguments() {
+        // Every shape a password can take in `vcrs mount`'s arguments: the long
+        // form (which the old list missed), the alias, the attached short form,
+        // and both `=` styles. The hidden password must arrive over the pipe, so
+        // `--hidden-password-stdin` is added in its place.
+        let input = args(&[
+            "secret.vc",
+            "--protect-hidden",
+            "--hidden-password",
+            "hunter2",
+            "--hidden-pim",
+            "10",
+            "--hidden-keyfile",
+            "k.bin",
+            "--read-only",
+        ]);
+        let child =
+            child_arguments("iqn.x", "127.0.0.1:3260", input.into_iter()).expect("arguments");
+        let text: Vec<String> = child.iter().map(|a| a.to_string_lossy().into()).collect();
+        assert!(!text.iter().any(|arg| arg.contains("hunter2")), "{text:?}");
+        assert!(text.contains(&"--protect-hidden".to_string()));
+        assert!(text.contains(&"--hidden-password-stdin".to_string()));
+        // Everything that is not a secret still gets through.
+        assert!(text.contains(&"--hidden-pim".to_string()));
+        assert!(text.contains(&"10".to_string()));
+        assert!(text.contains(&"--hidden-keyfile".to_string()));
+        assert!(text.contains(&"k.bin".to_string()));
+        assert!(text.contains(&"--read-only".to_string()));
+
+        // The main password, all four ways. None of them may leave a stray token.
+        for form in [
+            vec!["secret.vc", "-p", "hunter2"],
+            vec!["secret.vc", "-phunter2"],
+            vec!["secret.vc", "--password", "hunter2"],
+            vec!["secret.vc", "--password=hunter2"],
+            vec!["secret.vc", "--master-key", "00ff"],
+        ] {
+            let child = child_arguments("iqn.x", "127.0.0.1:3260", args(&form).into_iter())
+                .expect("arguments");
+            let text: Vec<String> = child.iter().map(|a| a.to_string_lossy().into()).collect();
+            assert!(!text.iter().any(|arg| arg.contains("hunter2")), "{form:?} {text:?}");
+            assert!(!text.iter().any(|arg| arg.contains("00ff")), "{form:?} {text:?}");
+            // The container itself is not a secret, and it has to survive.
+            assert!(text.contains(&"secret.vc".to_string()), "{form:?} {text:?}");
+            assert!(!text.contains(&"--hidden-password-stdin".to_string()));
+            assert_eq!(
+                text,
+                vec![
+                    "mount",
+                    "secret.vc",
+                    "--idle-timeout",
+                    "30",
+                    "--target-name",
+                    "iqn.x",
+                    "--bind",
+                    "127.0.0.1:3260",
+                    "--password-stdin",
+                ],
+                "{form:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_switch_does_not_swallow_the_container() {
+        let input = args(&[
+            "secret.vc",
+            "--foreground",
+            "--letter",
+            "Y",
+            "--password-stdin",
+        ]);
+        let child = child_arguments("iqn.x", "127.0.0.1:3260", input.into_iter())
+            .expect("arguments");
+        let text: Vec<String> = child.iter().map(|a| a.to_string_lossy().into()).collect();
+        assert_eq!(
+            text,
+            vec![
+                "mount",
+                "secret.vc",
+                "--idle-timeout",
+                "30",
+                "--target-name",
+                "iqn.x",
+                "--bind",
+                "127.0.0.1:3260",
+                "--password-stdin",
+            ],
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn the_stdin_payload_survives_a_password_with_a_newline() {
+        let secret: Vec<u8> = b"one\ntwo".to_vec();
+        let payload = format!("{}\n{}\n", STDIN_SECRETS_TAG, hex_encode(&secret));
+        let mut lines = payload.split('\n');
+        assert_eq!(lines.next(), Some(STDIN_SECRETS_TAG));
+        assert_eq!(hex_encode(&secret), lines.next().expect("one line"));
+        assert_eq!(hex_encode(b""), "");
+        assert_eq!(hex_encode(&[0x00, 0xff]), "00ff");
+    }
+
+    #[test]
     fn an_equals_style_option_is_dropped_too() {
         let input = args(&["secret.vc", "--letter=Y", "--password=hunter2"]);
         let child =
@@ -604,16 +872,27 @@ mod tests {
         let dir = std::env::temp_dir().join("vcrs-serve-state-test");
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("vcrs-iqn.2025-12.io.vcrs_secret.server");
+        // The log path is taken from the file, so it has to point where a log really
+        // is written; `read_state` drops a path from anywhere else.
+        let log = std::env::temp_dir().join("vcrs-serve-state-test.log");
         fs::write(
             &path,
-            "pid=4242\nlog=C:\\Temp\\vcrs.log\niqn=iqn.2025-12.io.vcrs:secret\nletter=Y\n",
+            format!(
+                "pid=4242\nlog={}\niqn=iqn.2025-12.io.vcrs:secret\nletter=Y\n",
+                log.display()
+            ),
         )
         .expect("write");
         let server = read_state(&path).expect("a server");
         assert_eq!(server.pid, 4242);
         assert_eq!(server.iqn, "iqn.2025-12.io.vcrs:secret");
-        assert_eq!(server.log, PathBuf::from("C:\\Temp\\vcrs.log"));
+        assert_eq!(server.log, log);
         assert_eq!(server.letter, Some('Y'));
+
+        // A `log=` that points outside the temporary directory is not followed.
+        fs::write(&path, "pid=4242\nlog=C:\\Windows\\System32\\config\\SAM\n").expect("write");
+        let server = read_state(&path).expect("a server");
+        assert_eq!(server.log, Server::log_path(""));
 
         fs::write(&path, "pid=7\n").expect("write");
         let server = read_state(&path).expect("a server");

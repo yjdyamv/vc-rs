@@ -138,6 +138,13 @@ struct CreateArgs {
     /// filesystem (VeraCrypt refuses that too).
     #[arg(long)]
     no_size_check: bool,
+    /// Overwrite the container if it already exists.
+    ///
+    /// Without this a `create` aimed at an existing path is refused. The file is
+    /// opened with create+truncate, so before this flag existed a mistyped path
+    /// silently destroyed whatever was there.
+    #[arg(long)]
+    force: bool,
     /// Create a sparse (VeraCrypt's "dynamic") container: it is created at its
     /// full size but only the parts that are written use disk space. Implies a
     /// quick format (a full format would write every byte) and skips the
@@ -182,6 +189,14 @@ struct CreateHiddenArgs {
     /// Read the volume's random bytes from this file, as for `create`.
     #[arg(long, value_name = "FILE")]
     random_source: Option<PathBuf>,
+    /// Put the hidden volume in a quickly formatted outer volume anyway.
+    ///
+    /// A quick format leaves the unused part of the outer volume as zero bytes on
+    /// disk, and a hidden volume sits in that unused part — so the outer volume's
+    /// own emptiness points at it. VeraCrypt refuses this; this is the way to say
+    /// you know and accept it.
+    #[arg(long)]
+    force: bool,
     /// Print the master key of the new hidden volume (it is masked otherwise).
     #[arg(long)]
     show_master_key: bool,
@@ -198,12 +213,16 @@ struct PasswordArgs {
     #[arg(long, conflicts_with = "password")]
     password_stdin: bool,
     /// Personal iterations multiplier (0 = VeraCrypt default).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, value_parser = parse_pim)]
     pim: i32,
     /// Keyfile, or a directory whose files are used as keyfiles.  Repeatable;
     /// the keyfile pool is mixed into the password exactly like VeraCrypt does.
     #[arg(short = 'k', long = "keyfile", value_name = "PATH", action = clap::ArgAction::Append)]
     keyfiles: Vec<PathBuf>,
+    /// Which secret a framed stdin payload belongs to (see [`stdin_secrets`]).
+    /// Never set from the command line: the hidden-volume path fills it in.
+    #[arg(skip)]
+    slot: SecretSlot,
 }
 
 impl PasswordArgs {
@@ -213,6 +232,7 @@ impl PasswordArgs {
             self.password_stdin,
             "no password given (use --password, $VCRS_PASSWORD or --password-stdin)",
             false,
+            self.slot,
         )
     }
 
@@ -246,15 +266,111 @@ impl PasswordArgs {
 /// when there is neither and a person is at the terminal — a prompt with the echo
 /// switched off. `fresh` marks a password that is being *set* rather than checked;
 /// those are asked for twice, so one typo cannot lock the volume away for good.
+/// Which secret a framed stdin payload (see [`stdin_secrets`]) carries.
+///
+/// A detached mount server is given its secrets over one pipe rather than in its
+/// arguments: `--password` and `--hidden-password` are the only other ways in, and
+/// both would sit in the command line of a process that lives for hours, where any
+/// process of the same user can read them back out of `Win32_Process.CommandLine`.
+#[derive(Clone, Copy, Debug, Default)]
+enum SecretSlot {
+    /// The volume's own password.
+    #[default]
+    Main,
+    /// The hidden volume's password, for `--protect-hidden`.
+    Hidden,
+    /// The password a `change` is setting.
+    New,
+}
+
+impl SecretSlot {
+    fn index(self) -> usize {
+        match self {
+            SecretSlot::Main => 0,
+            SecretSlot::Hidden => 1,
+            SecretSlot::New => 2,
+        }
+    }
+}
+
+/// The tag that tells a framed payload from a password that simply *is* all of
+/// stdin. It is written by [`vcrs_host::serve::spawn`], which is the only thing
+/// that frames one.
+const STDIN_SECRETS_TAG: &str = vcrs_host::serve::STDIN_SECRETS_TAG;
+
+/// All of stdin, read once: two `--*-stdin` flags would otherwise fight over it.
+fn stdin_all() -> &'static [u8] {
+    static ALL: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    ALL.get_or_init(|| {
+        let mut buf = Vec::new();
+        let _ = std::io::stdin().read_to_end(&mut buf);
+        buf
+    })
+}
+
+/// The secrets a parent framed on stdin, or `None` when stdin is a plain
+/// password.
+///
+/// The tag, then one hex-encoded secret per line — hex so that a password with a
+/// newline in it survives the trip, and one line per secret so that reading the
+/// payload costs nothing. An empty line is the empty password, which
+/// `--password ""` allows.
+fn stdin_secrets() -> Option<Vec<Vec<u8>>> {
+    let all = stdin_all();
+    let mut lines = std::str::from_utf8(all).ok()?.split('\n');
+    if lines.next()?.trim_end_matches('\r') != STDIN_SECRETS_TAG {
+        return None;
+    }
+    let mut rest: Vec<&str> = lines.collect();
+    // The writer ends every line, including the last, so one empty element is the
+    // terminator rather than a secret.
+    if rest.last() == Some(&"") {
+        rest.pop();
+    }
+    rest.into_iter()
+        .map(|line| hex_decode(line.trim_end_matches('\r')))
+        .collect()
+}
+
+/// Hex, or `None` on anything else: a tag line followed by nonsense is not a
+/// framed payload, and falling back to treating it as a literal password only
+/// means it will not decrypt anything.
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    let digit = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    };
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks(2) {
+        out.push(digit(pair[0])? << 4 | digit(pair[1])?);
+    }
+    Some(out)
+}
+
 fn read_password(
     value: Option<&str>,
     from_stdin: bool,
     missing: &str,
     fresh: bool,
+    slot: SecretSlot,
 ) -> Result<Vec<u8>> {
     if from_stdin {
-        let mut buf = Vec::new();
-        std::io::stdin().read_to_end(&mut buf)?;
+        if let Some(mut secrets) = stdin_secrets() {
+            // The parent framed them, so the raw form's newline trimming does not
+            // apply; a slot the writer did not fill is the empty password.
+            return Ok(if slot.index() < secrets.len() {
+                secrets.swap_remove(slot.index())
+            } else {
+                Vec::new()
+            });
+        }
+        let mut buf = stdin_all().to_vec();
         if buf.last() == Some(&b'\n') {
             buf.pop();
             if buf.last() == Some(&b'\r') {
@@ -289,7 +405,7 @@ struct NewPasswordArgs {
     new_keyfiles: Vec<PathBuf>,
     /// New PIM. Defaults to the PIM the volume is opened with, so that changing
     /// only the password cannot silently weaken the key derivation.
-    #[arg(long = "new-pim", value_name = "N")]
+    #[arg(long = "new-pim", value_name = "N", value_parser = parse_pim)]
     new_pim: Option<i32>,
     /// New header hash algorithm; defaults to the one the volume already uses.
     #[arg(long = "new-hash", value_name = "PRF")]
@@ -304,6 +420,7 @@ impl NewPasswordArgs {
             "no new password given (use --new-password, $VCRS_NEW_PASSWORD or \
              --new-password-stdin)",
             true,
+            SecretSlot::New,
         )
     }
 
@@ -355,8 +472,20 @@ struct MountArgs {
     #[arg(long)]
     removable: bool,
     /// Address the iSCSI target listens on (default `127.0.0.1:3260`).
+    ///
+    /// Anything that is not a loopback address is refused unless `--allow-remote`
+    /// is also given: the disk being served is the *decrypted* volume, and the
+    /// target does not authenticate sessions.
     #[arg(long, value_name = "ADDR")]
     bind: Option<String>,
+    /// Serve the volume on a portal other machines can reach.
+    ///
+    /// The iSCSI target this program starts does not authenticate or encrypt its
+    /// sessions and stores `AuthConfig::None` for the target, so anyone who can
+    /// open a TCP connection to a non-loopback bind address reads and writes the
+    /// mounted volume in the clear. Only pass this on a network you trust.
+    #[arg(long, requires = "bind")]
+    allow_remote: bool,
     /// IQN the iSCSI target is published under.
     #[arg(long, value_name = "IQN")]
     target_name: Option<String>,
@@ -711,7 +840,8 @@ struct HiddenProtectionArgs {
     #[arg(
         long = "hidden-pim",
         visible_alias = "protection-pim",
-        default_value_t = 0
+        default_value_t = 0,
+        value_parser = parse_pim
     )]
     hidden_pim: i32,
     /// Keyfile of the hidden volume (repeatable).
@@ -741,6 +871,7 @@ impl HiddenProtectionArgs {
             password_stdin: self.hidden_password_stdin,
             pim: self.hidden_pim,
             keyfiles: self.hidden_keyfiles.clone(),
+            slot: SecretSlot::Hidden,
         };
         let options = creds
             .open_options(Some(VolumeType::Hidden), false)
@@ -896,9 +1027,27 @@ fn interrupted_error(error: &anyhow::Error) -> bool {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    // `$VCRS_PASSWORD` has been read into the parsed arguments by now, and this
+    // process is about to spawn copies of itself: the cached elevation agent and the
+    // detached mount server both inherited the whole environment, so the password sat
+    // in their environment block for as long as the worker lived (minutes, for the
+    // agent). Nothing reads the variable after parsing, so it can go now — and then no
+    // child can inherit it.
+    std::env::remove_var("VCRS_PASSWORD");
     let json = cli.json;
     match cli.command {
         Command::Create(a) => {
+            // `Volume::create` opens the container with create+truncate, so a
+            // mistyped path used to destroy whatever was already there. VeraCrypt
+            // refuses an existing file outright; `--force` is how a user says they
+            // meant that path on purpose.
+            if a.path.exists() && !a.force {
+                bail!(
+                    "{} already exists; pass --force to overwrite it (everything in it would be \
+                     lost)",
+                    a.path.display()
+                );
+            }
             let ea = parse_ea(&a.ea)?;
             let prf = parse_prf(&a.prf)?;
             // A sparse (dynamic) container only uses the space that is actually
@@ -930,9 +1079,11 @@ fn run() -> Result<()> {
             }
             if let Some(source) = &a.random_source {
                 eprintln!(
-                    "warning: --random-source makes {} reproducible from {}: anyone who has that \
-                     file can\n  rebuild the container's keys. Use it for tests and audits, not for \
-                     a real volume.",
+                    "warning: --random-source draws the salt and the master key of {} from {}.\n  \
+                     Anyone who has that file can decrypt the volume *without the password*, and\n  \
+                     building a second container from the same file reuses the same keystream at\n  \
+                     the same offsets (the stream always restarts at its beginning), which is a\n  \
+                     two-time pad. Use it for tests and audits, not for a real volume.",
                     a.path.display(),
                     source.display()
                 );
@@ -965,12 +1116,12 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::CreateHidden(a) => {
-            if vcrs_core::looks_quick_formatted(&a.path)? {
-                eprintln!(
-                    "warning: {} looks like it was created with a quick format (its unused space is\n  \
-                     still zero bytes on disk), so a hidden volume inside it can be detected. \
-                     VeraCrypt\n  refuses to put a hidden volume into a quickly formatted outer \
-                     volume.",
+            if vcrs_core::looks_quick_formatted(&a.path)? && !a.force {
+                bail!(
+                    "{} looks like it was created with a quick format (its unused space is still \
+                     zero bytes on disk), so a hidden volume inside it can be found by anyone \
+                     looking at the file — which is the one thing a hidden volume exists to \
+                     prevent. VeraCrypt refuses this too; pass --force if you accept it",
                     a.path.display()
                 );
             }
@@ -1257,6 +1408,14 @@ fn run() -> Result<()> {
                 // costs nothing.
                 iscsi.bind_addr = attach::free_bind_addr(&iscsi.bind_addr)?;
             }
+            if !a.allow_remote && !attach::is_loopback_addr(&iscsi.bind_addr) {
+                bail!(
+                    "{} is not a loopback address, so the volume would be served to the network; \
+                     the served disk is the decrypted volume and the target authenticates no \
+                     session, so pass --allow-remote if that is really what you want",
+                    iscsi.bind_addr
+                );
+            }
             if let Some(name) = &a.target_name {
                 iscsi.target_name = name.clone();
             } else if a.kind.hidden {
@@ -1304,9 +1463,14 @@ fn run() -> Result<()> {
                             // serving process would only wrap it in noise.
                             report.quiet();
                         }
+                        let hidden_password: &[u8] = iscsi
+                            .protect_hidden
+                            .as_ref()
+                            .map(|hidden| hidden.password.as_slice())
+                            .unwrap_or(&[]);
                         let server = serve::spawn(
                             &iscsi.target_name,
-                            &options.password,
+                            &[options.password.as_slice(), hidden_password],
                             Some(letter),
                             &iscsi.bind_addr,
                             &mut report,
@@ -1374,6 +1538,13 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::Attach(a) => {
+            // The elevated half checks both fields again (`attach::attach` calls
+            // `validate_target`), and it is the half that actually runs `iscsicli`.
+            // Checking here as well means a typo or a payload in `--iqn`/`--address`
+            // is refused before a UAC prompt is raised for it, and the caller sees
+            // the reason instead of the worker's bare exit code.
+            attach::validate_iqn(&a.iqn)?;
+            attach::validate_portal(&a.address)?;
             // The elevated half of a mount has to run to the end; a console control
             // event (a Ctrl-C in some arrangements, or a closing console) killed it
             // with STATUS_CONTROL_C_EXIT in the middle of the work.
@@ -1827,11 +1998,25 @@ fn create_keyfile(a: &CreateKeyfileArgs) -> Result<()> {
     }
     let bytes = match &a.random_source {
         Some(source) => {
-            let data = std::fs::read(source)
+            // Only `KEYFILE_SIZE` bytes are wanted and the file may be any size at
+            // all, so read a bounded prefix rather than the whole thing: the old
+            // `std::fs::read` held the entire file in memory and left it there. A
+            // file shorter than a keyfile is still repeated.
+            let mut file = std::fs::File::open(source)
+                .with_context(|| format!("reading the random source {}", source.display()))?;
+            let mut data = Vec::with_capacity(KEYFILE_SIZE);
+            file.by_ref()
+                .take(KEYFILE_SIZE as u64)
+                .read_to_end(&mut data)
                 .with_context(|| format!("reading the random source {}", source.display()))?;
             if data.is_empty() {
                 bail!("the random source {} is empty", source.display());
             }
+            eprintln!(
+                "warning: --random-source makes this keyfile reproducible from {}: anyone who has \
+                 that file can rebuild it",
+                source.display()
+            );
             data.iter().copied().cycle().take(KEYFILE_SIZE).collect()
         }
         None => vcrs_core::random_bytes(KEYFILE_SIZE)?,
@@ -2283,6 +2468,30 @@ fn parse_sector_size(s: &str) -> Result<u32, String> {
         ));
     }
     Ok(value)
+}
+
+/// A PIM this program will actually use.
+///
+/// Every PIM reaches the key derivation directly, and the derivation's arithmetic
+/// wraps in a release build: `--pim 4294968` produced a container with 15 704
+/// PBKDF2 iterations — 32 times weaker than the 500 000 of a default PIM — and
+/// nothing said a word. The iteration count is not stored in the header, so the
+/// mistake is invisible afterwards; refusing the argument is the only chance to
+/// report it.
+fn parse_pim(s: &str) -> Result<i32, String> {
+    let pim: i32 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid PIM {s:?}: it has to be a whole number"))?;
+    if !vcrs_core::pim_is_valid(pim) {
+        return Err(format!(
+            "invalid PIM {pim}: it has to be between 0 and {} (0 means the VeraCrypt \
+             default, and a PIM is not stored in the volume header, so it cannot be \
+             guessed back later)",
+            vcrs_core::MAX_PIM
+        ));
+    }
+    Ok(pim)
 }
 
 /// Parse `123`, `123K`, `64M`, `4G` (binary suffixes).

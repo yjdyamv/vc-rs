@@ -189,6 +189,16 @@ impl Default for SessionData {
 }
 
 impl SessionData {
+    /// Whether this session is allowed to leave the login phase.
+    ///
+    /// An initiator can put `CSG=1` in its first login PDU and skip the Security
+    /// Negotiation stage entirely. That route reaches `FullFeaturePhase` without the
+    /// target ever being asked for a CHAP response, so when `AuthConfig` requires
+    /// authentication the session has to have completed it before it transits.
+    pub fn login_may_transit(&self) -> bool {
+        !self.auth_config.requires_auth() || self.chap_completed
+    }
+
     /// Generate next Target Transfer Tag
     pub fn next_target_transfer_tag(&mut self) -> u32 {
         let ttt = self.next_ttt;
@@ -787,6 +797,23 @@ impl TypestateSession<LoginOperationalNegotiation> {
         self.data.next_stage = login.nsg;
 
         if login.transit && login.nsg == 3 {
+            // This is the transition the CSG=1 shortcut reaches directly, so it is
+            // the one place where a required authentication has provably never been
+            // checked. Without this, an initiator that skips Security Negotiation
+            // gets a full session on a target configured for CHAP.
+            if !self.data.login_may_transit() {
+                log::warn!("Login rejected: authentication is required but was not completed");
+                let response = self.data.create_login_reject(
+                    itt,
+                    pdu::login_status::INITIATOR_ERROR,
+                    0x01, // AUTH_FAILURE
+                );
+                let failed: TypestateSession<Failed> = TypestateSession {
+                    data: self.data,
+                    _state: PhantomData,
+                };
+                return Ok((AnySession::Failed(failed), vec![response]));
+            }
             // Transition to FullFeaturePhase
             if self.data.session_type == SessionType::Normal {
                 self.data.tsih = SessionData::generate_tsih();

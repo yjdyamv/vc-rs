@@ -19,7 +19,10 @@
 //! `key` = `HMAC-SHA-512(seed_label, file bytes)`. Any file size works, and a
 //! key derived this way does not repeat even for a one-byte source file.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+use zeroize::Zeroize;
 
 use crate::error::{Error, Result};
 
@@ -27,6 +30,8 @@ use crate::error::{Error, Result};
 const SEED_LABEL: &[u8] = b"vcrs-random-source v1";
 /// Label mixed into every block.
 const BLOCK_LABEL: &[u8] = b"vcrs-random-source";
+/// Buffer used to hash the seed file without holding it in memory.
+const SEED_CHUNK: usize = 64 * 1024;
 /// Digest size of HMAC-SHA-512, i.e. the block size of the stream.
 const BLOCK_SIZE: usize = 64;
 
@@ -57,22 +62,43 @@ impl RandomSupply {
     /// Errors when the file cannot be read or is empty: an empty file would give
     /// a stream that is the same for every run, which is the opposite of a
     /// deliberate choice.
+    ///
+    /// The file is hashed a chunk at a time. It used to be slurped whole with
+    /// `std::fs::read`, so `--random-source` on a large file (or on a FIFO, or on
+    /// a device node) either exhausted memory or never returned — and the seed's
+    /// bytes stayed in a buffer nothing ever wiped.
     pub fn from_file(path: &Path) -> Result<Self> {
-        let data = std::fs::read(path).map_err(|e| {
+        let file = std::fs::File::open(path).map_err(|e| {
             Error::Io(std::io::Error::new(
                 e.kind(),
                 format!("reading the random source {}: {e}", path.display()),
             ))
         })?;
-        if data.is_empty() {
+        let mut mac = botan::MsgAuthCode::new("HMAC(SHA-512)")?;
+        mac.set_key(SEED_LABEL)?;
+        let mut reader = std::io::BufReader::with_capacity(SEED_CHUNK, file);
+        let mut chunk = vec![0u8; SEED_CHUNK];
+        let mut total = 0usize;
+        loop {
+            let read = reader.read(&mut chunk).map_err(|e| {
+                Error::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("reading the random source {}: {e}", path.display()),
+                ))
+            })?;
+            if read == 0 {
+                break;
+            }
+            total += read;
+            mac.update(&chunk[..read])?;
+        }
+        chunk.zeroize();
+        if total == 0 {
             return Err(Error::InvalidParameter(format!(
                 "the random source {} is empty; it has to hold at least one byte",
                 path.display()
             )));
         }
-        let mut mac = botan::MsgAuthCode::new("HMAC(SHA-512)")?;
-        mac.set_key(SEED_LABEL)?;
-        mac.update(&data)?;
         let key = mac.finish()?;
         Ok(RandomSupply::File {
             path: path.to_path_buf(),
@@ -115,6 +141,20 @@ impl RandomSupply {
                 out.truncate(len);
                 Ok(out)
             }
+        }
+    }
+}
+
+impl Drop for RandomSupply {
+    /// Wipe the stream key.
+    ///
+    /// With `--random-source` the key *is* the container: whoever has the seed file
+    /// can rebuild the salt and the master key of every container built from it
+    /// (see the note in `volume.rs::random_supply`). Leaving it in freed heap
+    /// hands it to the next allocation, to a crash dump and to the pagefile.
+    fn drop(&mut self) {
+        if let RandomSupply::File { key, .. } = self {
+            key.zeroize();
         }
     }
 }

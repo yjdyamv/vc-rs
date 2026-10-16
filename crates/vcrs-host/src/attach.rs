@@ -85,6 +85,9 @@ pub fn attach(options: &AttachOptions) -> Result<Attached> {
              elevated prompt, or use `vcrs mount --letter` which asks for elevation itself"
         );
     }
+    // Before anything is touched: the IQN and the portal go to `iscsicli`, so a
+    // value that cannot be one is an error here, not a shell command later.
+    validate_target(options)?;
 
     let letter = options.letter.map(|c| c.to_ascii_uppercase());
     if let Some(letter) = letter {
@@ -126,15 +129,34 @@ pub fn attach(options: &AttachOptions) -> Result<Attached> {
         forget_stale_devices(&mut report);
     }
 
-    // 2. register the target statically, then log in.  The two empty CHAP
-    //    arguments only survive as `""` through a `cmd /c` hop, which is why
-    //    this one command is built as a line rather than as arguments.
+    // 2. register the target statically, then log in.  `AddTarget` takes two
+    //    CHAP arguments that have to stay *empty*; they go through as two empty
+    //    `argv` elements, which the Windows argument quoting renders as `""` for
+    //    the child.  There is deliberately no `cmd /c` hop any more: it existed
+    //    only to preserve those two `""`, and it turned the IQN and the portal
+    //    into a shell command line (see `validate_iqn`).
     let (host, port) = split_address(&options.address);
-    let add = format!(
-        "iscsicli AddTarget {} vcrs {} {} 0 0 0 0 0 8 0 0 \"\" \"\" 0 0",
-        options.iqn, host, port
-    );
-    iscsicli_line(&add).with_context(|| format!("registering {host}:{port} as a static target"))?;
+    let port = port.to_string();
+    iscsicli(&[
+        "AddTarget",
+        options.iqn.as_str(),
+        "vcrs",
+        host.as_str(),
+        port.as_str(),
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "8",
+        "0",
+        "0",
+        "",
+        "",
+        "0",
+        "0",
+    ])
+    .with_context(|| format!("registering {host}:{port} as a static target"))?;
     if let Ok(out) = iscsicli(&["QLoginTarget", &options.iqn]) {
         report.line(&first_line(&out).unwrap_or_else(|| "logged in".to_string()));
     }
@@ -222,6 +244,9 @@ pub fn attach(options: &AttachOptions) -> Result<Attached> {
 /// one UAC prompt and nothing else to do; from an elevated prompt it attaches
 /// straight away.
 pub fn attach_with_elevation(options: &AttachOptions, json: bool) -> Result<()> {
+    // Rejected before the elevation prompt (and before the cached agent): a bad
+    // IQN or portal has to cost nothing.
+    validate_target(options)?;
     if elevated() {
         attach(options)?;
         return Ok(());
@@ -248,7 +273,12 @@ pub fn attach_with_elevation(options: &AttachOptions, json: bool) -> Result<()> 
          yourself from an elevated prompt)",
         options.iqn
     );
-    start_elevated(&exe, &args, &log)?;
+    // A denied UAC prompt (or a PowerShell that would not start) leaves no run and
+    // therefore no reason to leave `--log` behind: it names the container.
+    if let Err(err) = start_elevated(&exe, &args, &log) {
+        let _ = std::fs::remove_file(&log);
+        return Err(err);
+    }
     let text = wait_for_log(&log);
     let _ = std::fs::remove_file(&log);
     finish(&text, "attach", json)
@@ -596,29 +626,6 @@ pub fn iscsicli(args: &[&str]) -> Result<String> {
             out.status,
             all.trim()
         );
-    }
-    Ok(all)
-}
-
-/// Run a whole `iscsicli` command line through `cmd /c`.
-///
-/// `AddTarget` takes two arguments that must stay *empty* (the CHAP user and
-/// password); passing them as empty strings straight to `CreateProcess` loses
-/// them, so the line goes through `cmd`, which keeps the literal `""`.
-fn iscsicli_line(line: &str) -> Result<String> {
-    let out = quiet_command("cmd")
-        .args(["/c", line])
-        .output()
-        .with_context(|| format!("running `{line}`"))?;
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
-    let errors = String::from_utf8_lossy(&out.stderr);
-    let mut all = text;
-    if !errors.trim().is_empty() {
-        all.push_str(errors.trim());
-        all.push('\n');
-    }
-    if !out.status.success() {
-        bail!("`{line}` failed ({}): {}", out.status, all.trim());
     }
     Ok(all)
 }
@@ -1104,6 +1111,85 @@ pub fn free_bind_addr(preferred: &str) -> Result<String> {
 const PORT_SEARCH: u16 = 32;
 
 /// Split `host:port` (the form `IscsiMount::addr` uses) for `iscsicli`.
+/// Check the two `AttachOptions` fields that end up in an `iscsicli` call before
+/// any of it runs, so a bad value fails here rather than after a UAC prompt.
+fn validate_target(options: &AttachOptions) -> Result<()> {
+    validate_iqn(&options.iqn)?;
+    validate_portal(&options.address)
+}
+
+/// Reject an iSCSI target name that is not one.
+///
+/// This is not a quoting rule — `AddTarget` is called with real arguments and no
+/// shell. It is a bound on what the *rest* of the program can carry: the name is
+/// written into state files, printed in log lines and parsed back out of
+/// `iscsicli`'s output, and characters like a newline or a space break those.
+/// It also turns a typo into an error before an elevation prompt is spent on it.
+pub fn validate_iqn(iqn: &str) -> Result<()> {
+    if iqn.is_empty() {
+        bail!("the iSCSI target name (IQN) is empty");
+    }
+    // The iSCSI name grammar allows up to 223 bytes.
+    if iqn.len() > 223 {
+        bail!(
+            "the iSCSI target name is {} characters, over the iSCSI limit of 223",
+            iqn.len()
+        );
+    }
+    if !(iqn.starts_with("iqn.") || iqn.starts_with("eui.") || iqn.starts_with("naa.")) {
+        bail!("`{iqn}` is not an iSCSI name: it has to start with `iqn.`, `eui.` or `naa.`");
+    }
+    if let Some(bad) = iqn.chars().find(|c| {
+        c.is_whitespace()
+            || c.is_control()
+            || matches!(
+                c,
+                '"' | '\'' | '&' | '|' | '^' | '<' | '>' | '%' | ';' | '(' | ')' | '\\' | ',' | '`'
+            )
+    }) {
+        bail!("the iSCSI target name contains {bad:?}, which is not allowed in an iSCSI name");
+    }
+    Ok(())
+}
+
+/// Reject a portal address that is not `host[:port]` with a host of an IP address
+/// or a DNS name.
+///
+/// `--address` used to reach `cmd /c` unescaped; it is an argument now, so this
+/// is about catching nonsense (a path, a URL, a shell fragment that used to be
+/// an injection) rather than about quoting.
+pub fn validate_portal(address: &str) -> Result<()> {
+    if address.trim().is_empty() {
+        bail!("the iSCSI portal address is empty");
+    }
+    let (host, port) = split_address(address);
+    if host.is_empty() {
+        bail!("the iSCSI portal address `{address}` has no host part");
+    }
+    if let Some(bad) = host
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':')))
+    {
+        bail!(
+            "the iSCSI portal host `{host}` contains {bad:?}; only an IP address or a DNS name \
+             is accepted"
+        );
+    }
+    // Exactly one `:` means `host:port`, and there the port has to be a number:
+    // `127.0.0.1:abc` used to silently become the default port.
+    if address.matches(':').count() == 1 {
+        if let Some((_, tail)) = address.rsplit_once(':') {
+            if tail.parse::<u16>().is_err() {
+                bail!("`{address}` has no usable port: `{tail}` is not a number");
+            }
+        }
+    }
+    if port == 0 {
+        bail!("port 0 is not a usable iSCSI portal port");
+    }
+    Ok(())
+}
+
 fn split_address(address: &str) -> (String, u16) {
     match address.rsplit_once(':') {
         Some((host, port)) => match port.parse() {
@@ -1111,6 +1197,39 @@ fn split_address(address: &str) -> (String, u16) {
             Err(_) => (address.to_string(), 3260),
         },
         None => (address.to_string(), 3260),
+    }
+}
+
+/// Whether an iSCSI portal is one only this machine can reach.
+///
+/// The threat this guards is `--bind 0.0.0.0:3260`: the disk the target serves is
+/// the *decrypted* volume, the vendored target stores `AuthConfig::None` and
+/// never checks a CHAP exchange or an allowed-initiator list, and its sessions
+/// are plaintext. A loopback bind is the only one that is safe by default, so
+/// anything else has to be asked for explicitly.
+pub fn is_loopback_addr(address: &str) -> bool {
+    let address = address.trim();
+    // A bare IPv6 address is all colons, and `split_address` would read its last
+    // group as a port, so try the whole string first.
+    if let Ok(ip) = address.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    let (host, port) = split_address(address);
+    if port == 0 {
+        return false;
+    }
+    let host = host.trim();
+    if host.is_empty() {
+        // `:3260` listens on every interface.
+        return false;
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        // A name this cannot resolve is assumed to be reachable.
+        Err(_) => false,
     }
 }
 
@@ -1200,14 +1319,61 @@ mod tests {
     }
 
     #[test]
-    fn the_manual_path_never_splits_the_chap_arguments() {
-        // The line handed to `cmd /c` must still carry the two empty strings.
-        let line = format!(
-            "iscsicli AddTarget {} vcrs {} {} 0 0 0 0 0 8 0 0 \"\" \"\" 0 0",
-            "iqn.2025-12.io.vcrs:secret", "127.0.0.1", 3260
-        );
-        assert_eq!(line.matches("\"\"").count(), 2);
-        assert!(line.ends_with("\"\" \"\" 0 0"), "{line}");
+    fn the_add_target_call_keeps_the_two_chap_arguments_empty() {
+        // The two CHAP arguments have to stay *empty*, and they are passed as two
+        // empty `argv` elements now: no shell, so nothing in the IQN or the portal
+        // can be a command (`std::process` renders an empty argument as `""`).
+        let argv: Vec<&str> = [
+            "AddTarget",
+            "iqn.2025-12.io.vcrs:secret",
+            "vcrs",
+            "127.0.0.1",
+            "3260",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "8",
+            "0",
+            "0",
+            "",
+            "",
+            "0",
+            "0",
+        ]
+        .to_vec();
+        assert_eq!(argv.iter().filter(|a| a.is_empty()).count(), 2);
+        assert_eq!(&argv[argv.len() - 4..], &["", "", "0", "0"]);
+        // `""` never appears literally: it is an empty argv element, not text.
+        assert!(!argv.iter().any(|a| *a == "\"\""));
+    }
+
+    #[test]
+    fn an_iqn_that_is_not_one_is_refused() {
+        assert!(validate_iqn("iqn.2025-12.io.vcrs:secret").is_ok());
+        assert!(validate_iqn("eui.0200000000000000").is_ok());
+        // The old injection: a shell metacharacter is not an iSCSI name.
+        assert!(validate_iqn("iqn.x & net user pwn P@ss /add").is_err());
+        assert!(validate_iqn("iqn.x\npid=1").is_err());
+        assert!(validate_iqn("iqn.x | calc").is_err());
+        assert!(validate_iqn("not-an-iqn").is_err());
+        assert!(validate_iqn("").is_err());
+        assert!(validate_iqn(&format!("iqn.{}", "a".repeat(300))).is_err());
+    }
+
+    #[test]
+    fn a_portal_that_is_not_one_is_refused() {
+        assert!(validate_portal("127.0.0.1:3260").is_ok());
+        assert!(validate_portal("127.0.0.1").is_ok());
+        assert!(validate_portal("[::1]:3260").is_ok());
+        assert!(validate_portal("iscsi.example.com").is_ok());
+        // The old injection, and assorted nonsense.
+        assert!(validate_portal("127.0.0.1 & calc").is_err());
+        assert!(validate_portal("127.0.0.1:abc").is_err());
+        assert!(validate_portal("127.0.0.1:0").is_err());
+        assert!(validate_portal("").is_err());
+        assert!(validate_portal(r"C:\Temp").is_err());
     }
 
     #[test]
