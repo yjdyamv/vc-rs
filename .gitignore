@@ -2,3 +2,8 @@
 .logs
 target
 testdata
+
+# The security and anti-forensics review is kept out of the repository on purpose: the
+# per-layer reports carry working attack steps for the findings that are still open.
+# The files stay in docs/research/ locally; this only stops them from being committed.
+docs/research/security-review*.md

@@ -690,5 +690,23 @@ and let Botan `strlen()` it, which cannot express that, so `vcrs-core` calls
 is kept behind `#[cfg(test)]` and cross-checked against Botan's own for the same
 parameters.
 
-Secrets held in memory (`master_key` in `VolumeHeader`, derived header keys) are
-`zeroize`d where practical.
+Secrets held in memory are wiped where the program can reach them: the `master_key` in
+`VolumeHeader`, the derived 192-byte header keys and the stream key of `--random-source`
+are zeroized when the volume is dropped. The password you type is not: it arrives from
+the terminal as a `String`/`Vec<u8>`, is copied into `OpenOptions`, and those copies are
+left to the allocator. Nothing here is protected from being written to disk by the
+operating system either: the process is not locked into RAM (`VirtualLock`) and no
+crash-dump policy is set, so a pagefile or a WER dump can hold the master key and
+plaintext.
+
+## Anti-forensics: what is covered and what is not
+
+`--preserve-timestamp` (on by default) keeps a container's modification and access time
+from moving while it is mounted, and `Volume` freezes them before its first read. That is
+one trace out of several, and it is the only one this program touches. Writing to a
+container still leaves, untouched: NTFS `$UsnJrnl` records (append-only, with offsets and
+timestamps), Prefetch and Amcache entries for `vcrs.exe`, ETW/Defender telemetry, the
+SRUM database, and — for `--letter` mounts — the container-derived or random IQN in the
+Microsoft iSCSI Initiator's registry list and event log. Assume that *when* a container was
+used is recoverable on Windows even with timestamp preservation on; what the flag buys is
+that the container's own timestamp does not testify to it.
