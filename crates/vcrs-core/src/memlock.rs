@@ -91,21 +91,29 @@ mod dump {
     type Module = *mut c_void;
     /// `WerRegisterExcludedMemoryBlock(PVOID Address, DWORD Size) -> HRESULT`.
     type Register = unsafe extern "system" fn(*mut c_void, u32) -> i32;
+    /// `WerSetFlags(DWORD Flags) -> HRESULT`.
+    type SetFlags = unsafe extern "system" fn(u32) -> i32;
 
     extern "system" {
-        fn LoadLibraryW(name: *const u16) -> Module;
+        fn GetModuleHandleW(name: *const u16) -> Module;
         fn GetProcAddress(module: Module, name: *const u8) -> *mut c_void;
     }
 
-    fn register_fn() -> Option<Register> {
-        // Windows Error Reporting lives in `wer.dll`; the call exists since Windows 8
-        // and is simply absent on anything older, so it is looked up rather than
-        // linked. The library is never unloaded: the registration has to outlive this
-        // call.
-        let name: [u16; 8] = [
-            b'w' as u16,
+    fn wer_entry(name: &core::ffi::CStr) -> Option<*mut c_void> {
+        // The process-side calls of Windows Error Reporting (`WerSetFlags`,
+        // `WerRegisterExcludedMemoryBlock`) live in **kernel32**, not in `wer.dll`:
+        // `wer.dll` has the local-dump helpers. Looking them up rather than linking
+        // them keeps the binary loadable on Windows 7, where they do not exist yet;
+        // there the lookup misses and the caller is told the request was refused.
+        let module_name: [u16; 13] = [
+            b'k' as u16,
             b'e' as u16,
             b'r' as u16,
+            b'n' as u16,
+            b'e' as u16,
+            b'l' as u16,
+            b'3' as u16,
+            b'2' as u16,
             b'.' as u16,
             b'd' as u16,
             b'l' as u16,
@@ -115,15 +123,15 @@ mod dump {
         // SAFETY: the name is NUL terminated and outlives the call, and the entry
         // point is only used with the signature the documentation gives it.
         unsafe {
-            let module = LoadLibraryW(name.as_ptr());
+            let module = GetModuleHandleW(module_name.as_ptr());
             if module.is_null() {
                 return None;
             }
-            let address = GetProcAddress(module, c"WerRegisterExcludedMemoryBlock".as_ptr() as *const u8);
+            let address = GetProcAddress(module, name.as_ptr() as *const u8);
             if address.is_null() {
                 return None;
             }
-            Some(std::mem::transmute::<*mut c_void, Register>(address))
+            Some(address)
         }
     }
 
@@ -131,13 +139,31 @@ mod dump {
         let Ok(size) = u32::try_from(bytes.len()) else {
             return false;
         };
-        let Some(register) = register_fn() else {
+        // SAFETY: the address came from `GetProcAddress` for this symbol and is
+        // transmuted to the signature the documentation gives it.
+        let Some(register) = wer_entry(c"WerRegisterExcludedMemoryBlock")
+            .map(|address| unsafe { std::mem::transmute::<*mut c_void, Register>(address) })
+        else {
             return false;
         };
         // SAFETY: the pointer and length describe a live slice, and the block must not
         // move afterwards — the caller only ever registers a buffer it does not
         // grow again.
         unsafe { register(bytes.as_ptr() as *mut c_void, size) == 0 }
+    }
+
+    /// `WER_FAULT_REPORTING_FLAG_NOHEAP`: leave the heap out of the reports this
+    /// process asks WER for.
+    const NO_HEAP: u32 = 0x2;
+
+    pub fn no_heap_in_dumps() -> bool {
+        // SAFETY: as above; `WerSetFlags` takes one `DWORD`.
+        let Some(set_flags) = wer_entry(c"WerSetFlags")
+            .map(|address| unsafe { std::mem::transmute::<*mut c_void, SetFlags>(address) })
+        else {
+            return false;
+        };
+        unsafe { set_flags(NO_HEAP) == 0 }
     }
 }
 
@@ -148,6 +174,78 @@ mod dump {
         // they are written, and what they contain, is decided outside the process.
         false
     }
+
+    #[cfg(not(windows))]
+    #[allow(dead_code)] // only the Windows process hardening asks for it
+    pub fn no_heap_in_dumps() -> bool {
+        false
+    }
+}
+
+/// Stop the operating system from writing this process's memory to disk after it
+/// crashes, and from letting another process read it.
+#[cfg(windows)]
+mod process {
+    pub fn harden() -> bool {
+        super::dump::no_heap_in_dumps()
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod process {
+    extern "C" {
+        fn prctl(option: i32, ...) -> i32;
+    }
+
+    /// `PR_SET_DUMPABLE`.
+    const PR_SET_DUMPABLE: i32 = 4;
+
+    pub fn harden() -> bool {
+        // SAFETY: `PR_SET_DUMPABLE` takes one unsigned long argument (0). Turning it
+        // off stops the kernel from writing a core dump of this process, and makes
+        // `/proc/<pid>` belong to root, so another user cannot read this process's
+        // memory out of it. Only root (or the process itself) can turn it back on.
+        unsafe { prctl(PR_SET_DUMPABLE, 0usize) == 0 }
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+mod process {
+    pub fn harden() -> bool {
+        // No portable equivalent: whether a crash writes memory to disk is decided
+        // by the system's crash reporter, not by the process.
+        false
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+mod process {
+    pub fn harden() -> bool {
+        false
+    }
+}
+
+/// Ask the system to keep this process's memory off disk when it crashes.
+///
+/// `zeroize` and [`lock`] protect individual buffers; this covers the ones nobody
+/// thought about — the plaintext of a volume that is being served, the decrypted
+/// header, whatever a library allocated on the way. It is the only measure here
+/// that is process-wide, so call it once, as early as possible.
+///
+/// On Windows it sets `WER_FAULT_REPORTING_FLAG_NOHEAP`, which removes the heap from
+/// the reports WER writes for this process (a crash then still produces a report
+/// with the stack and the registers, just not the memory around them). On Linux it
+/// clears `PR_SET_DUMPABLE`, so the kernel writes no core dump at all and
+/// `/proc/<pid>/mem` becomes root-only. Both are best effort: an administrator who
+/// configured a full local dump or a kernel dump can still capture memory, and no
+/// in-process call can do anything about hibernation. Returns whether the request
+/// was accepted.
+pub fn harden_process() -> bool {
+    let hardened = process::harden();
+    if !hardened {
+        log::debug!("the system refused to keep this process out of crash dumps");
+    }
+    hardened
 }
 
 /// Keep `bytes` out of the page file, best effort. Returns whether it worked.
@@ -200,4 +298,45 @@ pub fn exclude_from_dumps(bytes: &[u8]) -> bool {
         );
     }
     excluded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{exclude_from_dumps, harden_process, lock, unlock};
+
+    #[test]
+    fn nothing_is_asked_of_the_system_for_an_empty_block() {
+        // A zero-length buffer is accepted without a call: `VirtualLock` and
+        // `mlock` both refuse a zero length, and there is nothing to protect.
+        assert!(lock(&[]));
+        assert!(unlock(&[]));
+        assert!(exclude_from_dumps(&[]));
+    }
+
+    #[test]
+    fn hardening_the_process_twice_is_harmless() {
+        // Asked for once at startup in practice; a test binary that runs several
+        // cases must not blow up on the second call either.
+        let first = harden_process();
+        let second = harden_process();
+        assert_eq!(first, second);
+        // Windows 8 and newer answer the call; a refusal here would mean the lookup
+        // or the flags are wrong, which is worth knowing.
+        #[cfg(windows)]
+        assert!(first, "WerSetFlags has to be accepted on Windows 8 and newer");
+    }
+
+    #[test]
+    fn a_key_buffer_can_be_locked_and_given_back() {
+        let key = [0x5au8; 32];
+        // Whether the system agrees depends on the working-set quota, so only the
+        // pairing is asserted: unlocking must not report success for a range that
+        // was never handed to the system in a way that could panic.
+        let _ = lock(&key);
+        let _ = unlock(&key);
+        // The dump exclusion, on the other hand, has no quota: a refusal means the
+        // call was not found (it is in kernel32, not in wer.dll).
+        #[cfg(windows)]
+        assert!(exclude_from_dumps(&key), "WerRegisterExcludedMemoryBlock has to be found");
+    }
 }

@@ -413,9 +413,30 @@ fn read_password(
         return Ok(buf);
     }
     match value {
-        Some(password) => Ok(password.as_bytes().to_vec()),
+        Some(password) => {
+            // The argument list is readable by every process on the machine while
+            // this one runs, and some auditing setups copy it into an event log,
+            // where it outlives the process. There is no way to take it back, so
+            // say it once and let the user decide.
+            warn_once(ARGV_SECRET_WARNING);
+            Ok(password.as_bytes().to_vec())
+        }
         None if fresh => prompt::new_password(missing),
         None => prompt::password(missing),
+    }
+}
+
+/// Printed when a secret was given on the command line.
+const ARGV_SECRET_WARNING: &str = "warning: a secret on the command line is readable by every process on this \
+     machine while it runs, and some audit configurations keep a copy of it afterwards; \
+     --password-stdin (or --password-file) keeps it out of the argument list";
+
+/// Print `message` unless this process already did.
+fn warn_once(message: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static PRINTED: AtomicBool = AtomicBool::new(false);
+    if !PRINTED.swap(true, Ordering::Relaxed) {
+        eprintln!("{message}");
     }
 }
 
@@ -1147,6 +1168,11 @@ struct WriteArgs {
 /// real failure.
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Before anything else: keep this process's memory off disk when it crashes.
+    // The volume that gets served lives in ordinary heap buffers, and a crash dump
+    // would take a copy of it; the master key has its own exclusion, but the
+    // plaintext does not.
+    vcrs_core::memlock::harden_process();
     catch_interrupts();
     match run() {
         Ok(()) => {

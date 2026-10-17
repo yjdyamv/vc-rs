@@ -824,14 +824,22 @@ used is recoverable on Windows even with timestamp preservation on; what the fla
 that the container's own timestamp does not testify to it.
 
 Two more things are deliberately not defended against, because they cannot be fixed inside
-this program. A crash dump (WER or a manual one) contains the process's memory: the master
-key is excluded from the dumps Windows Error Reporting writes
-(`WerRegisterExcludedMemoryBlock`), but a manually taken dump, a `LocalDumps` policy or
-`hiberfil.sys` can still contain it, and only a policy outside the process can stop them.
-And the unlock itself is observable: a larger PIM or a slower KDF makes `--password`-based
-opens measurably slower, so a local process that can time them learns something about the
-volume's parameters (the PIM is not stored in the header, but it is not hidden by timing
-either).
+this program. A crash dump (a manual one, a `LocalDumps` policy, a kernel dump) contains the
+process's memory: `vcrs` turns the two in-process knobs there are — `WER_FAULT_REPORTING_FLAG_NOHEAP`
+on Windows, so the reports Windows Error Reporting writes for this process carry the stack
+but not the heap, and `PR_SET_DUMPABLE=0` on Linux, so the kernel writes no core at all and
+another user cannot read this process's memory out of `/proc` — and excludes the master key
+block explicitly, but an administrator's dump policy or `hiberfil.sys` is outside the
+process. And the unlock itself is observable: a larger PIM or a slower KDF makes
+`--password`-based opens measurably slower, so a local process that can time them learns
+something about the volume's parameters (the PIM is not stored in the header, but it is not
+hidden by timing either).
+
+A secret given on the command line (`-p`, `--password`, `--master-key`) is readable by every
+process on the machine while the command runs, and some audit configurations keep a copy;
+`vcrs` warns once when that happens and offers `--password-stdin`, `--password-file`, `--master-key-stdin` and
+`--master-key-file` instead. The detached background server never receives a secret through
+its argument list at all: it reads them from a framed payload on its standard input.
 
 The program's own leftovers are kept out of `%TEMP%`: the background server's state file and
 log live in `%LOCALAPPDATA%\vcrs` (0700/0600 on Unix), are removed when the volume is
