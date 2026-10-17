@@ -173,6 +173,19 @@ fn attach_registered_target(
     letter_taken: bool,
     report: &mut Report,
 ) -> Result<Attached> {
+    // Which vc-rs disks Windows already had. The disk this login creates has to be a
+    // new one: the INQUIRY name is what identifies a vc-rs disk, and anything that can
+    // create an iSCSI disk chooses that name itself, so a disk that was already there
+    // and merely *looks* the same must not be taken for ours — the letter would go onto
+    // another volume. (The snapshot is taken after the stale-device cleanup in
+    // `attach`, so a number that cleanup freed is not in it and can be reused by our
+    // own disk.)
+    let before: Vec<u32> = vcrs_disks()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|disk| disk.number)
+        .collect();
+
     // A login that did not work has to be reported. `iscsicli` exits non-zero on
     // an authentication failure, and swallowing that used to end in "logged in
     // ... waiting for the disk" plus a timeout that said nothing about the
@@ -194,7 +207,7 @@ fn attach_registered_target(
     ));
 
     // 3. Windows builds the disk asynchronously, so wait for it to turn up.
-    let disk = wait_for_disk(options.disk_size, options.wait, report)?;
+    let disk = wait_for_disk(options.disk_size, &before, options.wait, report)?;
 
     // 4. put it on the letter that was asked for.
     let mut fresher = None;
@@ -853,12 +866,13 @@ fn has_a_file_system(disk: &DiskInfo) -> bool {
 pub fn vcrs_disks() -> Result<Vec<DiskInfo>> {
     crate::win32::vcrs_disks(DISK_PRODUCT)
 }
-/// The disk is chosen by its INQUIRY name, and by size when the caller knows it
-/// (several `vcrs mount` processes can be serving different volumes at once);
-/// the highest disk number wins when two of them are the same size, because
-/// Windows numbers a newly created disk above the existing ones.
+/// The disk is chosen by its INQUIRY name and its size, and it has to be one Windows
+/// did not have before the login (`already_present`): several `vcrs mount` processes can
+/// be serving different volumes at once, so the name alone would not pick one, and a
+/// name that anything can copy would let a planted disk be picked instead of ours.
 fn wait_for_disk(
     disk_size: Option<u64>,
+    already_present: &[u32],
     timeout: Duration,
     report: &mut Report,
 ) -> Result<DiskInfo> {
@@ -878,7 +892,8 @@ fn wait_for_disk(
     let _ = crate::win32::rescan_devices();
     let mut since_scan = std::time::Instant::now();
     loop {
-        if let Some(disk) = newest_disk(disk_size) {
+        if let Some(disk) = newest_disk(&vcrs_disks().unwrap_or_default(), disk_size, already_present)
+        {
             return Ok(disk);
         }
         if std::time::Instant::now() >= deadline {
@@ -891,34 +906,62 @@ fn wait_for_disk(
         std::thread::sleep(Duration::from_millis(200));
     }
     // Nothing appeared: say what Windows does have, which is what tells a stale
-    // device apart from a login that never got through.
-    let seen: Vec<String> = vcrs_disks()
-        .unwrap_or_default()
+    // device apart from a login that never got through. A vc-rs disk that was already
+    // there and is the size we are looking for is called out separately: it is the
+    // shape of a planted name-alike, and it must not be used.
+    let all = vcrs_disks().unwrap_or_default();
+    let seen: Vec<String> = all
         .iter()
         .map(|disk| format!("disk {} ({} bytes)", disk.number, disk.size))
         .collect();
+    let look_alike: Vec<String> = all
+        .iter()
+        .filter(|disk| already_present.contains(&disk.number))
+        .filter(|disk| disk_size.map_or(true, |size| disk.size == size))
+        .map(|disk| format!("disk {} ({} bytes)", disk.number, disk.size))
+        .collect();
+    let seen_part = if seen.is_empty() {
+        String::new()
+    } else {
+        format!("; the vc-rs disks it does have: {}", seen.join(", "))
+    };
+    let alike_part = if look_alike.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; a vc-rs disk of that size was already on this machine before the login \
+             ({}), and it was left alone — refusing to put the letter on a disk this \
+             login did not create",
+            look_alike.join(", ")
+        )
+    };
     bail!(
-        "Windows did not show the disk within {} s{}. \
+        "Windows did not show the disk within {} s{}{}. \
          `vcrs dismount --iscsi <IQN>` clears a half-finished attach",
         timeout.as_secs(),
-        if seen.is_empty() {
-            String::new()
-        } else {
-            format!("; the vc-rs disks it does have: {}", seen.join(", "))
-        },
+        seen_part,
+        alike_part,
     );
 }
 
-/// The newest vc-rs disk of a given size, if Windows has one yet.
+/// The newest vc-rs disk of a given size that Windows did not have before, if any.
 ///
 /// The highest disk number wins when two candidates have the same size, because
-/// Windows numbers a newly created disk above the ones already there.
-fn newest_disk(disk_size: Option<u64>) -> Option<DiskInfo> {
-    crate::win32::vcrs_disks(DISK_PRODUCT)
-        .ok()?
-        .into_iter()
+/// Windows numbers a newly created disk above the ones already there. A disk whose
+/// number was there before the login is never a candidate: the INQUIRY name is what
+/// identifies a vc-rs disk, and whoever can create an iSCSI disk picks that name
+/// themselves.
+fn newest_disk(
+    disks: &[DiskInfo],
+    disk_size: Option<u64>,
+    already_present: &[u32],
+) -> Option<DiskInfo> {
+    disks
+        .iter()
+        .filter(|disk| !already_present.contains(&disk.number))
         .filter(|disk| disk_size.map_or(true, |size| disk.size == size))
         .max_by_key(|disk| disk.number)
+        .cloned()
 }
 
 /// Make this process ignore console control events (Ctrl-C, Ctrl-Break, a
@@ -1364,6 +1407,38 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn a_disk(number: u32, size: u64, letter: Option<char>) -> DiskInfo {
+        DiskInfo {
+            number,
+            size,
+            partition: None,
+            letter,
+        }
+    }
+
+    /// A disk that was already on the machine before the login must never be picked:
+    /// the INQUIRY name is the only thing that identifies a vc-rs disk, so a planted
+    /// disk can wear it, and the letter would then go onto someone else's volume.
+    #[test]
+    fn a_disk_that_was_already_there_is_not_ours() {
+        let disks = vec![
+            a_disk(1, 11272192, Some('S')),
+            a_disk(2, 4096, None),
+            a_disk(3, 11272192, None),
+        ];
+        // Disk 1 is the size we want but was there before, so disk 3 (the login's)
+        // wins — and with no "before" list, the highest number still wins.
+        assert_eq!(newest_disk(&disks, Some(11272192), &[1]).unwrap().number, 3);
+        assert_eq!(newest_disk(&disks, Some(11272192), &[]).unwrap().number, 3);
+        // The size still has to match.
+        assert_eq!(newest_disk(&disks, Some(4096), &[]).unwrap().number, 2);
+        assert!(newest_disk(&disks, Some(512), &[]).is_none());
+        // A look-alike that was already there and nothing else: no candidate at all.
+        assert!(newest_disk(&disks, Some(11272192), &[1, 3]).is_none());
+        // Without a size any new disk will do.
+        assert_eq!(newest_disk(&disks, None, &[3]).unwrap().number, 2);
+    }
 
     fn options() -> AttachOptions {
         AttachOptions {

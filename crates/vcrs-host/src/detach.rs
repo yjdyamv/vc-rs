@@ -151,33 +151,39 @@ pub fn detach(options: &DetachOptions, report: &mut Report) -> Result<Detached> 
             // forgetting the volume (a letter left behind with no disk under it, a
             // session the initiator refuses to log out) — and the disk is the
             // fallback for a mount made by hand, which leaves no state file.
+            //
+            // What is on the letter *now* is asked first, though: a stale record
+            // names a letter that may have been given to a different volume since,
+            // and a request for one letter must never take another volume down.
+            let on_disk = disks.iter().find(|disk| disk.letter == Some(want));
             let recorded = serve::states()
                 .into_iter()
                 .find(|server| server.letter == Some(want))
                 .map(|server| server.iqn);
-            let iqn = match recorded {
-                Some(iqn) => Some(iqn),
-                None => disks
-                    .iter()
-                    .find(|disk| disk.letter == Some(want))
-                    .and_then(|disk| {
-                        vcrs.iter()
-                            .find(|session| session.disk == Some(disk.number))
-                            .or_else(|| vcrs.first())
-                            .map(|session| session.iqn.clone())
-                    }),
-            };
-            let Some(iqn) = iqn else {
+            let iqn: Option<String> = on_disk
+                .and_then(|disk| vcrs.iter().find(|session| session.disk == Some(disk.number)))
+                .map(|session| session.iqn.clone())
+                .or(recorded);
+            if on_disk.is_none() && iqn.is_none() {
                 bail!("no vc-rs volume is on {want}: (see `vcrs list`)");
+            }
+            // The sessions of the volume on that letter: by IQN when it could be
+            // named, and by the disk when Windows did not name its session's disk.
+            let candidates: Vec<Session> = match &iqn {
+                Some(iqn) => vcrs
+                    .iter()
+                    .filter(|session| &session.iqn == iqn)
+                    .cloned()
+                    .collect(),
+                None => vcrs
+                    .iter()
+                    .filter(|session| session.disk == on_disk.map(|disk| disk.number))
+                    .cloned()
+                    .collect(),
             };
-            let candidates: Vec<Session> = vcrs
-                .iter()
-                .filter(|session| session.iqn == iqn)
-                .cloned()
-                .collect();
             if candidates.is_empty() {
                 out.notes.push(format!(
-                    "{iqn} has no session any more (Windows may have logged it out already)"
+                    "{want}: has no session any more (Windows may have logged it out already)"
                 ));
             }
             candidates
@@ -194,7 +200,19 @@ pub fn detach(options: &DetachOptions, report: &mut Report) -> Result<Detached> 
     //    gives a session no disk number at all, and letting go of every vc-rs disk
     //    because of that would take a second volume down with the one asked for.
     let numbers: Vec<u32> = if wanted.iter().any(|session| session.disk.is_none()) {
-        target_disks(&options.target, &disks)?
+        let numbers = target_disks(&options.target, &vcrs, &disks)?;
+        // An IQN names a target, not a disk, and Windows does not always name the
+        // disk a session is on. Taking *every* vc-rs disk down for that would take a
+        // second volume with the one that was asked for, so a disk that cannot be
+        // attributed to this target is left alone instead.
+        if numbers.is_empty() && wanted.iter().any(|session| session.disk.is_none()) {
+            report.line(
+                "  Windows did not say which disk this target is on, so no disk was taken \
+                 offline (the logout may need a second try; `vcrs dismount --letter <L>` \
+                 can take the volume off directly)",
+            );
+        }
+        numbers
     } else {
         wanted.iter().filter_map(|session| session.disk).collect()
     };
@@ -236,7 +254,17 @@ pub fn detach(options: &DetachOptions, report: &mut Report) -> Result<Detached> 
     if let Target::Letter(letter) = &options.target {
         let want = letter.to_ascii_uppercase();
         if !letters.contains(&want) {
-            letters.push(want);
+            // Only a letter that is on a vc-rs disk is ours to let go of: a stale
+            // record must not make this take the letter off a volume that is not
+            // ours (the volume that inherited the letter is not in the listing at
+            // all, because the listing only holds vc-rs disks).
+            if disks.iter().any(|disk| disk.letter == Some(want)) {
+                letters.push(want);
+            } else {
+                report.line(&format!(
+                    "  {want}: holds no vc-rs volume, so it was left alone"
+                ));
+            }
         }
     }
     let released = release(&numbers, &letters, &pids, report)?;
@@ -682,7 +710,7 @@ fn remove_device(instance_id: &str) -> Result<()> {
 }
 
 /// The disks a request is about, for the case where Windows will not name them.
-fn target_disks(target: &Target, disks: &[DiskInfo]) -> Result<Vec<u32>> {
+fn target_disks(target: &Target, sessions: &[Session], disks: &[DiskInfo]) -> Result<Vec<u32>> {
     Ok(match target {
         Target::All => disks.iter().map(|disk| disk.number).collect(),
         Target::Letter(letter) => {
@@ -693,9 +721,29 @@ fn target_disks(target: &Target, disks: &[DiskInfo]) -> Result<Vec<u32>> {
                 .map(|disk| disk.number)
                 .collect()
         }
-        // An IQN names a target, not a disk, and with no session to ask there is
-        // nothing to narrow it down with.
-        Target::Iqn(_) => disks.iter().map(|disk| disk.number).collect(),
+        // An IQN names a target, not a disk. Only the disks that target is known to
+        // own are returned: the ones its own sessions name, and — for a session
+        // Windows did not give a disk — the letter `vcrs mount --letter` recorded for
+        // that IQN. Returning every vc-rs disk here is what used to take an unrelated
+        // volume offline along with the one that was asked for.
+        Target::Iqn(iqn) => {
+            let mut numbers: Vec<u32> = sessions
+                .iter()
+                .filter(|session| &session.iqn == iqn)
+                .filter_map(|session| session.disk)
+                .collect();
+            if let Some(letter) = serve::state(iqn).and_then(|server| server.letter) {
+                numbers.extend(
+                    disks
+                        .iter()
+                        .filter(|disk| disk.letter == Some(letter))
+                        .map(|disk| disk.number),
+                );
+            }
+            numbers.sort_unstable();
+            numbers.dedup();
+            numbers
+        }
     })
 }
 
@@ -921,5 +969,61 @@ sess=;iqn=;disk=0;conn=False
             .collect();
         assert_eq!(vcrs.len(), 1);
         assert_eq!(vcrs[0].iqn, "iqn.2025-12.io.vcrs:secret");
+    }
+
+    fn a_session(iqn: &str, disk: Option<u32>) -> Session {
+        Session {
+            id: format!("sess-{iqn}"),
+            iqn: iqn.to_string(),
+            disk,
+            connected: true,
+        }
+    }
+
+    fn a_disk(number: u32, letter: Option<char>) -> DiskInfo {
+        DiskInfo {
+            number,
+            size: 4096,
+            partition: None,
+            letter,
+        }
+    }
+
+    /// The bug this pins: `dismount --iscsi <iqn>` used to hand *every* vc-rs disk to
+    /// the release step for a target whose session Windows did not give a disk number,
+    /// so asking for one volume took another one down with it.
+    #[test]
+    fn an_iqn_only_takes_the_disks_it_owns() {
+        let mine = "iqn.2025-12.io.vcrs:mine";
+        let other = "iqn.2025-12.io.vcrs:other";
+        let sessions = vec![a_session(mine, Some(1)), a_session(other, Some(2))];
+        let disks = vec![a_disk(1, Some('S')), a_disk(2, Some('T'))];
+
+        assert_eq!(
+            target_disks(&Target::Iqn(mine.to_string()), &sessions, &disks).unwrap(),
+            vec![1]
+        );
+        assert_eq!(
+            target_disks(&Target::All, &sessions, &disks).unwrap(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            target_disks(&Target::Letter('t'), &sessions, &disks).unwrap(),
+            vec![2]
+        );
+    }
+
+    /// Windows often gives a session no disk number at all. When nothing says which
+    /// disk it is (no session, no state file), the answer is "no disk", never "every
+    /// disk".
+    #[test]
+    fn a_session_without_a_disk_names_no_disk() {
+        let mine = "iqn.2025-12.io.vcrs:not-a-real-mount-9f3a";
+        let sessions = vec![a_session(mine, None)];
+        let disks = vec![a_disk(1, Some('S')), a_disk(2, Some('T'))];
+
+        assert!(target_disks(&Target::Iqn(mine.to_string()), &sessions, &disks)
+            .unwrap()
+            .is_empty());
     }
 }

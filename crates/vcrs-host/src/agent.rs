@@ -122,6 +122,11 @@ fn split_reply(text: &str) -> (i32, String) {
 
 /// Serve requests until the idle timeout passes, or somebody says `stop`.
 pub fn serve(idle: Duration) -> Result<()> {
+    // The agent outlives the command that started it (it waits for the next one), so a
+    // password left in its environment would sit in a long-lived process. Nothing in
+    // the agent reads it, and the requests it runs get their secrets over stdin, so
+    // it is dropped here — the same reason `vcrs` drops it at startup.
+    std::env::remove_var("VCRS_PASSWORD");
     #[cfg(windows)]
     {
         pipe::serve(&pipe_name(), idle)
