@@ -648,7 +648,12 @@ impl Volume {
                                 );
                                 continue;
                             }
-                            log::info!("opened {layout:?} volume with PRF {prf} and {ea}");
+                            // Debug, not info: the layout, the PRF and the
+                            // encryption algorithm are what a trial decryption
+                            // has to guess, and a log line is a forensic artifact
+                            // that outlives the mount. `vcrs info` says the same
+                            // thing when it is asked.
+                            log::debug!("opened {layout:?} volume with PRF {prf} and {ea}");
                             return Volume::from_parts(file, *layout, header, host_size, timestamps);
                         }
                         Err(Error::HigherVersionRequired(v)) => {

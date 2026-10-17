@@ -192,6 +192,12 @@ fn execute(words: &[&str]) -> Result<(i32, String)> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    if std::env::var_os("RUST_LOG").is_none() {
+        // The worker's log is a file on disk that lives until the agent reads it
+        // (and longer if the worker dies first); warn-level keeps the volume's
+        // parameters out of it unless the user asked for more.
+        command.env("RUST_LOG", "warn");
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
