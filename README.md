@@ -412,6 +412,35 @@ iscsicli QLoginTarget iqn.2025-12.io.vcrs:secret
 vcrs attach --iqn iqn.2025-12.io.vcrs:secret --letter S
 ```
 
+### Mounting on Linux
+
+The same target serves there; only the initiator differs, and Linux has several. The
+recipe `vcrs mount` prints works with open-iscsi, and unlike the Microsoft initiator it
+can scan a portal (so no static target is needed). Verified end to end on Ubuntu 26.04:
+`/dev/sdX1` appeared with the volume's filesystem label, a file written inside it was
+still there when a **fresh** server process served the same container afterwards.
+
+```bash
+sudo apt install open-iscsi && sudo modprobe iscsi_tcp
+
+# terminal 1 (no special rights): serve the volume; it prints these same two lines
+vcrs mount secret.vc -p "correct horse"
+
+# terminal 2 (root): log the kernel in, the way `--letter` does on Windows
+sudo iscsiadm -m discovery -t sendtargets -p 127.0.0.1:3260
+sudo iscsiadm -m node -T iqn.2025-12.io.vcrs:xxxx -l     # → /dev/sdX, partition /dev/sdX1
+sudo mount /dev/sdX1 /mnt/vcrs                           # any filesystem Linux supports
+
+# detach again
+sudo umount /mnt/vcrs
+sudo iscsiadm -m node -T iqn.2025-12.io.vcrs:xxxx -u
+sudo iscsiadm -m node -T iqn.2025-12.io.vcrs:xxxx -o delete
+```
+
+The synthetic MBR (`--disk-mode partition`, the default) is what makes the data area
+show up as `/dev/sdX1`; `--disk-mode raw` presents the bare data area instead, for an
+initiator that would rather mount the device itself.
+
 `--backup` opens the volume through the copy of the header at the end of the container
 instead of the one at the front (VeraCrypt's "Use backup header embedded in volume if
 available"), so a container whose primary header is damaged still serves; `--letter`
