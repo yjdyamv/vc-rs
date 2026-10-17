@@ -22,6 +22,8 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+#[cfg(not(windows))]
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -61,13 +63,74 @@ impl Server {
     /// The log file the detached process writes to (it has no console of its
     /// own, so this is where its output goes).
     fn log_path(iqn: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("vcrs-{}.log", slug(iqn)))
+        state_dir().join(format!("vcrs-{}.log", slug(iqn)))
     }
 
     /// Where this server is recorded so `vcrs dismount` can find it.
     fn state_path(iqn: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("vcrs-{}.server", slug(iqn)))
+        state_dir().join(format!("vcrs-{}.server", slug(iqn)))
     }
+}
+
+/// The directory the servers' state files and logs live in.
+///
+/// This used to be `std::env::temp_dir()`, which is `%TEMP%` on Windows: every
+/// process of every user can create files there, and by default they can read
+/// each other's. Both halves of that are wrong for these files. A state file
+/// planted there is what let an elevated `vcrs dismount` be pointed at an
+/// unrelated process (see [`wait_and_kill`]), and a log there keeps the name of
+/// the container on disk for anyone who comes by. The per-user application data
+/// directory inherits the profile's access control list instead, so another user
+/// can neither read the log nor plant a state file, and the `%TEMP%` cleaner that
+/// runs on reboot or logon no longer takes a running server's files away.
+///
+/// It is created on demand, and the old temporary directory is used as a last
+/// resort rather than failing a mount (a service account may have neither).
+pub fn state_dir() -> PathBuf {
+    #[cfg(windows)]
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    // `$XDG_RUNTIME_DIR` is private to the user by definition; without it the
+    // temporary directory is all we have, but the subdirectory is then 0700.
+    #[cfg(not(windows))]
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| Path::new(&home).join(".cache"))
+        });
+    let dir = base
+        .unwrap_or_else(std::env::temp_dir)
+        .join("vcrs");
+    if !dir.is_dir() {
+        let _ = create_private_dir(&dir);
+    }
+    dir
+}
+
+#[cfg(unix)]
+fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(dir)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    fs::create_dir_all(dir)
+}
+
+/// Create (or truncate) one of these files so that, on Unix, nobody else can
+/// read it. Windows inherits the directory's access control list.
+pub(crate) fn private_file(path: &std::path::Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 /// A file-name-safe form of an IQN (`iqn.2025-12.io.vcrs:secret`).
@@ -118,7 +181,7 @@ pub fn spawn(
     let exe = std::env::current_exe().context("finding this program's own path")?;
     let args = child_arguments(iqn, bind, std::env::args_os())?;
     let log = Server::log_path(iqn);
-    let file = fs::File::create(&log)
+    let file = private_file(&log)
         .with_context(|| format!("creating the background log {}", log.display()))?;
     disinherit_standard_handles();
 
@@ -264,7 +327,7 @@ pub fn state(iqn: &str) -> Option<Server> {
 
 /// Every server still recorded, newest state files included.
 pub fn states() -> Vec<Server> {
-    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+    let Ok(entries) = fs::read_dir(state_dir()) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -294,11 +357,12 @@ fn read_state(path: &std::path::Path) -> Option<Server> {
             Some(("pid", value)) => pid = value.trim().parse::<u32>().ok(),
             Some(("log", value)) => {
                 let value = PathBuf::from(value.trim());
-                // The state file lives in `%TEMP%`, which the invoking user can write,
-                // so its `log=` line is attacker-controlled input. Without this check a
-                // planted file would make every error message read (and print the tail
-                // of) an arbitrary file — `C:\Windows\System32\config\SAM`, say.
-                if in_temp_dir(&value) {
+                // The state file is written by this program but read back from a
+                // directory other processes may reach, so its `log=` line is
+                // attacker-controlled input. Without this check a planted file would
+                // make every error message read (and print the tail of) an arbitrary
+                // file — `C:\Windows\System32\config\SAM`, say.
+                if in_state_dir(&value) {
                     log = Some(value);
                 }
             }
@@ -322,13 +386,13 @@ fn read_state(path: &std::path::Path) -> Option<Server> {
     })
 }
 
-/// Whether a path is inside this process's temporary directory.
+/// Whether a path is inside this program's own state directory.
 ///
 /// The state files (and the logs they name) are only ever written there, so a path
 /// that points somewhere else was planted. The canonical check is what rejects a
-/// `%TEMP%\..\..\Windows\...` that starts out looking like one of ours.
-fn in_temp_dir(path: &std::path::Path) -> bool {
-    let dir = std::env::temp_dir();
+/// `%LOCALAPPDATA%\vcrs\..\..\Windows\...` that starts out looking like one of ours.
+fn in_state_dir(path: &std::path::Path) -> bool {
+    let dir = state_dir();
     if !path.starts_with(&dir) {
         return false;
     }
@@ -343,13 +407,13 @@ fn in_temp_dir(path: &std::path::Path) -> bool {
 /// Forget a server's state file (after it went away, or after it was stopped).
 ///
 /// Its log goes with it: the log names the container (the default target name is
-/// derived from the file name), so leaving it in `%TEMP%` leaves the name of an
-/// encrypted volume on disk after the volume was dismounted. It is only removed
+/// derived from the file name), so leaving it on disk leaves the name of an
+/// encrypted volume behind after the volume was dismounted. It is only removed
 /// when it really is one of ours — the path comes from the state file, and
 /// removing whatever it named would be an arbitrary file deletion.
 pub fn forget(iqn: &str) {
     if let Some(server) = read_state(&Server::state_path(iqn)) {
-        if in_temp_dir(&server.log) {
+        if in_state_dir(&server.log) {
             let _ = fs::remove_file(&server.log);
         }
     }
@@ -359,22 +423,43 @@ pub fn forget(iqn: &str) {
 /// Remove the logs of servers that nothing records any more.
 ///
 /// A server that was killed or that went down with the machine leaves its log in
-/// `%TEMP%` without a state file beside it, and that log is a lasting record: it names
-/// the target, and under `RUST_LOG=debug` it says which layout was opened — the one
+/// the state directory without a state file beside it, and that log is a lasting
+/// record: it names the target, and under `RUST_LOG=debug` it says which layout was
+/// opened — the one
 /// thing a hidden volume exists to keep out of the open. A server that is still running
 /// always has its state file (`remember` writes it right after `spawn`), so a log
 /// without one belongs to nobody. Logs of an *attach* run (`vcrs-attach-<pid>.log`) are
 /// kept until they are well past the five minutes an attach may take, because one may be
 /// in flight right now and deleting it would lose that run's output.
 pub fn sweep_logs() {
-    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
-        return;
-    };
+    // The temporary directory is swept as well: that is where these files lived
+    // before, so an older build (or a machine that was not cleaned since) still
+    // has the container's name lying there.
+    let mut dirs = vec![state_dir()];
+    let legacy = std::env::temp_dir();
+    if legacy != dirs[0] {
+        dirs.push(legacy);
+    }
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        sweep_one_dir(&dir, entries);
+    }
+}
+
+fn sweep_one_dir(dir: &std::path::Path, entries: fs::ReadDir) {
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
+        // A state file this build cannot read any more (it looks in `state_dir`), so
+        // whatever it described is not reachable through `vcrs dismount` anyway.
+        if name.starts_with("vcrs-") && name.ends_with(".server") && dir == std::env::temp_dir() && dir != state_dir() {
+            let _ = fs::remove_file(&path);
+            continue;
+        }
         let Some(slug) = name
             .strip_prefix("vcrs-")
             .and_then(|rest| rest.strip_suffix(".log"))
@@ -407,8 +492,9 @@ pub fn sweep_logs() {
 
 /// Whether an open process handle is this program (a `vcrs.exe`).
 ///
-/// State files live in `%TEMP%`, a directory the calling user can write, so their
-/// `pid=` line is attacker-controlled input, and without this check a planted
+/// State files are plain files whose `pid=` line the user can rewrite (and, back
+/// when they lived in `%TEMP%`, so could every other process of every other user),
+/// so that line is attacker-controlled input: without this check a planted
 /// `vcrs-*.server` would turn `vcrs dismount` — which runs elevated, because it has
 /// to touch disks and letters — into "terminate any process on this machine". The
 /// image name is the strongest claim a handle can be asked for without reading the
@@ -912,7 +998,7 @@ mod tests {
         let server = Server {
             iqn: "iqn.x".to_string(),
             pid: 1,
-            log: std::env::temp_dir().join("vcrs-serve-size-test.log"),
+            log: state_dir().join("vcrs-serve-size-test.log"),
             letter: None,
         };
         fs::write(
@@ -927,12 +1013,12 @@ mod tests {
 
     #[test]
     fn a_state_file_is_read_back_from_the_iqn_or_from_its_name() {
-        let dir = std::env::temp_dir().join("vcrs-serve-state-test");
+        let dir = state_dir().join("vcrs-serve-state-test");
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("vcrs-iqn.2025-12.io.vcrs_secret.server");
         // The log path is taken from the file, so it has to point where a log really
         // is written; `read_state` drops a path from anywhere else.
-        let log = std::env::temp_dir().join("vcrs-serve-state-test.log");
+        let log = state_dir().join("vcrs-serve-state-test.log");
         fs::write(
             &path,
             format!(

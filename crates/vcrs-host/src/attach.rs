@@ -524,7 +524,11 @@ fn attach_arguments(options: &AttachOptions, log: Option<&Path>, json: bool) -> 
 }
 
 pub fn temp_log_path() -> PathBuf {
-    std::env::temp_dir().join(format!("vcrs-attach-{}.log", std::process::id()))
+    // In the private state directory rather than `%TEMP%`: this file holds a
+    // report about a container, and `%TEMP%` is readable by every user on the
+    // machine. The name keeps the `vcrs-attach-` prefix that `serve::sweep_logs`
+    // looks for.
+    crate::serve::state_dir().join(format!("vcrs-attach-{}.log", std::process::id()))
 }
 
 /// Run `exe args` elevated, and return as soon as it is running.
@@ -1378,7 +1382,7 @@ pub struct Report {
 
 impl Report {
     pub fn new(path: Option<&Path>) -> Self {
-        let log = path.and_then(|path| std::fs::File::create(path).ok());
+        let log = path.and_then(|path| crate::serve::private_file(path).ok());
         Self {
             log,
             quiet: false,
