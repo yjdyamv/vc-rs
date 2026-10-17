@@ -844,4 +844,19 @@ its argument list at all: it reads them from a framed payload on its standard in
 The program's own leftovers are kept out of `%TEMP%`: the background server's state file and
 log live in `%LOCALAPPDATA%\vcrs` (0700/0600 on Unix), are removed when the volume is
 dismounted, and are swept if a server died without one. A log that is left behind says
-nothing about the volume's layout unless `RUST_LOG` asked for it.
+nothing about the volume's layout at the default level.
+
+The **plaintext** of a mounted volume is a different matter from its key, and less can be
+done about it. While a volume is mounted its contents pass through this process (in the
+served disk) and through the kernel (the iSCSI initiator and the file system on top of it),
+so they are ordinary memory: they can be paged into the page file, captured by
+`hiberfil.sys`, and copied by a dump of either the process or the kernel. Locking them is
+not practical (a transfer is megabytes and changes constantly), and no user-mode call keeps
+a page out of the page file. If the machine is captured while a volume is mounted, treat
+its contents as readable by whoever captured it; after a dismount the session's buffers are
+gone, and the operating system's caches are the only copy left.
+
+Two related traces are outside this program entirely: a file deleted with the ordinary
+delete call can still be recovered until its sectors are reused, and if the container lives
+on a volume with shadow copies (or another snapshot mechanism), an older copy of it -
+encrypted, but showing that a container was there - can survive a rewrite.
