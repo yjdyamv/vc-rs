@@ -93,6 +93,36 @@ configured for CHAP without ever authenticating.  (vc-rs itself configures
 and the other login path ANDs the same predicate into its transit decision.
 Covered by `typestate_session::tests::a_login_that_skips_security_negotiation_*`.
 
+## (5) `src/typestate_session.rs` — the CHAP challenge reply must echo `AuthMethod`
+
+**Cause.** In `handle_chap_auth`, the branch that sends the challenge
+(`chap_a.is_some() && chap_state.is_none()`) built its response without
+`AuthMethod`.  RFC 7143 makes `AuthMethod` mandatory in both the
+SecurityNegotiation request and its response; the Microsoft initiator requires
+it and does not answer a challenge that omits it.
+
+**Fix.** The challenge reply now carries `AuthMethod=CHAP` in front of
+`TargetPortalGroupTag`, `CHAP_A`, `CHAP_I` and `CHAP_C`.
+
+## (6) `src/target.rs` — the connection handler has to use the configured session
+
+**Cause.** `handle_connection_with_first_pdu_boxed` created its session with
+`AnySession::new()`, which is `AuthConfig::None`, instead of the target's own
+configuration.  A target therefore answered the initiator's very first login
+PDU with `AuthMethod=None` no matter what `add_target_with_auth` had been given,
+and Windows refused the session with the event `iScsiPrt` 38: "the initiator
+requires CHAP for login authentication, but the target did not offer CHAP".
+This is why authentication could not be turned on in the first place; the bug in
+(4) only mattered after this one was fixed.
+
+**Fix.** The session is built with
+`AnySession::new_configured(auth_config.clone(), target_name, target_alias,
+allowed_initiators.clone())`.  Covered by
+`target::tests::a_configured_connection_answers_the_first_login_with_chap`,
+which drives the real handler over a socket pair (and was checked to fail when
+this fix is reverted) and by
+`typestate_session::tests::a_configured_session_offers_chap_in_the_first_login_reply`.
+
 ## Still broken upstream (worked around, not patched)
 
 * **Discovery sessions.** `QAddTargetPortal` (portal scan) opens a *discovery*
@@ -106,6 +136,10 @@ Covered by `typestate_session::tests::a_login_that_skips_security_negotiation_*`
   iscsicli AddTarget <iqn> vcrs 127.0.0.1 3260 0 0 0 0 0 8 0 0 "" "" 0 0
   iscsicli QLoginTarget <iqn>
   ```
+
+  (with `--chap` the credential arguments and the type change: `... 0 0 vcrs
+  <secret> 1 0`, and `vcrs attach --chap-from <volume>` computes the secret
+  from the container's header salt for you.)
 
   This uses the normal login path, which does handle the multi-PDU handshake.
   The two empty strings must reach `iscsicli` as genuinely empty arguments.

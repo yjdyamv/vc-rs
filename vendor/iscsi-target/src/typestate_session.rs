@@ -703,7 +703,18 @@ impl TypestateSession<SecurityNegotiation> {
                         ]))
                     } else if chap_a.is_some() && self.data.chap_state.is_none() {
                         let chap_state = ChapAuthState::new(false);
+                        // `AuthMethod` has to be in this reply as well. An
+                        // initiator is allowed to offer the method and its
+                        // CHAP_A algorithm in the same login PDU, and the
+                        // Microsoft one does exactly that; without the echo it
+                        // concludes that the target does not offer CHAP at all
+                        // and drops the connection with iScsiPrt event 38,
+                        // "the initiator requires CHAP for login authentication,
+                        // but the target did not offer CHAP". RFC 3720 12.10
+                        // shows AuthMethod in this response too.
                         let result = vec![
+                            ("AuthMethod".to_string(), "CHAP".to_string()),
+                            ("TargetPortalGroupTag".to_string(), "1".to_string()),
                             ("CHAP_A".to_string(), "5".to_string()),
                             ("CHAP_I".to_string(), chap_state.identifier_str()),
                             ("CHAP_C".to_string(), chap_state.challenge_hex()),
@@ -1068,6 +1079,64 @@ mod tests {
         session.data.auth_config = auth_config;
         session.data.chap_completed = chap_completed;
         session
+    }
+
+    /// The Microsoft initiator's first login PDU: it offers `AuthMethod=CHAP`
+    /// and nothing else, and leaves `CHAP_A` for the next PDU.
+    fn a_first_login() -> IscsiPdu {
+        let data = serialize_text_parameters(&[
+            (
+                "InitiatorName".to_string(),
+                "iqn.1991-05.com.microsoft:desktop".to_string(),
+            ),
+            ("SessionType".to_string(), "Normal".to_string()),
+            (
+                "TargetName".to_string(),
+                "iqn.2025-12.io.vcrs:test".to_string(),
+            ),
+            ("AuthMethod".to_string(), "CHAP".to_string()),
+        ]);
+        IscsiPdu::login_request([0x11; 6], 0, 0, 1, 0, 0, 0, false, data)
+    }
+
+    /// The connection handler builds the session that answers the *first* login
+    /// PDU with `AnySession::new_configured`. It used to build it with
+    /// `AnySession::new()`, and then a target that requires CHAP answered
+    /// `AuthMethod=None` to an initiator that had offered only `CHAP`: Windows
+    /// dropped the connection with "the initiator requires CHAP for login
+    /// authentication, but the target did not offer CHAP" (iScsiPrt event 38)
+    /// and CHAP could not be turned on at all.
+    #[test]
+    fn a_configured_session_offers_chap_in_the_first_login_reply() {
+        let session = AnySession::new_configured(
+            AuthConfig::Chap {
+                credentials: crate::auth::ChapCredentials::new("vcrs", "secret"),
+            },
+            "iqn.2025-12.io.vcrs:test",
+            "vc-rs VeraCrypt volume",
+            None,
+        );
+        let (any_session, responses) = session
+            .process_login(&a_first_login(), "iqn.2025-12.io.vcrs:test")
+            .unwrap();
+        assert!(
+            matches!(any_session, AnySession::SecurityNegotiation(_)),
+            "the first reply is part of the security negotiation"
+        );
+        assert_eq!(responses.len(), 1);
+        let params = pdu::parse_text_parameters(&responses[0].data).unwrap();
+        assert!(
+            params
+                .iter()
+                .any(|(k, v)| k == "AuthMethod" && v == "CHAP"),
+            "the target has to offer CHAP, got {params:?}"
+        );
+        assert!(
+            !params
+                .iter()
+                .any(|(k, v)| k == "AuthMethod" && v == "None"),
+            "a target that requires CHAP must not offer None, got {params:?}"
+        );
     }
 
     /// A target that requires CHAP must not hand out a session to an initiator

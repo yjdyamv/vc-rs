@@ -1508,7 +1508,19 @@ fn handle_connection_with_first_pdu_boxed(
         std::net::SocketAddr::V6(addr) => format!("[{}]", addr.ip()),
     };
 
-    let mut session = AnySession::new();
+    // The session that answers the *first* login PDU has to carry the target's
+    // authentication configuration: that PDU is where the initiator offers
+    // `AuthMethod`, and a session built with `AnySession::new()` would answer
+    // `AuthMethod=None` no matter what the target was configured with. The
+    // initiator then reports "the initiator requires CHAP for login
+    // authentication, but the target did not offer CHAP" (iScsiPrt event 38)
+    // and drops the connection, so CHAP could never be turned on at all.
+    let mut session = AnySession::new_configured(
+        auth_config.clone(),
+        target_name,
+        _target_alias,
+        allowed_initiators.clone(),
+    );
     let mut session_entered = false;
 
     // Process the first PDU (login request)
@@ -2097,6 +2109,89 @@ mod tests {
 
         fn capacity(&self) -> u64 { self.capacity }
         fn block_size(&self) -> u32 { self.block_size }
+    }
+
+    /// The connection handler has to answer the *first* login PDU from the
+    /// session it was configured with. It used to build that session with
+    /// `AnySession::new()`, so a target that requires CHAP answered
+    /// `AuthMethod=None` to an initiator that had offered only `CHAP`; Windows
+    /// dropped the connection with iScsiPrt event 38 ("the initiator requires
+    /// CHAP for login authentication, but the target did not offer CHAP") and
+    /// CHAP could not be turned on at all. This drives the real handler over a
+    /// real socket pair.
+    #[test]
+    fn a_configured_connection_answers_the_first_login_with_chap() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+
+        // The Microsoft initiator's first PDU offers CHAP and nothing else.
+        let data = serialize_text_parameters(&[
+            (
+                "InitiatorName".to_string(),
+                "iqn.1991-05.com.microsoft:desktop".to_string(),
+            ),
+            ("SessionType".to_string(), "Normal".to_string()),
+            (
+                "TargetName".to_string(),
+                "iqn.2025-12.io.vcrs:test".to_string(),
+            ),
+            ("AuthMethod".to_string(), "CHAP".to_string()),
+        ]);
+        let first_pdu = IscsiPdu::login_request([0x11; 6], 0, 0, 1, 0, 0, 0, false, data);
+
+        let device: Arc<Mutex<Box<dyn ScsiBlockDevice + Send>>> =
+            Arc::new(Mutex::new(Box::new(MockDevice::new(1000, 512))));
+        let running = Arc::new(AtomicBool::new(true));
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let active_sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let handler = thread::spawn({
+            let running = Arc::clone(&running);
+            let shutting_down = Arc::clone(&shutting_down);
+            let active_sessions = Arc::clone(&active_sessions);
+            move || {
+                handle_connection_with_first_pdu_boxed(
+                    server,
+                    device,
+                    "iqn.2025-12.io.vcrs:test",
+                    "vc-rs VeraCrypt volume",
+                    crate::auth::AuthConfig::Chap {
+                        credentials: crate::auth::ChapCredentials::new("vcrs", "secret"),
+                    },
+                    running,
+                    shutting_down,
+                    8,
+                    active_sessions,
+                    None,
+                    first_pdu,
+                )
+            }
+        });
+
+        let reply = read_pdu(&mut client).expect("the target has to answer the login");
+        let params = pdu::parse_text_parameters(&reply.data).unwrap();
+        assert!(
+            params
+                .iter()
+                .any(|(k, v)| k == "AuthMethod" && v == "CHAP"),
+            "a target that requires CHAP has to offer it, got {params:?}"
+        );
+        assert!(
+            !params
+                .iter()
+                .any(|(k, v)| k == "AuthMethod" && v == "None"),
+            "a target that requires CHAP must not offer None, got {params:?}"
+        );
+
+        // Closing the client ends the handler's read loop.
+        drop(client);
+        running.store(false, Ordering::SeqCst);
+        let _ = handler.join();
     }
 
     #[test]
