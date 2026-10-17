@@ -181,6 +181,10 @@ fn send_connection_limit_reject(mut stream: TcpStream) -> ScsiResult<()> {
 }
 
 /// Handle a single iSCSI connection using typestate session
+// The parameter list is the upstream one: each argument is part of the
+// connection's state, and grouping them would touch every call site of the
+// patched login path for no behavioural gain.
+#[allow(clippy::too_many_arguments)]
 fn handle_connection<D: ScsiBlockDevice>(
     mut stream: TcpStream,
     device: Arc<Mutex<D>>,
@@ -268,7 +272,12 @@ fn handle_connection<D: ScsiBlockDevice>(
                 resp.specific[0..4].copy_from_slice(&pdu.specific[0..4]); // TTT
                 // StatSN, ExpCmdSN, MaxCmdSN will be approximate but good enough for keepalive
                 if let Ok(mut writer) = nop_writer.lock() {
-                    let _ = write_pdu_digest(&mut *writer, &resp, nop_hd.load(Ordering::SeqCst), nop_dd.load(Ordering::SeqCst));
+                    let _ = write_pdu_digest(
+                        &mut writer,
+                        &resp,
+                        nop_hd.load(Ordering::SeqCst),
+                        nop_dd.load(Ordering::SeqCst),
+                    );
                 }
                 continue;
             }
@@ -515,7 +524,7 @@ fn handle_login_phase(
 
             // Process login using typestate session
             // We need to take ownership and replace session
-            let old_session = std::mem::replace(session, AnySession::new());
+            let old_session = std::mem::take(session);
             let (new_session, responses) = old_session.process_login(pdu, target_name)?;
             *session = new_session;
 
@@ -557,7 +566,7 @@ fn handle_full_feature_phase<D: ScsiBlockDevice>(
         }
         opcode::LOGOUT_REQUEST => {
             // Process logout - this transitions session state
-            let old_session = std::mem::replace(session, AnySession::new());
+            let old_session = std::mem::take(session);
             let (new_session, response) = old_session.process_logout(pdu)?;
             *session = new_session;
             Ok(vec![response])
@@ -720,15 +729,12 @@ fn handle_write_command<D: ScsiBlockDevice>(
                 (0, 0)
             }
         }
-        0x8a => {
-            if cmd.cdb.len() >= 16 {
+        0x8a
+            if cmd.cdb.len() >= 16 => {
                 let lba = BigEndian::read_u64(&cmd.cdb[2..10]);
                 let length = BigEndian::read_u32(&cmd.cdb[10..14]);
                 (lba, length)
-            } else {
-                (0, 0)
             }
-        }
         _ => (0, 0),
     };
 
@@ -1419,12 +1425,7 @@ fn handle_discovery_session(
     }
 
     // Wait for text request with SendTargets
-    loop {
-        let pdu = match read_pdu(&mut stream) {
-            Ok(pdu) => pdu,
-            Err(_) => break,
-        };
-
+    while let Ok(pdu) = read_pdu(&mut stream) {
         match pdu.opcode {
             opcode::LOGIN_REQUEST => {
                 // NOTE (vc-rs): the upstream single-PDU discovery login is kept
@@ -1446,7 +1447,7 @@ fn handle_discovery_session(
                     let targets_lock = targets.lock().unwrap();
                     let mut response_params = Vec::new();
 
-                    for (iqn, _) in targets_lock.iter() {
+                    for iqn in targets_lock.keys() {
                         response_params.push(("TargetName".to_string(), iqn.clone()));
                         response_params.push(("TargetAddress".to_string(), format!("{},1", target_address)));
                     }
@@ -1472,7 +1473,7 @@ fn handle_discovery_session(
                 }
             }
             opcode::LOGOUT_REQUEST => {
-                let old_session = std::mem::replace(&mut session, AnySession::new());
+                let old_session = std::mem::take(&mut session);
                 let (_new_session, response) = old_session.process_logout(&pdu)?;
                 write_pdu(&mut stream, &response)?;
                 break;
@@ -1488,6 +1489,7 @@ fn handle_discovery_session(
 }
 
 /// Boxed device version of handle_connection_with_first_pdu for multi-target server
+#[allow(clippy::too_many_arguments)]
 fn handle_connection_with_first_pdu_boxed(
     mut stream: TcpStream,
     device: Arc<Mutex<Box<dyn ScsiBlockDevice + Send>>>,
@@ -1592,6 +1594,7 @@ fn handle_connection_with_first_pdu_boxed(
 }
 
 /// Handle a single PDU in multi-target mode
+#[allow(clippy::too_many_arguments)]
 fn handle_pdu_multi_target(
     pdu: &IscsiPdu,
     session: &mut AnySession,
@@ -1609,7 +1612,7 @@ fn handle_pdu_multi_target(
             // Track session entry
             let was_in_full_feature = session.is_full_feature();
 
-            let old_session = std::mem::replace(session, AnySession::new());
+            let old_session = std::mem::take(session);
             let (new_session, responses) = old_session.process_login(pdu, target_name)?;
             *session = new_session;
 
@@ -1637,7 +1640,7 @@ fn handle_pdu_multi_target(
             Ok(vec![response])
         }
         opcode::LOGOUT_REQUEST => {
-            let old_session = std::mem::replace(session, AnySession::new());
+            let old_session = std::mem::take(session);
             let (new_session, response) = old_session.process_logout(pdu)?;
             *session = new_session;
             Ok(vec![response])
@@ -1750,15 +1753,12 @@ fn handle_write_command_boxed(
                 (0, 0)
             }
         }
-        0x8a => {
-            if cmd.cdb.len() >= 16 {
+        0x8a
+            if cmd.cdb.len() >= 16 => {
                 let lba = BigEndian::read_u64(&cmd.cdb[2..10]);
                 let length = BigEndian::read_u32(&cmd.cdb[10..14]);
                 (lba, length)
-            } else {
-                (0, 0)
             }
-        }
         _ => (0, 0),
     };
 
@@ -1942,10 +1942,19 @@ fn handle_scsi_data_out_boxed(
     Ok(vec![])
 }
 
+/// One registered target: its device, alias, authentication and the initiator
+/// names it answers to.
+type TargetEntry = (
+    Box<dyn ScsiBlockDevice + Send>,
+    String,
+    crate::auth::AuthConfig,
+    Option<Vec<String>>,
+);
+
 /// Builder for configuring a multi-target iSCSI server
 pub struct IscsiServerBuilder {
     bind_addr: Option<String>,
-    targets: std::collections::HashMap<String, (Box<dyn ScsiBlockDevice + Send>, String, crate::auth::AuthConfig, Option<Vec<String>>)>,
+    targets: std::collections::HashMap<String, TargetEntry>,
     max_connections: Option<u32>,
     max_sessions: Option<u32>,
 }

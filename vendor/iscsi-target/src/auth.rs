@@ -13,7 +13,8 @@ pub enum ChapAlgorithm {
 }
 
 impl ChapAlgorithm {
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// Parse the algorithm identifier the initiator sends (`CHAP_A`).
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "5" => Some(ChapAlgorithm::Md5),
             _ => None,
@@ -41,8 +42,10 @@ impl ChapCredentials {
 
 /// Authentication configuration
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum AuthConfig {
     /// No authentication required
+    #[default]
     None,
     /// CHAP authentication (one-way: initiator authenticates to target)
     Chap {
@@ -58,11 +61,6 @@ pub enum AuthConfig {
     },
 }
 
-impl Default for AuthConfig {
-    fn default() -> Self {
-        AuthConfig::None
-    }
-}
 
 impl AuthConfig {
     /// Check if authentication is required

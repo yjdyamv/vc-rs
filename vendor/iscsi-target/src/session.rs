@@ -624,11 +624,10 @@ impl IscsiSession {
 
         // Note: SessionType and TargetName are declarative (initiator-only) and should NOT be echoed back
         // Only send TargetAlias if configured
-        if self.session_type == SessionType::Normal {
-            if !self.params.target_alias.is_empty() {
+        if self.session_type == SessionType::Normal
+            && !self.params.target_alias.is_empty() {
                 params.push(("TargetAlias".to_string(), self.params.target_alias.clone()));
             }
-        }
 
         // Negotiated parameters
         params.push((
@@ -699,8 +698,10 @@ impl IscsiSession {
 
         // Check iSCSI version compatibility - RFC 3720 Section 11.12
         // Target supports version 0x00 (RFC 3720)
+        // The target speaks version 0 only, and both fields are unsigned, so the
+        // range test is what it means: it rejects a range that starts above 0.
         const TARGET_VERSION: u8 = 0x00;
-        if TARGET_VERSION < login.version_min || TARGET_VERSION > login.version_max {
+        if !(login.version_min..=login.version_max).contains(&TARGET_VERSION) {
             log::warn!(
                 "Login rejected: version mismatch (initiator: min=0x{:02x}, max=0x{:02x}, target=0x{:02x})",
                 login.version_min, login.version_max, TARGET_VERSION

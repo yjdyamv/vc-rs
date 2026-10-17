@@ -182,7 +182,7 @@ impl IscsiClient {
         }
 
         // Pad to 4-byte boundary
-        while params.len() % 4 != 0 {
+        while !params.len().is_multiple_of(4) {
             params.push('\0');
         }
 
@@ -282,7 +282,7 @@ impl IscsiClient {
         // Send SendTargets Text Request
         let mut params = String::new();
         params.push_str("SendTargets=All\0");
-        while params.len() % 4 != 0 {
+        while !params.len().is_multiple_of(4) {
             params.push('\0');
         }
 
@@ -390,7 +390,7 @@ impl IscsiClient {
         }
 
         // Pad to 4-byte boundary
-        while params.len() % 4 != 0 {
+        while !params.len().is_multiple_of(4) {
             params.push('\0');
         }
 
@@ -508,7 +508,7 @@ impl IscsiClient {
         }
 
         let data_len = ((bhs[5] as u32) << 16) | ((bhs[6] as u32) << 8) | (bhs[7] as u32);
-        let padded_len = ((data_len + 3) / 4) * 4;
+        let padded_len = data_len.div_ceil(4) * 4;
 
         let mut buf = bhs.to_vec();
         if padded_len > 0 {

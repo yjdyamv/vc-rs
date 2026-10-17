@@ -22,7 +22,7 @@ differ (see `git diff` against
 writing).  That is deliberate: the patches below are not otherwise exercised by
 anything, and the crate cannot be tested through a path dependency alone.
 
-Delete this fork as soon as upstream fixes (1) to (4) below.
+Delete this fork as soon as upstream fixes (1) to (6) below.
 
 ## (1) `src/target.rs` — signal residual overflow/underflow on the final Data-In
 
@@ -153,3 +153,25 @@ this fix is reverted) and by
   (digest-less), so any client that offers CRC32C first (including the crate's
   own `IscsiClient::login`) sees a header digest mismatch.  The Microsoft
   Initiator offers `None` by default, so this does not affect us.
+
+## (7) `src/*.rs` — the cleanups clippy asked for
+
+These change no behaviour; they are here so that `cargo clippy --workspace
+--all-targets` stays at zero warnings (the workspace gate) without an
+`#[allow]` list that would hide the security-relevant lints:
+
+* `src/auth.rs`: `ChapAlgorithm::from_str` is now `parse` — it shadowed
+  `std::str::FromStr::from_str` without implementing the trait.
+* `src/scsi.rs`: the zero-padding of the SCSI name string is one `resize` instead
+  of a `push(0)` loop.
+* `src/target.rs`: the discovery loop is a `while let Ok(pdu) = read_pdu(..)`;
+  `IscsiServerBuilder::targets` uses a `TargetEntry` alias instead of an inline
+  four-element tuple; the three connection/PDU functions carry
+  `#[allow(clippy::too_many_arguments)]`, because their parameter lists are the
+  connection's state and regrouping them would touch every call site of the
+  patched login path for no gain.
+* `src/session.rs`, `src/typestate_session.rs`: the login version check is
+  `!(version_min..=version_max).contains(&TARGET_VERSION)`. The old
+  `TARGET_VERSION > login.version_max` half was dead code — both sides are
+  unsigned, so it was never true (`clippy::absurd_extreme_comparisons`, denied by
+  default).

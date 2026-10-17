@@ -445,10 +445,9 @@ impl ScsiHandler {
                     data.push(0x00); // Reserved
                     data.push(padded_len as u8); // Designator length
                     data.extend_from_slice(name_bytes);
-                    // Pad with zeros
-                    for _ in name_bytes.len()..padded_len {
-                        data.push(0);
-                    }
+                    // Pad to the 4-byte boundary with zeros.
+                    let padding = padded_len.saturating_sub(name_bytes.len());
+                    data.resize(data.len() + padding, 0);
                 }
 
                 // Update page length (2-byte big-endian at offset 2-3)

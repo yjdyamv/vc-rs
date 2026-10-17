@@ -445,8 +445,10 @@ impl TypestateSession<Free> {
         let itt = pdu.itt;
 
         // Version check
+        // The target speaks version 0 only, and both fields are unsigned, so the
+        // range test is what it means: it rejects a range that starts above 0.
         const TARGET_VERSION: u8 = 0x00;
-        if TARGET_VERSION < login.version_min || TARGET_VERSION > login.version_max {
+        if !(login.version_min..=login.version_max).contains(&TARGET_VERSION) {
             log::warn!("Login rejected: version mismatch");
             let response = self.data.create_login_reject(itt, pdu::login_status::INITIATOR_ERROR, 0x05);
             return Ok((AnySession::Failed(self.into_failed()), vec![response]));
