@@ -336,7 +336,7 @@ fn stdin_secrets() -> Option<Vec<Vec<u8>>> {
 /// framed payload, and falling back to treating it as a literal password only
 /// means it will not decrypt anything.
 fn hex_decode(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return None;
     }
     let digit = |c: u8| match c {
@@ -1494,7 +1494,7 @@ fn run() -> Result<()> {
                                 serde_json::json!({
                                     "attached": false,
                                     "iqn": mount.target_name(),
-                                    "address": format!("{}", mount.addr()),
+                                    "address": mount.addr().to_string(),
                                     "disk_size": disk_size,
                                     "mount_point": serde_json::Value::Null,
                                 })
@@ -1868,8 +1868,7 @@ fn watch_progress() -> impl FnMut(u64, u64) -> vcrs_core::Control {
     // which the handler only does for these long runs.
     INTERRUPTIBLE.store(true, Ordering::SeqCst);
     move |done: u64, total: u64| {
-        if total > 0 {
-            let percent = done.saturating_mul(100) / total;
+        if let Some(percent) = done.saturating_mul(100).checked_div(total) {
             if percent >= said + 5 || done == total {
                 said = percent;
                 eprintln!(
@@ -2536,7 +2535,7 @@ fn parse_sector_size(s: &str) -> Result<u32, String> {
         .trim()
         .parse()
         .map_err(|_| format!("{s:?} is not a sector size"))?;
-    if !(512..=4096).contains(&value) || value % 512 != 0 {
+    if !(512..=4096).contains(&value) || !value.is_multiple_of(512) {
         return Err(format!(
             "sector size must be 512..4096 and a multiple of 512, got {value}"
         ));
@@ -2650,7 +2649,7 @@ fn check_read_range(data_size: u64, offset: u64, length: u64) -> Result<()> {
 
 fn parse_hex(s: &str) -> Result<Vec<u8>> {
     let s = s.trim().trim_start_matches("0x");
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         bail!("hex string must have an even number of digits");
     }
     (0..s.len())

@@ -102,7 +102,7 @@ impl Xts {
 
     /// One full XTS pass with a single cipher/whitening pair over `buf`.
     fn pass(&self, layer: &Layer, buf: &mut [u8], start_data_unit: u64, encrypting: bool) -> Result<()> {
-        if buf.len() % BLOCK_SIZE != 0 {
+        if !buf.len().is_multiple_of(BLOCK_SIZE) {
             return Err(Error::InvalidParameter(format!(
                 "XTS input must be a multiple of {BLOCK_SIZE}, got {}",
                 buf.len()

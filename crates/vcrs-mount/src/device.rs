@@ -34,7 +34,7 @@ const CACHE_ENTRIES: usize = 16;
 
 /// Converts a `vcrs-core` error into an `io::Error` for the `fatfs` layer.
 fn to_io(err: vcrs_core::error::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, format!("volume: {err}"))
+    io::Error::other(format!("volume: {err}"))
 }
 
 /// Byte-granular access to the decrypted volume data area.
@@ -101,15 +101,15 @@ impl DataArea for &mut Volume {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        Volume::read_data(&**self, offset, buf).map_err(to_io)
+        Volume::read_data(self, offset, buf).map_err(to_io)
     }
 
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> io::Result<()> {
-        Volume::write_data(&**self, offset, buf).map_err(to_io)
+        Volume::write_data(self, offset, buf).map_err(to_io)
     }
 
     fn sync(&self) -> io::Result<()> {
-        Volume::flush(&**self).map_err(to_io)
+        Volume::flush(self).map_err(to_io)
     }
 }
 

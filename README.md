@@ -103,6 +103,16 @@ vcrs test                                  # crypto self-test (checksums, hashes
 (for Botan's `configure.py`) and `cl.exe` reachable; `python3` must exist in `PATH`
 (Botan's build script hardcodes `python3`).
 
+```bash
+bash scripts/msvc.sh cargo clippy --workspace --all-targets   # has to stay warning-free
+```
+
+Clippy is kept at zero warnings across the whole workspace, the vendored
+`iscsi-target` fork included. The source is hand-formatted and deliberately *not*
+`rustfmt`-clean (a `cargo fmt` would rewrite every file for no behavioural gain and
+would make future diffs against the vendored crate unreadable), so the lint gate is
+clippy rather than `cargo fmt --check`.
+
 ## Usage
 
 ```bash

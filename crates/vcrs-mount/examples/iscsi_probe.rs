@@ -22,18 +22,22 @@ fn main() {
     let password = b"probe-password".to_vec();
 
     step!("1. create");
-    let mut create = CreateOptions::default();
-    create.password = password.clone();
-    create.pim = 1;
+    let create = CreateOptions {
+        password: password.clone(),
+        pim: 1,
+        ..Default::default()
+    };
     let mut volume = Volume::create(&path, size, &create).expect("create");
     step!("2. format");
     format_volume(&mut volume, "PROBE").expect("format");
     volume.flush().expect("flush");
     drop(volume);
 
-    let mut open = OpenOptions::default();
-    open.password = password;
-    open.pim = 1;
+    let open = OpenOptions {
+        password,
+        pim: 1,
+        ..Default::default()
+    };
 
     let mut opts = IscsiMountOptions::for_volume(&path);
     opts.disk_mode = DiskMode::Partitioned;

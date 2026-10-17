@@ -508,10 +508,12 @@ mod windows {
             })?;
             let target = ntfs
                 .filesystem_size()
-                .saturating_sub(TOTAL_HEADERS_SIZE as u64);
+                .saturating_sub(TOTAL_HEADERS_SIZE);
             // NTFS wants the new size to be a multiple of its cluster size.
             let cluster = ntfs.bytes_per_cluster as u64;
-            let target = if cluster > 0 { target / cluster * cluster } else { target };
+            // Round down to a whole number of clusters; a filesystem that reports
+            // a zero cluster size is left alone rather than divided by.
+            let target = target.checked_div(cluster).map_or(target, |whole| whole * cluster);
             self.shrink_ntfs_to(target)?;
             Ok(target)
         }

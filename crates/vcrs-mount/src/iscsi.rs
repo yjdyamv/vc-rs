@@ -268,7 +268,7 @@ fn random_target_name() -> Option<String> {
 
 /// Turns an iSCSI layer failure into a `vcrs-core` error.
 fn to_core(err: IscsiError) -> Error {
-    Error::Io(io::Error::new(io::ErrorKind::Other, format!("iSCSI: {err}")))
+    Error::Io(io::Error::other(format!("iSCSI: {err}")))
 }
 
 /// Turns a device failure into the error the SCSI layer expects. `read`/`write`
@@ -364,13 +364,13 @@ impl<A: DataArea> ScsiVolume<A> {
     /// Serve an arbitrary data area (used by the tests and by future backends).
     pub fn with_signature(area: A, opts: &IscsiMountOptions, disk_signature: u32) -> Result<Self> {
         let block_size = area.sector_size().max(SECTOR_SIZE as u32);
-        if block_size as usize % SECTOR_SIZE != 0 {
+        if !(block_size as usize).is_multiple_of(SECTOR_SIZE) {
             return Err(Error::InvalidParameter(format!(
                 "the volume's {block_size}-byte sectors are not a multiple of {SECTOR_SIZE}"
             )));
         }
         let data_len = area.len();
-        if data_len % block_size as u64 != 0 {
+        if !data_len.is_multiple_of(block_size as u64) {
             return Err(Error::InvalidParameter(format!(
                 "the data area ({data_len} bytes) is not a multiple of the {block_size}-byte sector size"
             )));
@@ -895,6 +895,9 @@ pub fn mount_iscsi(volume_path: &Path, open: &OpenOptions, opts: &IscsiMountOpti
     mount_iscsi_with(volume_path, open, opts, None)
 }
 
+/// Called by [`mount_iscsi_with`] once the target is serving a disk.
+pub type OnReady<'a> = &'a dyn Fn(&IscsiMount, u64);
+
 /// Serve `volume_path` over iSCSI, calling `on_ready` once the target is
 /// listening and before blocking on it.
 ///
@@ -910,7 +913,7 @@ pub fn mount_iscsi_with(
     volume_path: &Path,
     open: &OpenOptions,
     opts: &IscsiMountOptions,
-    on_ready: Option<&dyn Fn(&IscsiMount, u64)>,
+    on_ready: Option<OnReady<'_>>,
 ) -> Result<()> {
     install_ctrl_handler();
     let device = ScsiVolume::open(volume_path, open, opts)?;
@@ -952,16 +955,16 @@ pub fn mount_iscsi_with(
                 eprintln!(
                     "    iscsicli AddTarget {} vcrs {} {} 0 0 0 0 0 8 0 0 {} <secret> 1 0",
                     mount.target_name(),
-                    portal_host(&mount.addr()),
-                    portal_port(&mount.addr()),
+                    portal_host(mount.addr()),
+                    portal_port(mount.addr()),
                     vcrs_core::CHAP_USER,
                 );
             } else {
                 eprintln!(
                     "    iscsicli AddTarget {} vcrs {} {} 0 0 0 0 0 8 0 0 \"\" \"\" 0 0",
                     mount.target_name(),
-                    portal_host(&mount.addr()),
-                    portal_port(&mount.addr()),
+                    portal_host(mount.addr()),
+                    portal_port(mount.addr()),
                 );
             }
             eprintln!("    iscsicli QLoginTarget {}", mount.target_name());

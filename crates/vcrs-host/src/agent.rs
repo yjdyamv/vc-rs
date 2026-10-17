@@ -90,7 +90,7 @@ pub fn status() -> Option<u32> {
 
 /// Ask the running agent to end itself. `false` when there was none.
 pub fn stop() -> bool {
-    matches!(exchange("stop"), Some(_))
+    exchange("stop").is_some()
 }
 
 fn exchange(request: &str) -> Option<(i32, String)> {

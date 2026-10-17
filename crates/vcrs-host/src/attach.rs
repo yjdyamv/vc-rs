@@ -67,9 +67,6 @@ pub struct AttachOptions {
     pub chap_from: Option<PathBuf>,
 }
 
-/// Which header group a CHAP secret is derived from.
-///
-
 /// The volume is attached: Windows has a disk, and this is where it went.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attached {
@@ -160,7 +157,7 @@ pub fn attach(options: &AttachOptions) -> Result<Attached> {
         let _ = iscsicli(&["QLogoutTarget", &options.iqn]);
         let _ = iscsicli(&["RemoveTarget", &options.iqn]);
     }
-    return attempt;
+    attempt
 }
 
 /// Log in to a registered target and bring its disk up.
@@ -855,7 +852,10 @@ pub struct DiskInfo {
 }
 
 /// Ask Windows for every vc-rs disk and its partition.
-///
+pub fn vcrs_disks() -> Result<Vec<DiskInfo>> {
+    crate::win32::vcrs_disks(DISK_PRODUCT)
+}
+
 /// Does Windows see a file system on this disk's partition?
 fn has_a_file_system(disk: &DiskInfo) -> bool {
     disk.partition
@@ -866,10 +866,6 @@ fn has_a_file_system(disk: &DiskInfo) -> bool {
 
 /// Wait for the disk Windows creates for the target to show up.
 ///
-
-pub fn vcrs_disks() -> Result<Vec<DiskInfo>> {
-    crate::win32::vcrs_disks(DISK_PRODUCT)
-}
 /// The disk is chosen by its INQUIRY name and its size, and it has to be one Windows
 /// did not have before the login (`already_present`): several `vcrs mount` processes can
 /// be serving different volumes at once, so the name alone would not pick one, and a
@@ -921,7 +917,7 @@ fn wait_for_disk(
     let look_alike: Vec<String> = all
         .iter()
         .filter(|disk| already_present.contains(&disk.number))
-        .filter(|disk| disk_size.map_or(true, |size| disk.size == size))
+        .filter(|disk| disk_size.is_none_or(|size| disk.size == size))
         .map(|disk| format!("disk {} ({} bytes)", disk.number, disk.size))
         .collect();
     let seen_part = if seen.is_empty() {
@@ -963,7 +959,7 @@ fn newest_disk(
     disks
         .iter()
         .filter(|disk| !already_present.contains(&disk.number))
-        .filter(|disk| disk_size.map_or(true, |size| disk.size == size))
+        .filter(|disk| disk_size.is_none_or(|size| disk.size == size))
         .max_by_key(|disk| disk.number)
         .cloned()
 }
@@ -1408,6 +1404,23 @@ impl Report {
     }
 }
 
+/// Start a helper process with no console window of its own.
+///
+/// The worker that runs a dismount has no console — that is exactly what keeps a
+/// closing console from killing it — so every wrapper it starts would otherwise
+/// allocate a console of its own. That is what a user sees as a window flashing
+/// once per PowerShell call, two or three times per dismount.
+pub fn quiet_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1562,7 +1575,7 @@ mod tests {
         assert_eq!(argv.iter().filter(|a| a.is_empty()).count(), 2);
         assert_eq!(&argv[argv.len() - 4..], &["", "", "0", "0"]);
         // `""` never appears literally: it is an empty argv element, not text.
-        assert!(!argv.iter().any(|a| *a == "\"\""));
+        assert!(!argv.contains(&"\"\""));
     }
 
     #[test]
@@ -1658,21 +1671,4 @@ mod tests {
         assert!(session_ids("Total of 0 sessions\n", "iqn.2025-12.io.vcrs:smoke").is_empty());
         assert!(session_ids("", "iqn.2025-12.io.vcrs:smoke").is_empty());
     }
-}
-
-/// Start a helper process with no console window of its own.
-///
-/// The worker that runs a dismount has no console — that is exactly what keeps a
-/// closing console from killing it — so every wrapper it starts would otherwise
-/// allocate a console of its own. That is what a user sees as a window flashing
-/// once per PowerShell call, two or three times per dismount.
-pub fn quiet_command(program: &str) -> Command {
-    let mut command = Command::new(program);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    command
 }

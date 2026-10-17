@@ -8,7 +8,7 @@
 //! The rules verified here are VeraCrypt's:
 //!   * the protected range is the hidden volume's data area, in host bytes
 //!     (`hiddenVolumeOffset = hiddenHeader.EncryptedAreaStart`,
-//!      `hiddenVolumeProtectedSize = hiddenHeader.VolumeDataSize`);
+//!     `hiddenVolumeProtectedSize = hiddenHeader.VolumeDataSize`);
 //!   * reads are never affected, only writes;
 //!   * the first offending write fails, and from then on *every* write fails,
 //!     so a filesystem that ignores the error cannot quietly corrupt the hidden

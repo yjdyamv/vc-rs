@@ -157,7 +157,7 @@ impl VolumeHeader {
     /// Everything that serialization does not write stays zero, matching
     /// `VolumeHeader::Serialize()` which is always called on a zeroed buffer.
     pub fn serialize(&self, header_size: usize) -> Result<Vec<u8>> {
-        if header_size < 512 || header_size % DATA_UNIT_SIZE != 0 {
+        if header_size < 512 || !header_size.is_multiple_of(DATA_UNIT_SIZE) {
             return Err(Error::InvalidParameter(format!(
                 "header region size must be a multiple of {DATA_UNIT_SIZE} and >= 512, got {header_size}"
             )));
@@ -266,7 +266,7 @@ impl VolumeHeader {
     /// means "wrong key"). `ea`/`prf` must be the ones used to derive
     /// `header_key`, and are stored in the returned header.
     pub fn decrypt(region: &[u8], header_key: &[u8], ea: EncryptionAlgorithm, prf: Prf) -> Result<VolumeHeader> {
-        if region.len() < 512 || region.len() % DATA_UNIT_SIZE != 0 {
+        if region.len() < 512 || !region.len().is_multiple_of(DATA_UNIT_SIZE) {
             return Err(Error::InvalidParameter(format!(
                 "header region size must be a multiple of {DATA_UNIT_SIZE} and >= 512, got {}",
                 region.len()

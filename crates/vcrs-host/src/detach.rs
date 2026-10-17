@@ -796,11 +796,10 @@ fn logout(session: &Session, report: &mut Report) -> bool {
 /// `vcrs mount` of that volume clears it, because attaching prunes stale sessions.
 fn clear_leftover_sessions(out: &mut Detached, refused: &[Session], report: &mut Report) {
     for session in refused {
-        if logout(session, report) {
-            if !out.targets.contains(&session.iqn) {
+        if logout(session, report)
+            && !out.targets.contains(&session.iqn) {
                 out.targets.push(session.iqn.clone());
             }
-        }
     }
     let (after, _) = snapshot();
     let left = after

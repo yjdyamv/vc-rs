@@ -87,7 +87,8 @@ fn a_directory_of_keyfiles_equals_the_explicit_list() {
     write_keyfile(&a, 0x22, 200);
     write_keyfile(&b, 0x33, 4096);
 
-    let from_dir = apply_keyfiles(b"password", &[keys.clone()], None).expect("directory pool");
+    let from_dir =
+        apply_keyfiles(b"password", std::slice::from_ref(&keys), None).expect("directory pool");
     let explicit = apply_keyfiles(b"password", &[a, b], None).expect("explicit pool");
     assert_eq!(from_dir, explicit, "a directory must hash like its sorted file list");
 
@@ -122,6 +123,7 @@ fn the_pool_layout_follows_the_password_length() {
     assert_ne!(&long[..100], &long_password[..]);
 
     // 64 bytes is the boundary: still the legacy pool.
-    let boundary = apply_keyfiles(&vec![b'y'; KEYFILE_POOL_LEGACY_SIZE], &keyfiles, None).expect("boundary");
+    let boundary =
+        apply_keyfiles(&[b'y'; KEYFILE_POOL_LEGACY_SIZE], &keyfiles, None).expect("boundary");
     assert_eq!(boundary.len(), KEYFILE_POOL_LEGACY_SIZE);
 }

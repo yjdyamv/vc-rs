@@ -5,9 +5,9 @@
 //!
 //! * `create()` makes a V2 normal volume: primary header at 0, backup header
 //!   128 KiB before the end of the host, and a *fake* random hidden-volume
-//! header in each of the two hidden header slots at offset 64 KiB and at the
-//! very end (this is what VeraCrypt writes so that the hidden header areas look
-//! like random data).
+//!   header in each of the two hidden header slots at offset 64 KiB and at the
+//!   very end (this is what VeraCrypt writes so that the hidden header areas
+//!   look like random data).
 //! * data access is raw XTS over the host file: the data unit number of a byte
 //!   offset is `host_offset / 512` regardless of where the data area starts.
 
@@ -319,7 +319,7 @@ impl Volume {
     ) -> Result<Volume> {
         let layout = VolumeLayout::V2Normal;
         validate_sector_size(options.sector_size)?;
-        if host_size % DATA_UNIT_SIZE as u64 != 0 {
+        if !host_size.is_multiple_of(DATA_UNIT_SIZE as u64) {
             return Err(Error::InvalidParameter(format!(
                 "host size must be a multiple of {DATA_UNIT_SIZE}"
             )));
@@ -444,7 +444,7 @@ impl Volume {
         let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
         let host_size = file.metadata()?.len();
 
-        if hidden_size % DATA_UNIT_SIZE as u64 != 0 {
+        if !hidden_size.is_multiple_of(DATA_UNIT_SIZE as u64) {
             return Err(Error::InvalidParameter(
                 "hidden volume size must be a multiple of 512".into(),
             ));
@@ -890,8 +890,8 @@ impl Volume {
                  containers can only grow"
             )));
         }
-        if new_host_size % self.header.sector_size as u64 != 0
-            || new_host_size % DATA_UNIT_SIZE as u64 != 0
+        if !new_host_size.is_multiple_of(self.header.sector_size as u64)
+            || !new_host_size.is_multiple_of(DATA_UNIT_SIZE as u64)
         {
             return Err(Error::InvalidParameter(format!(
                 "the new size must be a multiple of the sector size ({} bytes)",
@@ -1091,7 +1091,9 @@ impl Volume {
         if len == 0 {
             return Ok(());
         }
-        if host_offset % DATA_UNIT_SIZE as u64 != 0 || len % DATA_UNIT_SIZE != 0 {
+        if !host_offset.is_multiple_of(DATA_UNIT_SIZE as u64)
+            || !len.is_multiple_of(DATA_UNIT_SIZE)
+        {
             return Err(Error::InvalidParameter(format!(
                 "host offset and length must be multiples of {DATA_UNIT_SIZE}, got {host_offset}/{len}"
             )));
@@ -1114,7 +1116,7 @@ impl Volume {
         if len == 0 {
             return Ok(());
         }
-        if offset % DATA_UNIT_SIZE as u64 != 0 || len % DATA_UNIT_SIZE != 0 {
+        if !offset.is_multiple_of(DATA_UNIT_SIZE as u64) || !len.is_multiple_of(DATA_UNIT_SIZE) {
             return Err(Error::InvalidParameter(format!(
                 "data offset and length must be multiples of {DATA_UNIT_SIZE}, got {offset}/{len}"
             )));
@@ -1146,7 +1148,7 @@ const HIDDEN_SLOT_OFFSET: u64 = VOLUME_HEADER_SIZE;
 
 fn validate_sector_size(sector_size: u32) -> Result<()> {
     if !(MIN_SECTOR_SIZE..=MAX_SECTOR_SIZE).contains(&sector_size)
-        || sector_size % MIN_SECTOR_SIZE != 0
+        || !sector_size.is_multiple_of(MIN_SECTOR_SIZE)
     {
         return Err(Error::InvalidParameter(format!(
             "sector size must be 512..4096 and a multiple of 512, got {sector_size}"
@@ -1449,7 +1451,9 @@ pub fn encrypt_in_place_stopping_after(
             // the primary header group takes its first 128 KiB.
             let plaintext_size = backup_offset;
             let data_size = plaintext_size - VOLUME_HEADER_GROUP_SIZE;
-            if data_size < MIN_IN_PLACE_DATA_SIZE || data_size % DATA_UNIT_SIZE as u64 != 0 {
+            if data_size < MIN_IN_PLACE_DATA_SIZE
+                || !data_size.is_multiple_of(DATA_UNIT_SIZE as u64)
+            {
                 return Err(Error::InvalidParameter(format!(
                     "the image leaves {data_size} bytes for the data area; in-place encryption \
                      needs at least {MIN_IN_PLACE_DATA_SIZE} and a multiple of {DATA_UNIT_SIZE}"
@@ -1549,7 +1553,9 @@ pub fn encrypt_in_place_stopping_after(
             file.sync_all()?;
             since_update = 0;
         }
-        if encrypted_length == data_size || processed % IN_PLACE_HEADER_UPDATE_INTERVAL == 0 {
+        if encrypted_length == data_size
+            || processed.is_multiple_of(IN_PLACE_HEADER_UPDATE_INTERVAL)
+        {
             log::info!(
                 "in-place encryption of {}: {encrypted_length}/{data_size} bytes ({:.1}%)",
                 path.display(),
@@ -2122,8 +2128,7 @@ pub fn encrypt_device_in_place(
     if fresh {
         // The backup header group is the only live one during the run.
         write_header_region(file, backup_offset, &header, &password, options.pim, &backup_salt)
-            .map_err(|e| Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            .map_err(|e| Error::Io(std::io::Error::other(
                 format!("writing the new volume's backup header at offset {backup_offset}: {e}"),
             )))?;
         write_fake_hidden_region(
@@ -2134,8 +2139,7 @@ pub fn encrypt_device_in_place(
             &fake_options,
             &mut random,
         )
-        .map_err(|e| Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        .map_err(|e| Error::Io(std::io::Error::other(
             format!(
                 "writing the fake hidden header at offset {}: {e}",
                 backup_offset + VOLUME_HEADER_SIZE
@@ -2562,7 +2566,7 @@ fn freeze_access_time(file: &File) -> Result<()> {
 
     let ok = unsafe {
         file_info_ffi::SetFileTime(
-            file.as_raw_handle() as *mut core::ffi::c_void,
+            file.as_raw_handle(),
             std::ptr::null(),
             &FileTime::DONT_UPDATE,
             std::ptr::null(),
@@ -2595,7 +2599,7 @@ fn query_file_basic(file: &File) -> Result<FileBasicInfo> {
     let size = std::mem::size_of::<FileBasicInfo>() as u32;
     let ok = unsafe {
         file_info_ffi::GetFileInformationByHandleEx(
-            file.as_raw_handle() as *mut core::ffi::c_void,
+            file.as_raw_handle(),
             FILE_BASIC_INFO_CLASS,
             &mut info as *mut FileBasicInfo as *mut core::ffi::c_void,
             size,
@@ -2622,7 +2626,7 @@ fn set_file_basic_info(file: &File, times: [i64; 4]) -> Result<()> {
     let size = std::mem::size_of::<FileBasicInfo>() as u32;
     let ok = unsafe {
         file_info_ffi::SetFileInformationByHandle(
-            file.as_raw_handle() as *mut core::ffi::c_void,
+            file.as_raw_handle(),
             FILE_BASIC_INFO_CLASS,
             &mut info as *mut FileBasicInfo as *mut core::ffi::c_void,
             size,
@@ -2661,7 +2665,7 @@ fn set_sparse(file: &File) -> Result<()> {
     let mut returned = 0u32;
     let ok = unsafe {
         DeviceIoControl(
-            file.as_raw_handle() as *mut core::ffi::c_void,
+            file.as_raw_handle(),
             FSCTL_SET_SPARSE,
             std::ptr::null_mut(),
             0,
@@ -2917,7 +2921,7 @@ pub fn restore_headers_from_embedded(
     verify: Option<&OpenOptions>,
 ) -> Result<Option<Volume>> {
     let layout = volume_type.creation_layout();
-    let size = layout.header_size() as usize;
+    let size = layout.header_size();
     let slot = layout.header_offset();
     let host_size = std::fs::metadata(path)?.len();
     let primary = read_region(path, slot, size)?;
@@ -2944,7 +2948,7 @@ pub fn restore_headers_from_embedded(
 fn header_region_in_group(group: &[u8], volume_type: VolumeType) -> Result<&[u8]> {
     let layout = volume_type.creation_layout();
     let offset = layout.header_offset() as usize;
-    let size = layout.header_size() as usize;
+    let size = layout.header_size();
     group.get(offset..offset + size).ok_or_else(|| {
         Error::InvalidParameter(format!(
             "a header group is {VOLUME_HEADER_GROUP_SIZE} bytes, got {}",
@@ -2965,7 +2969,7 @@ fn restore_header_region(
     source: &str,
 ) -> Result<Option<Volume>> {
     let layout = volume_type.creation_layout();
-    let size = layout.header_size() as usize;
+    let size = layout.header_size();
     if region.len() != size {
         return Err(Error::InvalidParameter(format!(
             "{source} holds a {} byte header, expected {size}",
@@ -3131,7 +3135,7 @@ pub fn restore_headers_from_master_key(
         )));
     }
     let unit = DATA_UNIT_SIZE as u64;
-    if options.data_size == 0 || options.data_size % unit != 0 {
+    if options.data_size == 0 || !options.data_size.is_multiple_of(unit) {
         return Err(Error::InvalidParameter(format!(
             "the data area size must be a non-zero multiple of {DATA_UNIT_SIZE}, got {}",
             options.data_size
@@ -3307,6 +3311,15 @@ pub fn looks_quick_formatted(path: &Path) -> Result<bool> {
     Ok(seen > 0 && zero * 2 >= seen)
 }
 
+/// Read raw host bytes without decrypting them (diagnostics, tests, CLI).
+pub fn read_region(path: &Path, offset: u64, len: usize) -> Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; len];
+    file.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{in_place_area_is_sane, slot_has_data};
@@ -3391,13 +3404,4 @@ mod tests {
         let _ = std::fs::remove_file(&container);
         let _ = std::fs::remove_file(&backup);
     }
-}
-
-/// Read raw host bytes without decrypting them (diagnostics, tests, CLI).
-pub fn read_region(path: &Path, offset: u64, len: usize) -> Result<Vec<u8>> {
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
-    let mut buf = vec![0u8; len];
-    file.read_exact(&mut buf)?;
-    Ok(buf)
 }

@@ -11,7 +11,7 @@
 //! Argon2) so the whole matrix stays in the tens of seconds while still using the
 //! real code paths.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use vcrs_core::volume::{CreateOptions, OpenOptions, Volume};
 use vcrs_core::{EncryptionAlgorithm, Prf};
@@ -59,7 +59,7 @@ fn every_ea_and_prf_round_trips() {
     );
 }
 
-fn round_trip(path: &PathBuf, ea: EncryptionAlgorithm, prf: Prf) -> vcrs_core::Result<()> {
+fn round_trip(path: &Path, ea: EncryptionAlgorithm, prf: Prf) -> vcrs_core::Result<()> {
     let create = CreateOptions {
         ea,
         prf,

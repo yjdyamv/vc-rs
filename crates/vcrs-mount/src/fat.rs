@@ -47,7 +47,7 @@ const MAX_CLUSTER_SIZE: u32 = 32 * 1024;
 /// size can only be used when the arithmetic below lands in the FAT32 range.
 fn fits_fat32(total_sectors: u32, bytes_per_sector: u16, bytes_per_cluster: u32) -> bool {
     let bytes_per_sector = u32::from(bytes_per_sector);
-    if bytes_per_cluster < bytes_per_sector || bytes_per_cluster % bytes_per_sector != 0 {
+    if bytes_per_cluster < bytes_per_sector || !bytes_per_cluster.is_multiple_of(bytes_per_sector) {
         return false;
     }
     let sectors_per_cluster = bytes_per_cluster / bytes_per_sector;
@@ -166,7 +166,7 @@ pub fn format_volume(volume: &mut Volume, label: &str) -> Result<()> {
             "volume data area is too small to hold a filesystem ({data_size} bytes)"
         )));
     }
-    if data_size % u64::from(SECTOR_SIZE as u32) != 0 {
+    if !data_size.is_multiple_of(u64::from(SECTOR_SIZE as u32)) {
         return Err(Error::InvalidParameter(format!(
             "volume data area size {data_size} is not a multiple of the {SECTOR_SIZE} byte sector size"
         )));

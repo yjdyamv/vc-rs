@@ -296,11 +296,11 @@ mod tests {
         let file = dir.join("kf.bin");
         write_file(&file, b"a keyfile");
 
-        let pool = keyfile_pool(&[file.clone()], 3, None).expect("pool");
+        let pool = keyfile_pool(std::slice::from_ref(&file), 3, None).expect("pool");
         assert_eq!(pool.len(), 64);
         assert!(pool.iter().any(|&b| b != 0), "the pool must not be empty");
 
-        let mixed = apply_keyfiles(b"abc", &[file.clone()], None).expect("mixed");
+        let mixed = apply_keyfiles(b"abc", std::slice::from_ref(&file), None).expect("mixed");
         assert_eq!(mixed.len(), 64, "the KDF always sees at least the pool");
         assert_eq!(mixed[0], b'a'.wrapping_add(pool[0]));
         assert_eq!(mixed[1], b'b'.wrapping_add(pool[1]));
@@ -309,7 +309,7 @@ mod tests {
 
         // A password longer than 64 bytes switches to the 128-byte pool.
         let long = vec![b'x'; 65];
-        let mixed_long = apply_keyfiles(&long, &[file.clone()], None).expect("mixed");
+        let mixed_long = apply_keyfiles(&long, std::slice::from_ref(&file), None).expect("mixed");
         assert_eq!(mixed_long.len(), 128);
 
         // No keyfiles: the password goes through untouched.
@@ -326,9 +326,9 @@ mod tests {
         write_file(&a, b"first keyfile");
         write_file(&b, b"second keyfile");
 
-        let pool_a = keyfile_pool(&[a.clone()], 64, None).expect("pool");
-        let pool_b = keyfile_pool(&[b.clone()], 64, None).expect("pool");
-        let pool_dir = keyfile_pool(&[dir.clone()], 64, None).expect("pool");
+        let pool_a = keyfile_pool(std::slice::from_ref(&a), 64, None).expect("pool");
+        let pool_b = keyfile_pool(std::slice::from_ref(&b), 64, None).expect("pool");
+        let pool_dir = keyfile_pool(std::slice::from_ref(&dir), 64, None).expect("pool");
         let pool_both = keyfile_pool(&[a.clone(), b.clone()], 64, None).expect("pool");
 
         for i in 0..pool_dir.len() {
@@ -343,7 +343,8 @@ mod tests {
         // The container living in the keyfile directory is skipped.
         let volume = dir.join("volume.hc");
         write_file(&volume, b"not a keyfile at all");
-        let pool_with_volume = keyfile_pool(&[dir.clone()], 64, Some(&volume)).expect("pool");
+        let pool_with_volume =
+            keyfile_pool(std::slice::from_ref(&dir), 64, Some(&volume)).expect("pool");
         let pool_without = keyfile_pool(&[a.clone(), b.clone()], 64, None).expect("pool");
         assert_eq!(pool_with_volume, pool_without);
 
@@ -359,11 +360,11 @@ mod tests {
             *byte = (i as u8).wrapping_mul(31).wrapping_add(7);
         }
         write_file(&big, &contents);
-        let truncated = keyfile_pool(&[big.clone()], 64, None).expect("pool");
+        let truncated = keyfile_pool(std::slice::from_ref(&big), 64, None).expect("pool");
 
         contents.extend_from_slice(b"this tail must be ignored");
         write_file(&big, &contents);
-        let with_tail = keyfile_pool(&[big.clone()], 64, None).expect("pool");
+        let with_tail = keyfile_pool(std::slice::from_ref(&big), 64, None).expect("pool");
 
         assert_eq!(truncated, with_tail);
         assert!(truncated.iter().any(|&b| b != 0));

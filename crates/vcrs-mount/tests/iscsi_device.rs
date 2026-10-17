@@ -54,18 +54,22 @@ impl Fixture {
             std::env::temp_dir().join(format!("vcrs-iscsi-{name}-{}.vc", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
-        let mut create = CreateOptions::default();
-        create.password = PASSWORD.to_vec();
         // PIM 1 keeps the (500k-iteration default) PBKDF2 cost out of the test.
-        create.pim = 1;
+        let create = CreateOptions {
+            password: PASSWORD.to_vec(),
+            pim: 1,
+            ..Default::default()
+        };
         let mut volume = Volume::create(&path, VOLUME_SIZE, &create).expect("create volume");
         format_volume(&mut volume, LABEL).expect("format the FAT32 filesystem");
         volume.flush().expect("flush the container");
         drop(volume);
 
-        let mut open = OpenOptions::default();
-        open.password = PASSWORD.to_vec();
-        open.pim = 1;
+        let open = OpenOptions {
+            password: PASSWORD.to_vec(),
+            pim: 1,
+            ..Default::default()
+        };
 
         let mut opts = IscsiMountOptions::for_volume(&path);
         opts.disk_mode = mode;
@@ -358,15 +362,20 @@ fn hidden_volume_protection_refuses_writes_through_the_scsi_device() {
     let path = std::env::temp_dir().join(format!("vcrs-iscsi-protect-{}.vc", std::process::id()));
     let _ = std::fs::remove_file(&path);
 
-    let mut create = CreateOptions::default();
-    create.password = PASSWORD.to_vec();
-    create.pim = 1;
+    let create = CreateOptions {
+        password: PASSWORD.to_vec(),
+        pim: 1,
+        ..Default::default()
+    };
     let outer = Volume::create(&path, VOLUME_SIZE, &create).expect("create the outer volume");
-    let hidden = Volume::create_hidden(&path, HIDDEN_SIZE, &{
-        let mut hidden_create = create.clone();
-        hidden_create.password = hidden_password.to_vec();
-        hidden_create
-    })
+    let hidden = Volume::create_hidden(
+        &path,
+        HIDDEN_SIZE,
+        &CreateOptions {
+            password: hidden_password.to_vec(),
+            ..create.clone()
+        },
+    )
     .expect("create the hidden volume");
     let hidden_marker = vec![0x5au8; 512];
     hidden
@@ -377,12 +386,16 @@ fn hidden_volume_protection_refuses_writes_through_the_scsi_device() {
     drop(hidden);
     drop(outer);
 
-    let mut open = OpenOptions::default();
-    open.password = PASSWORD.to_vec();
-    open.pim = 1;
-    let mut hidden_open = OpenOptions::default();
-    hidden_open.password = hidden_password.to_vec();
-    hidden_open.pim = 1;
+    let open = OpenOptions {
+        password: PASSWORD.to_vec(),
+        pim: 1,
+        ..Default::default()
+    };
+    let hidden_open = OpenOptions {
+        password: hidden_password.to_vec(),
+        pim: 1,
+        ..Default::default()
+    };
 
     let mut opts = IscsiMountOptions::for_volume(&path);
     opts.disk_mode = DiskMode::Partitioned;
@@ -433,10 +446,12 @@ fn hidden_volume_protection_refuses_writes_through_the_scsi_device() {
     // The bytes we tried to overwrite are untouched and the hidden volume still
     // opens with its own password and keeps its marker.
     drop(device);
-    let mut open = OpenOptions::default();
-    open.password = hidden_password.to_vec();
-    open.pim = 1;
-    open.volume_type = Some(vcrs_core::VolumeType::Hidden);
+    let open = OpenOptions {
+        password: hidden_password.to_vec(),
+        pim: 1,
+        volume_type: Some(vcrs_core::VolumeType::Hidden),
+        ..Default::default()
+    };
     let hidden = Volume::open(&path, &open).expect("the hidden volume survives");
     let mut marker = vec![0u8; 512];
     hidden
@@ -460,10 +475,12 @@ fn serving_a_volume_preserves_the_container_timestamp() {
         std::env::temp_dir().join(format!("vcrs-iscsi-timestamps-{}.vc", std::process::id()));
     let _ = std::fs::remove_file(&path);
 
-    let mut create = CreateOptions::default();
-    create.password = PASSWORD.to_vec();
-    create.pim = 1;
-    create.full_format = false;
+    let create = CreateOptions {
+        password: PASSWORD.to_vec(),
+        pim: 1,
+        full_format: false,
+        ..Default::default()
+    };
     let volume = Volume::create(&path, VOLUME_SIZE, &create).expect("create volume");
     drop(volume);
 
@@ -480,9 +497,11 @@ fn serving_a_volume_preserves_the_container_timestamp() {
     let modified = || std::fs::metadata(&path).unwrap().modified().unwrap();
     assert_eq!(modified(), past);
 
-    let mut open = OpenOptions::default();
-    open.password = PASSWORD.to_vec();
-    open.pim = 1;
+    let open = OpenOptions {
+        password: PASSWORD.to_vec(),
+        pim: 1,
+        ..Default::default()
+    };
     let opts = IscsiMountOptions::for_volume(&path);
     assert!(
         opts.preserve_timestamp,
