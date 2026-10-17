@@ -440,6 +440,11 @@ one. `vcrs list` shows what is mounted, where, on which device and under which I
 serving in the terminal (that is what the background command runs internally, and what the
 manual recipe below used to be needed for).
 
+A dismount that fails because the filesystem is busy names the processes that are holding
+it (`fuser -m` plus `/proc/<pid>/comm`): the usual culprit is a shell whose working directory
+is inside the mount, which `umount`'s "target is busy" never says. The mount stays recorded in
+that case, so `vcrs list` shows it and the same command retries it afterwards.
+
 A killed server or a reboot leaves a mount point and a state file behind without a volume
 behind them (`the kernel keeps the device node while the session is logged in, so reads
 fail rather than the mount vanishing`). `vcrs list` marks those as stale, `vcrs mount` of the

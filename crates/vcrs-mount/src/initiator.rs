@@ -709,6 +709,53 @@ fn logout(iqn: &str, portal: &str) {
         .output();
 }
 
+/// Appended to a busy-mount complaint: what to do about it.
+const MOVE_AWAY: &str = "; leave the directory (or close the program) and run the same command again — `umount -l` detaches it anyway, and `vcrs dismount` falls back to it when the device is already gone";
+
+/// The process ids `fuser -m` printed, from either stream.
+///
+/// `fuser` writes `"/mnt/x:  1234 5678"` and exits non-zero whenever it found
+/// something, so the status says nothing useful and only the numbers matter.  A
+/// bare run tags each pid with what it does there: `1234c` is a process whose
+/// current directory is the mount point.
+fn pids_in_fuser_output(text: &str) -> Vec<u32> {
+    let mut pids: Vec<u32> = text
+        .split_whitespace()
+        .filter_map(|word| {
+            let digits: String = word
+                .trim_end_matches(':')
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse().ok()
+        })
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+/// Who is keeping a mount point busy, as `"name (pid N)"`.
+///
+/// A busy mount is the one failure a user cannot diagnose from `umount`'s
+/// "target is busy": the shell they are standing in is enough to cause it.
+fn mount_users(mount_point: &Path) -> Vec<String> {
+    let Ok(output) = Command::new("fuser").arg("-m").arg(mount_point).output() else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&output.stdout).into_owned()
+        + &String::from_utf8_lossy(&output.stderr);
+    pids_in_fuser_output(&text)
+        .into_iter()
+        .map(|pid| {
+            let name = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .map(|line| line.trim().to_string())
+                .unwrap_or_else(|_| "?".to_string());
+            format!("{name} (pid {pid})")
+        })
+        .collect()
+}
+
 /// Unmount, log out, stop the server and forget the mount.
 ///
 /// Every step is attempted even if an earlier one failed: the point of a dismount
@@ -716,6 +763,7 @@ fn logout(iqn: &str, portal: &str) {
 /// the server so a retry starts from a clean slate.
 pub fn unmount(session: &Session) -> Result<()> {
     let mut problems: Vec<String> = Vec::new();
+    let mut still_mounted = false;
     // A mount whose device vanished is a leftover: `umount` can still be refused
     // ("device is busy"), and `umount -l` detaches it either way.
     let device_gone = !session.device.exists();
@@ -750,8 +798,17 @@ pub fn unmount(session: &Session) -> Result<()> {
             }
         }
         if !last.is_empty() {
+            // "target is busy" alone leaves the user with nothing to act on, and
+            // the usual culprit is a shell whose working directory is inside.
+            let users = mount_users(&session.mount_point);
+            let busy = if users.is_empty() {
+                String::new()
+            } else {
+                format!(" — in use by {}", users.join(", "))
+            };
+            still_mounted = true;
             problems.push(format!(
-                "could not unmount {}: {last}",
+                "could not unmount {}: {last}{busy}{MOVE_AWAY}",
                 session.mount_point.display()
             ));
         }
@@ -768,7 +825,18 @@ pub fn unmount(session: &Session) -> Result<()> {
             session.pid
         ));
     }
-    session.forget();
+    if still_mounted {
+        // The mount point is still there, so the record stays too: otherwise
+        // `vcrs list` would lose a volume that is still mounted, and the retry
+        // after the user leaves the directory would have nothing to find.
+        problems.push(format!(
+            "{} is still mounted, and it is still recorded (`vcrs dismount {}` retries it)",
+            session.mount_point.display(),
+            session.container.display()
+        ));
+    } else {
+        session.forget();
+    }
     if problems.is_empty() {
         Ok(())
     } else {
@@ -850,6 +918,16 @@ mod tests {
         assert_eq!(orphan.health(), Health::ServerGone);
         assert!(orphan.is_stale());
         assert!(!orphan.server_alive());
+    }
+
+    #[test]
+    fn a_fuser_line_gives_up_its_pids() {
+        assert_eq!(pids_in_fuser_output("/media/vcrs/x:  1234 5678"), vec![1234, 5678]);
+        assert_eq!(pids_in_fuser_output("/media/vcrs/x:"), Vec::<u32>::new());
+        assert_eq!(pids_in_fuser_output(""), Vec::<u32>::new());
+        assert_eq!(pids_in_fuser_output("  42   42  "), vec![42]);
+        // A bare run tags the pid with the access it found.
+        assert_eq!(pids_in_fuser_output("/media/vcrs/x: 13895c"), vec![13895]);
     }
 
     #[test]
