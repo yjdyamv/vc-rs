@@ -672,6 +672,10 @@ impl Volume {
         host_size: u64,
         timestamps: Option<FileTimestamps>,
     ) -> Result<Volume> {
+        // The master key is about to become part of a long-lived struct, so this is
+        // the first moment its address is final: ask WER to leave it out of a dump
+        // (a crash dump otherwise contains it, page-file lock or not).
+        crate::memlock::exclude_from_dumps(&header.master_key);
         let xts = Xts::new(header.ea, header.data_key())?;
         let in_place = in_place_state(&header);
         // An unfinished in-place volume describes the *boundary* between its

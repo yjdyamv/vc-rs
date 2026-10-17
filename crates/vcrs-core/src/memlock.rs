@@ -13,9 +13,12 @@
 //!
 //! Locked pages are also **not** hidden from a crash dump: a WER dump or a manual
 //! dump of the process includes locked pages, because it copies the process's
-//! memory rather than reading it back through the paging path. Nothing in user
-//! space can stop an administrator from configuring such a dump; the only defence
-//! on that side is not to crash with the key in memory.
+//! memory rather than reading it back through the paging path. [`exclude_from_dumps`]
+//! asks Windows Error Reporting to leave one block out of every dump it takes, which
+//! covers the ordinary "the program crashed, WER saved a dump" case; it does not stop
+//! an administrator from configuring a dump tool that ignores the request, so a
+//! machine where the key must never reach disk still needs a policy outside the
+//! process (no local dumps, no hibernation).
 
 #[cfg(windows)]
 mod platform {
@@ -80,6 +83,73 @@ mod platform {
     }
 }
 
+/// Keep a block out of the crash dumps Windows Error Reporting writes.
+#[cfg(windows)]
+mod dump {
+    use std::ffi::c_void;
+
+    type Module = *mut c_void;
+    /// `WerRegisterExcludedMemoryBlock(PVOID Address, DWORD Size) -> HRESULT`.
+    type Register = unsafe extern "system" fn(*mut c_void, u32) -> i32;
+
+    extern "system" {
+        fn LoadLibraryW(name: *const u16) -> Module;
+        fn GetProcAddress(module: Module, name: *const u8) -> *mut c_void;
+    }
+
+    fn register_fn() -> Option<Register> {
+        // Windows Error Reporting lives in `wer.dll`; the call exists since Windows 8
+        // and is simply absent on anything older, so it is looked up rather than
+        // linked. The library is never unloaded: the registration has to outlive this
+        // call.
+        let name: [u16; 8] = [
+            b'w' as u16,
+            b'e' as u16,
+            b'r' as u16,
+            b'.' as u16,
+            b'd' as u16,
+            b'l' as u16,
+            b'l' as u16,
+            0,
+        ];
+        // SAFETY: the name is NUL terminated and outlives the call, and the entry
+        // point is only used with the signature the documentation gives it.
+        unsafe {
+            let module = LoadLibraryW(name.as_ptr());
+            if module.is_null() {
+                return None;
+            }
+            let address = GetProcAddress(module, c"WerRegisterExcludedMemoryBlock".as_ptr() as *const u8);
+            if address.is_null() {
+                return None;
+            }
+            Some(std::mem::transmute::<*mut c_void, Register>(address))
+        }
+    }
+
+    pub fn exclude(bytes: &[u8]) -> bool {
+        let Ok(size) = u32::try_from(bytes.len()) else {
+            return false;
+        };
+        let Some(register) = register_fn() else {
+            return false;
+        };
+        // SAFETY: the pointer and length describe a live slice, and the block must not
+        // move afterwards — the caller only ever registers a buffer it does not
+        // grow again.
+        unsafe { register(bytes.as_ptr() as *mut c_void, size) == 0 }
+    }
+}
+
+#[cfg(not(windows))]
+mod dump {
+    pub fn exclude(_bytes: &[u8]) -> bool {
+        // ELF core dumps and macOS crash reports have no equivalent request: whether
+        // they are written, and what they contain, is decided outside the process.
+        false
+    }
+}
+
 /// Keep `bytes` out of the page file, best effort. Returns whether it worked.
 ///
 /// Call this once, after the buffer has been filled and its final address is
@@ -106,4 +176,28 @@ pub fn lock(bytes: &[u8]) -> bool {
 /// give the working-set budget back.
 pub fn unlock(bytes: &[u8]) -> bool {
     platform::unlock(bytes)
+}
+
+/// Ask Windows Error Reporting to leave `bytes` out of any dump it writes.
+///
+/// The page-file lock does not help here: a dump copies the process's memory, so a
+/// locked key is in it. This call does, for the dumps WER itself takes after a
+/// crash (a manual dump or a configured `LocalDumps` key may ignore it, and other
+/// operating systems have no equivalent).
+///
+/// `bytes` must be a buffer that is **not reallocated afterwards** — the registration
+/// keeps the address, and a `Vec` that grows would leave it pointing at freed memory.
+/// Call it once the buffer is final; registering the same block twice is harmless.
+pub fn exclude_from_dumps(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    let excluded = dump::exclude(bytes);
+    if !excluded {
+        log::debug!(
+            "could not exclude {} bytes of key material from crash dumps",
+            bytes.len()
+        );
+    }
+    excluded
 }
