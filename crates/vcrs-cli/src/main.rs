@@ -2383,6 +2383,7 @@ fn mount_on_this_host(
         auth: chap
             .as_ref()
             .map(|(user, secret)| (user.as_str(), secret.as_str())),
+        raw: matches!(iscsi.disk_mode, vcrs_mount::DiskMode::Raw),
     };
     let session = match initiator::mount_served(
         &iscsi.target_name,

@@ -428,6 +428,11 @@ ls /media/vcrs/<label>               # ordinary filesystem, ordinary user rights
 sudo vcrs dismount secret.vc         # unmounts, logs out, stops the server
 ```
 
+`--disk-mode` decides which node carries the filesystem: the default presents a synthetic
+MBR, so the kernel creates a partition and `vcrs mount` takes `/dev/sdX1`; `raw` presents the
+bare data area, so it takes `/dev/sdX` itself. `vcrs format` writes the filesystem where both
+presentations find it, so one container mounts either way.
+
 The mount point is chosen from the volume's filesystem label (`/media/vcrs/<label>`, with
 `-2`, `-3`… for a second volume with the same label); `--mount-point <DIR>` picks another
 one. `vcrs list` shows what is mounted, where, on which device and under which IQN, and

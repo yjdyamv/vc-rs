@@ -371,25 +371,50 @@ fn by_path(portal: &str, iqn: &str, suffix: &str) -> PathBuf {
     ))
 }
 
-/// Wait for the kernel to publish the disk, and return the device to mount.
+/// Which node under `/dev/disk/by-path` carries the filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceChoice {
+    /// The whole disk: raw mode, no partition table.
+    Disk,
+    /// The first partition: the partitioned presentation.
+    Partition,
+}
+
+/// Decide between the disk and its first partition.
 ///
-/// `--disk-mode partition` (the default) puts a partition table inside the
-/// volume, so the filesystem is on the first partition and the whole disk is not
-/// mountable; raw mode has no partition.
-fn wait_for_device(portal: &str, iqn: &str) -> Result<PathBuf> {
+/// `--disk-mode partition` (the default) presents a synthetic MBR, so the kernel
+/// creates a partition node and that is where the filesystem is; raw mode has no
+/// partition table, so the disk itself is the filesystem.  Raw mode ignores a
+/// partition node on purpose: a stale one would be the wrong device.
+fn pick_device(raw: bool, disk: bool, part: bool) -> Option<DeviceChoice> {
+    if raw {
+        disk.then_some(DeviceChoice::Disk)
+    } else if part {
+        Some(DeviceChoice::Partition)
+    } else {
+        // No partition: either udev has not got there yet, or the initiator sees
+        // the raw layout.  The disk is still worth a try, and `mount` will say no.
+        disk.then_some(DeviceChoice::Disk)
+    }
+}
+
+/// Wait for the kernel to publish the disk, and return the device to mount.
+fn wait_for_device(portal: &str, iqn: &str, raw: bool) -> Result<PathBuf> {
     let start = Instant::now();
     loop {
         let disk = by_path(portal, iqn, "");
         let part = by_path(portal, iqn, "-part1");
-        if disk.exists() || part.exists() {
-            // Give udev a moment to finish the partition scan before deciding.
-            std::thread::sleep(Duration::from_millis(500));
-            if part.exists() {
-                return Ok(std::fs::canonicalize(&part).unwrap_or(part));
+        if let Some(choice) = pick_device(raw, disk.exists(), part.exists()) {
+            // Give udev a moment to finish the partition scan before deciding,
+            // except in raw mode, where there is no partition to wait for.
+            if !raw {
+                std::thread::sleep(Duration::from_millis(500));
             }
-            if disk.exists() {
-                return Ok(std::fs::canonicalize(&disk).unwrap_or(disk));
-            }
+            let path = match choice {
+                DeviceChoice::Partition => part,
+                DeviceChoice::Disk => disk,
+            };
+            return Ok(std::fs::canonicalize(&path).unwrap_or(path));
         }
         if start.elapsed() >= DISK_WAIT {
             return Err(Error::Unsupported(format!(
@@ -513,6 +538,8 @@ pub struct MountKnobs<'a> {
     /// CHAP credentials `(user, secret)` the login has to present, when the
     /// target asks for CHAP.
     pub auth: Option<(&'a str, &'a str)>,
+    /// The target presents no partition table, so the disk itself is mounted.
+    pub raw: bool,
 }
 
 /// Configure `iscsiadm`'s persistent node record with the CHAP credentials.
@@ -607,7 +634,7 @@ pub fn mount_served(
         &["-m", "node", "-T", iqn, "-p", portal, "--login"],
     )?;
 
-    let device = match wait_for_device(portal, iqn) {
+    let device = match wait_for_device(portal, iqn, knobs.raw) {
         Ok(device) => device,
         Err(err) => {
             logout(iqn, portal);
@@ -639,7 +666,7 @@ pub fn mount_served(
                 || reason.contains("can't read superblock")
                 || reason.contains("bad option")
             {
-                "; the volume has no filesystem this system can read — `vcrs format <volume>` puts a FAT32 one inside it; if it is NTFS, `apt install ntfs-3g` (or use a kernel with ntfs3)"
+                "; the volume has no filesystem this system can read — `vcrs format <volume>` puts a FAT32 one inside it; if it is NTFS, `apt install ntfs-3g` (or use a kernel with ntfs3); if it was written with the other disk mode, pass `--disk-mode raw` (or drop it)"
             } else {
                 ""
             };
@@ -823,6 +850,19 @@ mod tests {
         assert_eq!(orphan.health(), Health::ServerGone);
         assert!(orphan.is_stale());
         assert!(!orphan.server_alive());
+    }
+
+    #[test]
+    fn the_disk_mode_decides_which_node_is_mounted() {
+        use DeviceChoice::{Disk, Partition};
+        // Raw mode: the disk itself, even if a partition node is lying around.
+        assert_eq!(pick_device(true, true, true), Some(Disk));
+        assert_eq!(pick_device(true, true, false), Some(Disk));
+        assert_eq!(pick_device(true, false, true), None);
+        // Partitioned mode prefers the partition, and falls back to the disk.
+        assert_eq!(pick_device(false, true, true), Some(Partition));
+        assert_eq!(pick_device(false, true, false), Some(Disk));
+        assert_eq!(pick_device(false, false, false), None);
     }
 
     #[test]
