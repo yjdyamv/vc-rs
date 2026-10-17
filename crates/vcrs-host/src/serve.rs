@@ -347,6 +347,55 @@ pub fn forget(iqn: &str) {
     let _ = fs::remove_file(Server::state_path(iqn));
 }
 
+/// Remove the logs of servers that nothing records any more.
+///
+/// A server that was killed or that went down with the machine leaves its log in
+/// `%TEMP%` without a state file beside it, and that log is a lasting record: it names
+/// the target, and under `RUST_LOG=debug` it says which layout was opened — the one
+/// thing a hidden volume exists to keep out of the open. A server that is still running
+/// always has its state file (`remember` writes it right after `spawn`), so a log
+/// without one belongs to nobody. Logs of an *attach* run (`vcrs-attach-<pid>.log`) are
+/// kept until they are well past the five minutes an attach may take, because one may be
+/// in flight right now and deleting it would lose that run's output.
+pub fn sweep_logs() {
+    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(slug) = name
+            .strip_prefix("vcrs-")
+            .and_then(|rest| rest.strip_suffix(".log"))
+        else {
+            continue;
+        };
+        if slug.is_empty() {
+            continue;
+        }
+        if slug.starts_with("attach-") {
+            // `LOG_WAIT` gives an attach five minutes to speak; anything older than this
+            // is a parent that died while waiting for its elevated half.
+            const ATTACH_LOG_GRACE: Duration = Duration::from_secs(15 * 60);
+            let stale = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|written| written.elapsed().ok())
+                .is_some_and(|age| age > ATTACH_LOG_GRACE);
+            if stale {
+                let _ = fs::remove_file(&path);
+            }
+            continue;
+        }
+        if !Server::state_path(slug).exists() {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
 /// Whether an open process handle is this program (a `vcrs.exe`).
 ///
 /// State files live in `%TEMP%`, a directory the calling user can write, so their

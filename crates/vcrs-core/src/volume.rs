@@ -920,14 +920,26 @@ impl Volume {
             progress,
         )?;
 
-        // 3. The new header fields; the master key does not change.
+        // 3. The old backup header group sits inside the data area now; wipe it with
+        //    random bytes so no stale, decryptable header (a hidden volume's included)
+        //    survives. This has to reach the disk *before* the header below says the
+        //    data area is bigger: the other order leaves a window in which the new
+        //    header is durable and the header it replaced is still inside the volume.
+        wipe_region(
+            &self.file,
+            old_host_size.saturating_sub(VOLUME_HEADER_GROUP_SIZE),
+            VOLUME_HEADER_GROUP_SIZE,
+        )?;
+        self.file.sync_all()?;
+
+        // 4. The new header fields; the master key does not change.
         let mut header = self.header.clone();
         header.volume_data_size = new_data_size;
         header.hidden_volume_data_size = 0;
         header.encrypted_area_start = self.data_offset;
         header.encrypted_area_length = new_data_size;
 
-        // 4. Backup header first, then the primary one, each with its own fresh
+        // 5. Backup header first, then the primary one, each with its own fresh
         //    salt (VeraCrypt's CreateVolumeHeaderInMemory generates one per copy).
         let backup_offset = new_host_size - VOLUME_HEADER_GROUP_SIZE;
         let backup_salt = random_bytes(HEADER_SALT_SIZE)?;
@@ -942,14 +954,6 @@ impl Volume {
             &primary_salt,
         )?;
         header.salt = primary_salt;
-
-        // 5. The old backup header group sits inside the data area now; wipe it
-        //    so no stale, decryptable header survives.
-        wipe_region(
-            &self.file,
-            old_host_size.saturating_sub(VOLUME_HEADER_GROUP_SIZE),
-            VOLUME_HEADER_GROUP_SIZE,
-        )?;
 
         self.file.sync_all()?;
         self.host_size = new_host_size;

@@ -294,6 +294,9 @@ pub fn detach(options: &DetachOptions, report: &mut Report) -> Result<Detached> 
             let _ = serve::stop(server, report);
         }
     }
+    // Logs of servers that crashed (or of a machine that was reset) have no state
+    // file and would otherwise stay in `%TEMP%` for good.
+    serve::sweep_logs();
 
     // The target that just died may still hold a session, and a stale session logs
     // out more reliably than a live one: look again before logging out.
