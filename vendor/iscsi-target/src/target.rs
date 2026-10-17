@@ -16,8 +16,13 @@ use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 /// connection, which is the address the initiator just reached. The port has to
 /// be part of it, or an initiator records the target at the well-known 3260
 /// whatever port the server is really on.
-fn advertised_address(local_addr: std::net::SocketAddr) -> String {
-    local_addr.to_string()
+fn advertised_address(local_addr: std::net::SocketAddr, advertised: Option<&str>) -> String {
+    // An explicit portal wins: behind NAT or a container the address the
+    // initiator just reached is not the address the next initiator should use.
+    match advertised {
+        Some(portal) if !portal.is_empty() => portal.to_string(),
+        _ => local_addr.to_string(),
+    }
 }
 
 use std::thread;
@@ -40,6 +45,8 @@ pub struct IscsiTarget<D: ScsiBlockDevice> {
     max_sessions: u32,
     active_sessions: Arc<std::sync::atomic::AtomicUsize>,
     allowed_initiators: Option<Vec<String>>,
+    /// Portal to advertise in SendTargets replies instead of the local address.
+    advertised_portal: Option<String>,
 }
 
 impl<D: ScsiBlockDevice + Send + 'static> IscsiTarget<D> {
@@ -96,6 +103,7 @@ impl<D: ScsiBlockDevice + Send + 'static> IscsiTarget<D> {
                     let max_sessions = self.max_sessions;
                     let active_sessions = Arc::clone(&self.active_sessions);
                     let allowed_initiators = self.allowed_initiators.clone();
+                    let advertised_portal = self.advertised_portal.clone();
 
                     thread::spawn(move || {
                         let session_entered = handle_connection(
@@ -109,6 +117,7 @@ impl<D: ScsiBlockDevice + Send + 'static> IscsiTarget<D> {
                             max_sessions,
                             Arc::clone(&active_sessions),
                             allowed_initiators,
+                            advertised_portal,
                         ).unwrap_or(false); // Returns true if session was established
 
                         log::info!("Connection closed from {}", addr);
@@ -204,6 +213,7 @@ fn handle_connection<D: ScsiBlockDevice>(
     max_sessions: u32,
     active_sessions: Arc<std::sync::atomic::AtomicUsize>,
     allowed_initiators: Option<Vec<String>>,
+    advertised_portal: Option<String>,
 ) -> ScsiResult<bool> {
     let local_addr = stream.local_addr().map_err(IscsiError::Io)?;
     stream.set_nonblocking(false).map_err(IscsiError::Io)?;
@@ -222,7 +232,7 @@ fn handle_connection<D: ScsiBlockDevice>(
 
     // Address for discovery responses. On a connected socket, local_addr
     // resolves to the actual interface IP even when bound to 0.0.0.0.
-    let target_address = advertised_address(local_addr);
+    let target_address = advertised_address(local_addr, advertised_portal.as_deref());
 
     // Clone stream for writer — reader thread handles NOP-Out directly
     let mut write_stream = stream.try_clone().map_err(IscsiError::Io)?;
@@ -1089,6 +1099,7 @@ pub struct IscsiTargetBuilder<D: ScsiBlockDevice> {
     max_connections: Option<u32>,
     max_sessions: Option<u32>,
     allowed_initiators: Option<Vec<String>>,
+    advertised_portal: Option<String>,
     _phantom: std::marker::PhantomData<D>,
 }
 
@@ -1102,8 +1113,17 @@ impl<D: ScsiBlockDevice> IscsiTargetBuilder<D> {
             max_connections: None,
             max_sessions: None,
             allowed_initiators: None,
+            advertised_portal: None,
             _phantom: std::marker::PhantomData,
         }
+    }
+
+    /// Portal to put in SendTargets replies, e.g. `203.0.113.5:3260` when the
+    /// server is reached through NAT. Defaults to the address the initiator
+    /// connected to.
+    pub fn advertised_portal(mut self, portal: &str) -> Self {
+        self.advertised_portal = Some(portal.to_string());
+        self
     }
 
     pub fn bind_addr(mut self, addr: &str) -> Self {
@@ -1165,6 +1185,7 @@ impl<D: ScsiBlockDevice> IscsiTargetBuilder<D> {
             max_sessions: self.max_sessions.unwrap_or(256),
             active_sessions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             allowed_initiators: self.allowed_initiators,
+            advertised_portal: self.advertised_portal,
         })
     }
 }
@@ -1179,6 +1200,7 @@ struct TargetInfo {
     alias: String,
     auth_config: crate::auth::AuthConfig,
     allowed_initiators: Option<Vec<String>>,
+    advertised_portal: Option<String>,
 }
 
 /// Multi-target iSCSI server
@@ -1193,6 +1215,8 @@ pub struct IscsiServer {
     active_connections: Arc<std::sync::atomic::AtomicUsize>,
     max_sessions: u32,
     active_sessions: Arc<std::sync::atomic::AtomicUsize>,
+    /// Portal advertised in the server's discovery replies (see `TargetInfo`).
+    advertised_portal: Option<String>,
 }
 
 impl IscsiServer {
@@ -1247,6 +1271,7 @@ impl IscsiServer {
                     let max_sessions = self.max_sessions;
                     let active_sessions = Arc::clone(&self.active_sessions);
                     let bind_addr = self.bind_addr.clone();
+                    let advertised_portal = self.advertised_portal.clone();
 
                     thread::spawn(move || {
                         let session_entered = handle_multi_target_connection(
@@ -1257,6 +1282,7 @@ impl IscsiServer {
                             shutting_down,
                             max_sessions,
                             Arc::clone(&active_sessions),
+                            advertised_portal,
                         ).unwrap_or(false);
 
                         log::info!("Connection closed from {}", addr);
@@ -1315,6 +1341,7 @@ impl IscsiServer {
 }
 
 /// Handle a connection with multi-target routing
+#[allow(clippy::too_many_arguments)] // the argument list is the connection's state
 fn handle_multi_target_connection(
     mut stream: TcpStream,
     targets: Arc<Mutex<std::collections::HashMap<String, TargetInfo>>>,
@@ -1323,6 +1350,7 @@ fn handle_multi_target_connection(
     shutting_down: Arc<AtomicBool>,
     max_sessions: u32,
     active_sessions: Arc<std::sync::atomic::AtomicUsize>,
+    advertised_portal: Option<String>,
 ) -> ScsiResult<bool> {
     let local_addr = stream.local_addr().map_err(IscsiError::Io)?;
     stream.set_nonblocking(false).map_err(IscsiError::Io)?;
@@ -1332,7 +1360,7 @@ fn handle_multi_target_connection(
     // The port belongs in a SendTargets reply: an initiator that records the
     // target without one falls back to the well-known 3260 whatever port the
     // server is really on. `SocketAddr`'s Display already brackets IPv6.
-    let target_address = advertised_address(local_addr);
+    let target_address = advertised_address(local_addr, advertised_portal.as_deref());
 
     // Create initial session for login phase
     let _session = AnySession::new();
@@ -1392,6 +1420,7 @@ fn handle_multi_target_connection(
     let alias = target_info.alias.clone();
     let auth_config = target_info.auth_config.clone();
     let allowed_initiators = target_info.allowed_initiators.clone();
+    let advertised_portal = target_info.advertised_portal.clone();
     drop(targets_lock);
 
     log::info!("Routing to target: {} ({})", target_name, alias);
@@ -1409,6 +1438,7 @@ fn handle_multi_target_connection(
         max_sessions,
         active_sessions,
         allowed_initiators,
+        advertised_portal,
         first_pdu,
     )?;
 
@@ -1509,6 +1539,7 @@ fn handle_connection_with_first_pdu_boxed(
     max_sessions: u32,
     active_sessions: Arc<std::sync::atomic::AtomicUsize>,
     allowed_initiators: Option<Vec<String>>,
+    advertised_portal: Option<String>,
     first_pdu: IscsiPdu,
 ) -> ScsiResult<bool> {
     // Similar to handle_connection but with first PDU already read
@@ -1516,7 +1547,7 @@ fn handle_connection_with_first_pdu_boxed(
     // The port belongs in a SendTargets reply: an initiator that records the
     // target without one falls back to the well-known 3260 whatever port the
     // server is really on. `SocketAddr`'s Display already brackets IPv6.
-    let target_address = advertised_address(local_addr);
+    let target_address = advertised_address(local_addr, advertised_portal.as_deref());
 
     // The session that answers the *first* login PDU has to carry the target's
     // authentication configuration: that PDU is where the initiator offers
@@ -1965,6 +1996,7 @@ pub struct IscsiServerBuilder {
     targets: std::collections::HashMap<String, TargetEntry>,
     max_connections: Option<u32>,
     max_sessions: Option<u32>,
+    advertised_portal: Option<String>,
 }
 
 impl IscsiServerBuilder {
@@ -1974,7 +2006,16 @@ impl IscsiServerBuilder {
             targets: std::collections::HashMap::new(),
             max_connections: None,
             max_sessions: None,
+            advertised_portal: None,
         }
+    }
+
+    /// Portal to put in SendTargets replies for every target of this server,
+    /// e.g. `203.0.113.5:3260` when it is reached through NAT. Defaults to the
+    /// address each initiator connected to.
+    pub fn advertised_portal(mut self, portal: &str) -> Self {
+        self.advertised_portal = Some(portal.to_string());
+        self
     }
 
     pub fn bind_addr(mut self, addr: &str) -> Self {
@@ -2037,6 +2078,7 @@ impl IscsiServerBuilder {
                 alias,
                 auth_config,
                 allowed_initiators,
+                advertised_portal: self.advertised_portal.clone(),
             });
         }
 
@@ -2049,6 +2091,7 @@ impl IscsiServerBuilder {
             active_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_sessions: self.max_sessions.unwrap_or(256),
             active_sessions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            advertised_portal: self.advertised_portal,
         })
     }
 }
@@ -2142,16 +2185,25 @@ mod tests {
         // The bug this pins: the address used to be built from `ip()` alone, so
         // open-iscsi recorded the node at 3260 and the login never found it.
         assert_eq!(
-            advertised_address("127.0.0.1:3261".parse::<SocketAddr>().unwrap()),
+            advertised_address("127.0.0.1:3261".parse::<SocketAddr>().unwrap(), None),
             "127.0.0.1:3261"
         );
         assert_eq!(
-            advertised_address("0.0.0.0:3260".parse::<SocketAddr>().unwrap()),
+            advertised_address("0.0.0.0:3260".parse::<SocketAddr>().unwrap(), None),
             "0.0.0.0:3260"
         );
         assert_eq!(
-            advertised_address("[::1]:3262".parse::<SocketAddr>().unwrap()),
+            advertised_address("[::1]:3262".parse::<SocketAddr>().unwrap(), None),
             "[::1]:3262"
+        );
+        // Through NAT the address the initiator reached is not the one the next
+        // initiator should dial, so an explicit portal has to win.
+        assert_eq!(
+            advertised_address(
+                "127.0.0.1:3261".parse::<SocketAddr>().unwrap(),
+                Some("203.0.113.5:3260")
+            ),
+            "203.0.113.5:3260"
         );
     }
 
@@ -2203,6 +2255,7 @@ mod tests {
                     shutting_down,
                     8,
                     active_sessions,
+                    None,
                     None,
                     first_pdu,
                 )

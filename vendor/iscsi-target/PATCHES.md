@@ -210,3 +210,15 @@ when the incoming PDU contained it.
 with "Unexpected key present"; after, discovery succeeds, `iscsiadm --login`
 succeeds and `/dev/sdb` (160 MB) appears.  Windows was re-checked afterwards:
 `vcrs mount --chap --letter Y` still logs in and reads a file.
+
+## (10) `src/target.rs` — an advertise override for NAT (API addition, not a fix)
+
+`advertised_portal(host:port)` on `IscsiTargetBuilder` and `IscsiServerBuilder`
+places that portal in `SendTargets` replies instead of the address the initiator
+connected to. The default stays "the address the initiator reached", which is
+right for a direct connection; behind NAT, a proxy or a container port mapping
+it is the inside address and an initiator that records it cannot come back.
+`vcrs mount --advertise host:port` passes it through. Covered by
+`a_sendtargets_reply_names_the_port_and_brackets_ipv6` (override wins) and
+`vcrs_mount::iscsi::tests::an_advertised_portal_has_to_be_one` (a comma or a
+space would corrupt the comma-separated reply field).

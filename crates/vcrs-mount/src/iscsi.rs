@@ -196,6 +196,37 @@ pub struct IscsiMountOptions {
     /// halves of the mount derive it from the volume's header salt and the
     /// random per-mount target name, see [`vcrs_core::chap_secret`].
     pub chap: bool,
+    /// Portal to advertise in `SendTargets` replies, as `host:port`.
+    ///
+    /// The default (unset) advertises the address the initiator just connected
+    /// to, which is right for a direct connection. Behind NAT, a proxy or a
+    /// container port mapping that address is the *inside* one, and an
+    /// initiator that records it cannot come back, so the routable portal has
+    /// to be named explicitly.
+    pub advertised_portal: Option<String>,
+}
+
+/// The portal goes into a comma-separated `SendTargets` field, so anything that
+/// would break that field — or that is not a `host:port` at all — has to be
+/// refused before it reaches the initiator.
+fn check_advertised_portal(portal: &str) -> crate::Result<String> {
+    if portal.is_empty() {
+        return Err(crate::Error::InvalidParameter(
+            "the advertised portal is empty; give it as host:port".to_string(),
+        ));
+    }
+    if portal.contains(',') || portal.chars().any(char::is_whitespace) {
+        return Err(crate::Error::InvalidParameter(format!(
+            "{portal} cannot be advertised: a portal is host:port, without commas or spaces"
+        )));
+    }
+    let (host, port) = crate::net::split_address(portal);
+    if host.is_empty() || port == 0 {
+        return Err(crate::Error::InvalidParameter(format!(
+            "{portal} is not a portal; give it as host:port (the port may be left out for 3260)"
+        )));
+    }
+    Ok(portal.to_string())
 }
 
 impl Default for IscsiMountOptions {
@@ -211,6 +242,7 @@ impl Default for IscsiMountOptions {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             protect_hidden: None,
             chap: false,
+            advertised_portal: None,
         }
     }
 }
@@ -685,6 +717,10 @@ impl IscsiMount {
     /// and `QAddTargetPortal` fails with "Target Error".
     pub fn start(device: ScsiVolume, opts: &IscsiMountOptions) -> Result<Self> {
         let builder = IscsiServer::builder().bind_addr(&opts.bind_addr);
+        let builder = match &opts.advertised_portal {
+            Some(portal) => builder.advertised_portal(check_advertised_portal(portal)?.as_str()),
+            None => builder,
+        };
         let secret = device.chap_secret.clone();
         let builder = match &secret {
             Some(secret) => builder.add_target_with_auth(
@@ -1096,4 +1132,32 @@ pub fn free_loopback_port() -> Result<u16> {
     let port = listener.local_addr()?.port();
     drop(listener);
     Ok(port)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_advertised_portal;
+
+    #[test]
+    fn an_advertised_portal_has_to_be_one() {
+        assert_eq!(
+            check_advertised_portal("203.0.113.5:3260").unwrap(),
+            "203.0.113.5:3260"
+        );
+        assert_eq!(
+            check_advertised_portal("[::1]:3260").unwrap(),
+            "[::1]:3260"
+        );
+        // A portal without a port is fine: the initiator falls back to 3260.
+        assert_eq!(
+            check_advertised_portal("host.example").unwrap(),
+            "host.example"
+        );
+        for bad in ["", "203.0.113.5:0", "a b:3260", "10.0.0.1:3260,1", ",,,"] {
+            assert!(
+                check_advertised_portal(bad).is_err(),
+                "{bad:?} should have been refused"
+            );
+        }
+    }
 }

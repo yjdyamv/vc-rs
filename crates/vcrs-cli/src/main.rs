@@ -504,6 +504,14 @@ struct MountArgs {
     /// you trust.
     #[arg(long, requires_all = ["bind", "chap"])]
     allow_remote: bool,
+    /// Portal to hand to initiators in `SendTargets` replies, as `host:port`.
+    ///
+    /// By default the target advertises the address the initiator connected to,
+    /// which is right on a direct connection. Behind NAT, a proxy or a container
+    /// port mapping that address is the inside one and an initiator that records
+    /// it cannot come back, so name the reachable portal here.
+    #[arg(long, value_name = "HOST:PORT")]
+    advertise: Option<String>,
     /// IQN the iSCSI target is published under.
     #[arg(long, value_name = "IQN")]
     target_name: Option<String>,
@@ -1477,6 +1485,7 @@ fn run() -> Result<()> {
             }
             iscsi.protect_hidden = a.protect.hidden_open_options()?;
             iscsi.chap = a.chap;
+            iscsi.advertised_portal = a.advertise.clone();
             // The elevated half derives the same CHAP secret from the same file
             // (`attach::read_salt`), so the path is all it needs.
             // Only the drive-letter path hands the file to an elevated half; a
