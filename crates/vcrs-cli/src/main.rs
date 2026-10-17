@@ -2304,13 +2304,24 @@ fn mount_on_this_host(
         .into_iter()
         .find(|session| same_file(&session.container, &a.path))
     {
-        println!(
-            "{} is already mounted on {} (`vcrs dismount {}` takes it off)",
-            a.path.display(),
-            existing.mount_point.display(),
-            a.path.display()
-        );
-        return Ok(());
+        // A leftover from a crash or a reboot has the same state file but no live
+        // mount, and it would block this mount forever; take it down first.
+        if existing.is_stale() {
+            println!(
+                "clearing the leftover of an earlier mount of {} ({})",
+                a.path.display(),
+                existing.health()
+            );
+            initiator::unmount(&existing)?;
+        } else {
+            println!(
+                "{} is already mounted on {} (`vcrs dismount {}` takes it off)",
+                a.path.display(),
+                existing.mount_point.display(),
+                a.path.display()
+            );
+            return Ok(());
+        }
     }
     // Unlock once here, for the same reason `--foreground` is slow to say no: a
     // wrong password makes the trial loop run every layout with every PRF, and
@@ -2431,6 +2442,9 @@ fn list_mounts(a: &ListArgs, json: bool) -> Result<()> {
                         "device": session.device.display().to_string(),
                         "mount_point": session.mount_point.display().to_string(),
                         "pid": session.pid,
+                        "health": session.health().to_string(),
+                        "stale": session.is_stale(),
+                        "server_alive": session.server_alive(),
                     })
                 })
                 .collect();
@@ -2449,6 +2463,15 @@ fn list_mounts(a: &ListArgs, json: bool) -> Result<()> {
                     session.iqn,
                     session.pid
                 );
+                if session.is_stale() {
+                    // A state file outlives its session when the server is killed
+                    // or the machine goes down: the mount point is then a leftover
+                    // that still holds the old filesystem table.
+                    println!(
+                        "    {} — `sudo vcrs dismount --all` cleans this up",
+                        session.health()
+                    );
+                }
             }
         }
         Ok(())

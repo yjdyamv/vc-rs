@@ -435,6 +435,14 @@ one. `vcrs list` shows what is mounted, where, on which device and under which I
 serving in the terminal (that is what the background command runs internally, and what the
 manual recipe below used to be needed for).
 
+A killed server or a reboot leaves a mount point and a state file behind without a volume
+behind them (`the kernel keeps the device node while the session is logged in, so reads
+fail rather than the mount vanishing`). `vcrs list` marks those as stale, `vcrs mount` of the
+same container clears the leftover before it starts a new server, and `vcrs dismount --all`
+unmounts lazily (`umount -l`) when the device is gone. A recorded pid is only signalled after
+`/proc/<pid>/exe` says it still runs this program: a pid is reused, and killing the stranger
+that inherited the number would be worse than leaving the record.
+
 Everything below is only for an initiator that is *not* the Microsoft one and not
 open-iscsi — the two lines `--foreground` prints are the same information a hand-written
 setup needs:

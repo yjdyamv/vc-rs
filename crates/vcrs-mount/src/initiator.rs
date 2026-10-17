@@ -50,6 +50,61 @@ pub struct Session {
     pub log: PathBuf,
 }
 
+/// What is left of a mount that a state file still records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Health {
+    /// The device is there and the filesystem is mounted.
+    Live,
+    /// The session is gone (the server stopped, or the login was dropped), so
+    /// the block device the mount point was mounted from no longer exists.
+    DeviceGone,
+    /// The device and the mount are still there, but the background server is
+    /// gone: the mount looks fine and every read fails.
+    ServerGone,
+    /// The session is there but nothing is mounted: someone ran `umount` by hand.
+    NotMounted,
+}
+
+impl std::fmt::Display for Health {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Health::Live => write!(f, "mounted"),
+            Health::DeviceGone => write!(f, "stale: the session is gone"),
+            Health::ServerGone => write!(f, "stale: the server behind it is gone"),
+            Health::NotMounted => write!(f, "stale: nothing is mounted there"),
+        }
+    }
+}
+
+/// The program a pid is running, without the kernel's ` (deleted)` suffix.
+fn process_name(pid: i32) -> Option<PathBuf> {
+    if pid <= 1 {
+        return None;
+    }
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    let text = exe.to_string_lossy().into_owned();
+    let text = text.strip_suffix(" (deleted)").unwrap_or(&text).to_string();
+    Some(PathBuf::from(text))
+}
+
+/// Whether a recorded pid still runs this program.
+///
+/// A pid is reused: after a reboot, or once the server is gone, the number in a
+/// state file can belong to anything at all. Signalling a stranger would be a
+/// hostile act, so the check compares the binary name and fails closed.
+pub fn is_our_process(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    let Some(theirs) = process_name(pid) else {
+        return false;
+    };
+    let Ok(ours) = std::env::current_exe() else {
+        return false;
+    };
+    ours.file_name().is_some() && ours.file_name() == theirs.file_name()
+}
+
 impl Session {
     /// The state file that records this mount.
     pub fn state_path(&self) -> PathBuf {
@@ -101,6 +156,31 @@ impl Session {
             mount_point: mount_point?,
             log: log?,
         })
+    }
+
+    /// Whether the device is gone, nothing is mounted, or both are fine.
+    pub fn health(&self) -> Health {
+        if !self.device.exists() {
+            Health::DeviceGone
+        } else if !self.server_alive() {
+            // The kernel keeps the device node while the session is logged in, so
+            // a dead server shows up as a mount whose reads fail.
+            Health::ServerGone
+        } else if !is_mounted(&self.mount_point) {
+            Health::NotMounted
+        } else {
+            Health::Live
+        }
+    }
+
+    /// Whether this mount is a leftover: the state file outlived the session.
+    pub fn is_stale(&self) -> bool {
+        self.health() != Health::Live
+    }
+
+    /// Whether the background server is still running *and is this program*.
+    pub fn server_alive(&self) -> bool {
+        is_our_process(self.pid)
     }
 
     /// Write the state file, so a later `vcrs dismount` can find this mount.
@@ -609,6 +689,9 @@ fn logout(iqn: &str, portal: &str) {
 /// the server so a retry starts from a clean slate.
 pub fn unmount(session: &Session) -> Result<()> {
     let mut problems: Vec<String> = Vec::new();
+    // A mount whose device vanished is a leftover: `umount` can still be refused
+    // ("device is busy"), and `umount -l` detaches it either way.
+    let device_gone = !session.device.exists();
     if is_mounted(&session.mount_point) {
         let mut last = String::new();
         for attempt in 0..UMOUNT_TRIES {
@@ -629,6 +712,16 @@ pub fn unmount(session: &Session) -> Result<()> {
                 std::thread::sleep(Duration::from_millis(400));
             }
         }
+        if !last.is_empty() && device_gone {
+            let lazy = Command::new("umount").arg("-l").arg(&session.mount_point).output();
+            match lazy {
+                Ok(output) if output.status.success() => last.clear(),
+                Ok(output) => {
+                    last = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                }
+                Err(err) => last = err.to_string(),
+            }
+        }
         if !last.is_empty() {
             problems.push(format!(
                 "could not unmount {}: {last}",
@@ -640,7 +733,9 @@ pub fn unmount(session: &Session) -> Result<()> {
     // a directory the user named is left alone.
     let _ = std::fs::remove_dir(&session.mount_point);
     logout(&session.iqn, &session.portal);
-    if !stop(session.pid) {
+    // Only a pid that still runs this program is signalled: a reused number may
+    // belong to anything, and a server that is already gone needs nothing.
+    if session.server_alive() && !stop(session.pid) {
         problems.push(format!(
             "the background server (pid {}) did not stop",
             session.pid
@@ -657,10 +752,13 @@ pub fn unmount(session: &Session) -> Result<()> {
 /// Ask the server to stop, and make sure it did.
 pub fn stop(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
-        return false;
+        // Not a number this kernel could have handed out, so nothing is running
+        // behind it.
+        return true;
     };
-    if pid <= 1 {
-        return false;
+    if pid <= 1 || !is_our_process(pid as u32) {
+        // Already gone, or a stranger that ended up with a recorded number.
+        return true;
     }
     unsafe {
         if libc::kill(pid, libc::SIGTERM) == -1 {
@@ -693,6 +791,50 @@ mod tests {
             mount_point: PathBuf::from("/media/vcrs/private"),
             log: PathBuf::from("/home/u/.cache/vcrs/vcrs-x.log"),
         }
+    }
+
+    #[test]
+    fn a_mount_whose_device_is_gone_is_stale() {
+        let mut gone = session();
+        gone.device = PathBuf::from("/dev/vcrs-definitely-not-here");
+        assert_eq!(gone.health(), Health::DeviceGone);
+        assert!(gone.is_stale());
+        assert_eq!(gone.health().to_string(), "stale: the session is gone");
+
+        let mut unmounted = session();
+        unmounted.pid = std::process::id();
+        unmounted.device = std::env::current_exe().expect("this test has a binary");
+        // A plain directory: not a mount point of its own, however the temporary
+        // directory happens to be mounted.
+        unmounted.mount_point = std::env::temp_dir().join("vcrs-not-a-mount-point");
+        let _ = std::fs::create_dir_all(&unmounted.mount_point);
+        // A temp dir is not a mount point of its own, so nothing is mounted there.
+        assert_eq!(unmounted.health(), Health::NotMounted);
+        assert!(unmounted.is_stale());
+    }
+
+    #[test]
+    fn a_mount_whose_server_is_gone_is_stale() {
+        let mut orphan = session();
+        // The device and the mount point are still there, but the pid is not this
+        // program any more.
+        orphan.device = std::env::current_exe().expect("this test has a binary");
+        orphan.pid = 1;
+        assert_eq!(orphan.health(), Health::ServerGone);
+        assert!(orphan.is_stale());
+        assert!(!orphan.server_alive());
+    }
+
+    #[test]
+    fn only_this_program_counts_as_ours() {
+        assert!(is_our_process(std::process::id()));
+        // pid 1 is init/systemd and never this binary, and pid 0 is not a process.
+        assert!(!is_our_process(1));
+        assert!(!is_our_process(0));
+        // A pid that cannot be read (or does not exist) is not ours either.
+        assert!(!is_our_process(u32::MAX));
+        // ... and stopping one is a no-op that reports success.
+        assert!(stop(u32::MAX));
     }
 
     #[test]
