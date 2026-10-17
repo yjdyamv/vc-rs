@@ -37,6 +37,7 @@
 //!
 //! [Botan]: https://botan.randombit.net/
 
+pub mod chap;
 pub mod cipher;
 pub mod device;
 pub mod error;
@@ -49,6 +50,7 @@ pub mod random;
 pub mod volume;
 pub mod xts;
 
+pub use chap::{chap_secret, chap_secret_for_file, CHAP_USER};
 pub use cipher::{CipherId, EncryptionAlgorithm};
 pub use device::{describe, looks_like_device, Device, DeviceInfo, NtfsData, ShrinkProbe};
 pub use error::{Error, Result};

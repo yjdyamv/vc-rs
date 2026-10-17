@@ -83,7 +83,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use iscsi_target::{IscsiError, IscsiServer, ScsiBlockDevice, ScsiResult};
+use iscsi_target::{
+    AuthConfig, ChapCredentials, IscsiError, IscsiServer, ScsiBlockDevice, ScsiResult,
+};
 use vcrs_core::volume::{OpenOptions, ProtectedRange, Volume};
 
 use crate::device::{DataArea, SECTOR_SIZE};
@@ -178,6 +180,22 @@ pub struct IscsiMountOptions {
     /// VeraCrypt does the same when you mount an outer volume with "protect
     /// hidden volume".
     pub protect_hidden: Option<OpenOptions>,
+    /// Ask the initiator for CHAP authentication, with this secret and
+    /// [`vcrs_core::CHAP_USER`].
+    ///
+    /// Require CHAP authentication (the initiator has to prove it knows a
+    /// secret before it may log in).
+    ///
+    /// `false` (the default) serves the target to any initiator that knows the
+    /// name, which is how it has always worked; the target is then only as
+    /// private as its port and its name, which is why the bind address has to be
+    /// on the loopback interface. With this set, a login without the right
+    /// credentials is refused.
+    ///
+    /// The secret is never typed and never crosses a process boundary: both
+    /// halves of the mount derive it from the volume's header salt and the
+    /// random per-mount target name, see [`vcrs_core::chap_secret`].
+    pub chap: bool,
 }
 
 impl Default for IscsiMountOptions {
@@ -192,6 +210,7 @@ impl Default for IscsiMountOptions {
             preserve_timestamp: true,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             protect_hidden: None,
+            chap: false,
         }
     }
 }
@@ -275,6 +294,9 @@ pub struct ScsiVolume<A: DataArea = Volume> {
     capacity: u64,
     /// Whether a write into the synthetic region has been logged already.
     warned_prefix_write: bool,
+    /// The CHAP secret this target requires, derived from the volume's header
+    /// salt when it was opened (see [`IscsiMountOptions::chap`]).
+    chap_secret: Option<String>,
 }
 
 impl ScsiVolume<Volume> {
@@ -313,8 +335,29 @@ impl ScsiVolume<Volume> {
         // change between sessions (and differs between containers).
         let salt = &volume.header.salt;
         let signature = u32::from_le_bytes([salt[0], salt[1], salt[2], salt[3]]) | 0x8000_0000;
-        Self::with_signature(volume, opts, signature)
+        let mut device = Self::with_signature(volume, opts, signature)?;
+        device.chap_secret = chap_secret_for(path, opts)?;
+        Ok(device)
     }
+}
+
+/// The CHAP secret for this mount, or `None` when CHAP is off.
+///
+/// Both halves of a mount derive it independently: the target, and the elevated
+/// attach half that runs `iscsicli` reads the same 64 bytes from the same path.
+/// The input is the salt of the volume's *primary* header region -- plaintext,
+/// and at the same offset in every layout -- so neither half has to be told a
+/// secret and neither has to know which header the other one opened. (Deriving
+/// it from the header *this* side opened would not work for a hidden or
+/// `--backup` mount: the salt of those headers sits somewhere else and the other
+/// half would have to guess.)
+fn chap_secret_for(path: &Path, opts: &IscsiMountOptions) -> Result<Option<String>> {
+    if !opts.chap {
+        return Ok(None);
+    }
+    // The field name in a `vcrs` mount is not an IQN, but it still goes into
+    // the derivation here: the mount server is what turns it into one.
+    vcrs_core::chap_secret_for_file(path, &opts.target_name).map(Some)
 }
 
 impl<A: DataArea> ScsiVolume<A> {
@@ -387,6 +430,7 @@ impl<A: DataArea> ScsiVolume<A> {
             prefix,
             capacity,
             warned_prefix_write: false,
+            chap_secret: None,
         })
     }
 
@@ -640,14 +684,26 @@ impl IscsiMount {
     /// "Unsupported opcode 0x03 in full feature phase", the initiator times out
     /// and `QAddTargetPortal` fails with "Target Error".
     pub fn start(device: ScsiVolume, opts: &IscsiMountOptions) -> Result<Self> {
+        let builder = IscsiServer::builder().bind_addr(&opts.bind_addr);
+        let secret = device.chap_secret.clone();
+        let builder = match &secret {
+            Some(secret) => builder.add_target_with_auth(
+                opts.target_name.clone(),
+                Box::new(device),
+                Some("vc-rs VeraCrypt volume".to_string()),
+                AuthConfig::Chap {
+                    credentials: ChapCredentials::new(vcrs_core::CHAP_USER, secret.as_str()),
+                },
+                None,
+            ),
+            None => builder.add_target(
+                opts.target_name.clone(),
+                Box::new(device),
+                Some("vc-rs VeraCrypt volume".to_string()),
+            ),
+        };
         let server = Arc::new(
-            IscsiServer::builder()
-                .bind_addr(&opts.bind_addr)
-                .add_target(
-                    opts.target_name.clone(),
-                    Box::new(device),
-                    Some("vc-rs VeraCrypt volume".to_string()),
-                )
+            builder
                 .max_connections(8)
                 .build()
                 .map_err(to_core)?,
@@ -668,10 +724,11 @@ impl IscsiMount {
         };
         mount.wait_until_listening()?;
         log::info!(
-            "iSCSI target {} listening on {}{}",
+            "iSCSI target {} listening on {}{}{}",
             mount.target_name,
             mount.addr,
-            if mount.read_only { " (read-only)" } else { "" }
+            if mount.read_only { " (read-only)" } else { "" },
+            if secret.is_some() { " (CHAP)" } else { "" }
         );
         Ok(mount)
     }
@@ -886,19 +943,39 @@ pub fn mount_iscsi_with(
             eprintln!("nothing is attached yet, so no drive letter has appeared: this command only");
             eprintln!("serves the volume. `vcrs mount <volume> --letter Y` does the rest of the work");
             eprintln!("(it asks for one elevation prompt); by hand, from an ELEVATED prompt:");
-            eprintln!(
-                "    iscsicli AddTarget {} vcrs {} {} 0 0 0 0 0 8 0 0 \"\" \"\" 0 0",
-                mount.target_name(),
-                portal_host(&mount.addr()),
-                portal_port(&mount.addr()),
-            );
+            // The manual recipe has to match how the session was actually
+            // started: with CHAP the two credential arguments carry the user
+            // and the derived secret (see `vcrs_core::chap_secret`, and
+            // `vcrs attach --chap-from <volume>` does this for you), and the
+            // authentication type is 1 instead of 0.
+            if opts.chap {
+                eprintln!(
+                    "    iscsicli AddTarget {} vcrs {} {} 0 0 0 0 0 8 0 0 {} <secret> 1 0",
+                    mount.target_name(),
+                    portal_host(&mount.addr()),
+                    portal_port(&mount.addr()),
+                    vcrs_core::CHAP_USER,
+                );
+            } else {
+                eprintln!(
+                    "    iscsicli AddTarget {} vcrs {} {} 0 0 0 0 0 8 0 0 \"\" \"\" 0 0",
+                    mount.target_name(),
+                    portal_host(&mount.addr()),
+                    portal_port(&mount.addr()),
+                );
+            }
             eprintln!("    iscsicli QLoginTarget {}", mount.target_name());
             eprintln!();
             eprintln!("(a *static* target is registered because the target crate cannot complete the");
-            eprintln!(" initiator's multi-PDU login during a portal *scan*; the two empty strings are");
-            eprintln!(" the CHAP user/password and the trailing 0 means 'no authentication')");
-            eprintln!("(both commands must reach iscsicli with those two arguments still empty, which is");
-            eprintln!(" why the `cmd /c` hop with literal \"\" is used in scripts/vc-iscsi-e2e.ps1)");
+            eprintln!(" initiator's multi-PDU login during a portal *scan*)");
+            if opts.chap {
+                eprintln!("(this target asks for CHAP: the two arguments before the 1 are the user and");
+                eprintln!(" the secret, which is derived from the container's header salt, so a hand-");
+                eprintln!(" written command has to use `vcrs attach --chap-from <volume>` to get it right)");
+            } else {
+                eprintln!("(the two empty strings are the CHAP user/password and the trailing 0 means");
+                eprintln!(" 'no authentication'; use `--chap` to require authentication instead)");
+            }
             eprintln!();
             eprintln!("Windows then shows the volume as a partitioned disk: the data area appears as a");
             eprintln!("single partition (the container itself keeps its VeraCrypt layout).");

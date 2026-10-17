@@ -512,6 +512,15 @@ struct MountArgs {
     /// used; pass this to let the container's timestamp change normally.
     #[arg(long)]
     no_preserve_timestamp: bool,
+    /// Require CHAP authentication for the iSCSI session.
+    ///
+    /// The target refuses a login that does not prove it knows the secret, so a
+    /// process that finds the loopback port cannot read the decrypted volume.
+    /// Neither side is ever told the secret: the target and the elevated half
+    /// that runs `iscsicli` both derive it from the volume's header salt and the
+    /// (random) target name.
+    #[arg(long)]
+    chap: bool,
     /// Open the volume through its backup header instead of the primary one
     /// (VeraCrypt's "Use backup header embedded in volume if available",
     /// `/mountoption headerbak`). Useful when the primary header is damaged.
@@ -582,6 +591,11 @@ struct AttachArgs {
     /// whose elevated child has a console window of its own).
     #[arg(long, value_name = "FILE")]
     log: Option<PathBuf>,
+    /// Ask the target for CHAP authentication, deriving the secret from the
+    /// header salt of this volume (the target derives the same one, so nothing
+    /// is passed between them).
+    #[arg(long, value_name = "FILE")]
+    chap_from: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -1434,6 +1448,10 @@ fn run() -> Result<()> {
                 iscsi.idle_timeout = std::time::Duration::from_secs(seconds);
             }
             iscsi.protect_hidden = a.protect.hidden_open_options()?;
+            iscsi.chap = a.chap;
+            // The elevated half derives the same CHAP secret from the same file
+            // (`attach::read_salt`), so the path is all it needs.
+            let chap_from = if a.chap { Some(a.path.clone()) } else { None };
             if let Some(bind) = &a.bind {
                 iscsi.bind_addr = bind.clone();
             } else {
@@ -1518,6 +1536,7 @@ fn run() -> Result<()> {
                             disk_size: serve::disk_size(&server),
                             wait: attach::DISK_WAIT,
                             log: None,
+                            chap_from: chap_from.clone(),
                         };
                         match attach::attach_with_elevation(&request, json) {
                             Ok(()) => {
@@ -1557,12 +1576,17 @@ fn run() -> Result<()> {
                             disk_size: Some(disk_size),
                             wait: attach::DISK_WAIT,
                             log: None,
+                            chap_from: chap_from.clone(),
                         };
                         if let Err(err) = attach::attach_with_elevation(&request, json) {
                             println!("\ncould not attach the volume: {err:#}");
                             println!("the target keeps serving it; attach it by hand with");
+                            let chap = match &request.chap_from {
+                                Some(path) => format!(" --chap-from {}", path.display()),
+                                None => String::new(),
+                            };
                             println!(
-                                "    vcrs attach --iqn {} --address {} --letter {}",
+                                "    vcrs attach --iqn {} --address {} --letter {}{chap}",
                                 request.iqn, request.address, letter
                             );
                         }
@@ -1599,6 +1623,7 @@ fn run() -> Result<()> {
                 disk_size: a.disk_size,
                 wait: std::time::Duration::from_secs(a.wait),
                 log: a.log,
+                chap_from: a.chap_from,
             };
             let attached = match attach::attach(&request) {
                 Ok(attached) => attached,

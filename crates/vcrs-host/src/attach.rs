@@ -59,7 +59,16 @@ pub struct AttachOptions {
     /// Also write the same output here (set by the elevated child, whose
     /// console is a window of its own: the parent replays the file).
     pub log: Option<PathBuf>,
+    /// Ask the target for CHAP authentication. The secret is derived from the
+    /// header salt of the volume named here and from the target name, exactly as
+    /// the target derived it (see `vcrs_core::chap_secret`), so no secret has to
+    /// be passed between the two halves of a mount. `None` logs in without
+    /// credentials, which only works against a target that does not ask for any.
+    pub chap_from: Option<PathBuf>,
 }
+
+/// Which header group a CHAP secret is derived from.
+///
 
 /// The volume is attached: Windows has a disk, and this is where it went.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,36 +138,54 @@ pub fn attach(options: &AttachOptions) -> Result<Attached> {
         forget_stale_devices(&mut report);
     }
 
-    // 2. register the target statically, then log in.  `AddTarget` takes two
-    //    CHAP arguments that have to stay *empty*; they go through as two empty
-    //    `argv` elements, which the Windows argument quoting renders as `""` for
-    //    the child.  There is deliberately no `cmd /c` hop any more: it existed
-    //    only to preserve those two `""`, and it turned the IQN and the portal
-    //    into a shell command line (see `validate_iqn`).
+    // 2. register the target statically, then log in.  `AddTarget` takes the
+    //    CHAP user, secret and authentication type in fixed positions; without
+    //    CHAP the two credential arguments have to stay *empty*, and they go
+    //    through as two empty `argv` elements, which the Windows argument
+    //    quoting renders as `""` for the child.  There is deliberately no
+    //    `cmd /c` hop any more: it existed only to preserve those two `""`, and
+    //    it turned the IQN and the portal into a shell command line (see
+    //    `validate_iqn`).
     let (host, port) = split_address(&options.address);
-    let port = port.to_string();
-    iscsicli(&[
-        "AddTarget",
-        options.iqn.as_str(),
-        "vcrs",
-        host.as_str(),
-        port.as_str(),
-        "0",
-        "0",
-        "0",
-        "0",
-        "0",
-        "8",
-        "0",
-        "0",
-        "",
-        "",
-        "0",
-        "0",
-    ])
-    .with_context(|| format!("registering {host}:{port} as a static target"))?;
-    if let Ok(out) = iscsicli(&["QLoginTarget", &options.iqn]) {
-        report.line(&first_line(&out).unwrap_or_else(|| "logged in".to_string()));
+    let add_target = add_target_arguments(options)?;
+    let add_target: Vec<&str> = add_target.iter().map(|arg| arg.as_str()).collect();
+    iscsicli(&add_target)
+        .with_context(|| format!("registering {host}:{port} as a static target"))?;
+    // From here on the target is registered, so a failure has to take it off
+    // again: the initiator keeps retrying a static target whose process is gone,
+    // and the name would otherwise stay in its target list for good. Every mount
+    // draws a fresh name, so that list would grow with every failed attempt.
+    let attempt = attach_registered_target(options, letter, letter_taken, &mut report);
+    if attempt.is_err() {
+        let _ = iscsicli(&["QLogoutTarget", &options.iqn]);
+        let _ = iscsicli(&["RemoveTarget", &options.iqn]);
+    }
+    return attempt;
+}
+
+/// Log in to a registered target and bring its disk up.
+///
+/// Split out of [`attach`] so that a failure anywhere in here can take the
+/// static target off again ([`attach`] does that when this returns an error).
+fn attach_registered_target(
+    options: &AttachOptions,
+    letter: Option<char>,
+    letter_taken: bool,
+    report: &mut Report,
+) -> Result<Attached> {
+    // A login that did not work has to be reported. `iscsicli` exits non-zero on
+    // an authentication failure, and swallowing that used to end in "logged in
+    // ... waiting for the disk" plus a timeout that said nothing about the
+    // credentials being the problem.
+    let out = iscsicli(&["QLoginTarget", &options.iqn]).with_context(|| {
+        format!(
+            "logging in to {} (a target that asks for CHAP fails here when the \
+             credentials do not match)",
+            options.iqn
+        )
+    })?;
+    if let Some(line) = first_line(&out) {
+        report.line(&line);
     }
     report.line(&format!(
         "logged in to {}; waiting up to {} s for Windows to show the disk",
@@ -167,7 +194,7 @@ pub fn attach(options: &AttachOptions) -> Result<Attached> {
     ));
 
     // 3. Windows builds the disk asynchronously, so wait for it to turn up.
-    let disk = wait_for_disk(options.disk_size, options.wait, &mut report)?;
+    let disk = wait_for_disk(options.disk_size, options.wait, report)?;
 
     // 4. put it on the letter that was asked for.
     let mut fresher = None;
@@ -402,6 +429,55 @@ fn describe(attached: &Attached) -> String {
 }
 
 /// Everything needed to re-run this program as `vcrs attach …`.
+/// The `iscsicli AddTarget` arguments for this attach, credentials included.
+///
+/// The positions are fixed by the initiator: name, alias, portal address, portal
+/// socket, target flags, persist, login flags, header digest, data digest, max
+/// connections, DefaultTime2Wait, DefaultTime2Retain, user, secret,
+/// authentication type, mapping count. With CHAP the three after the digests
+/// carry the credentials and `1` (`ISCSI_CHAP_AUTH_TYPE`, one-way CHAP: the
+/// target authenticates the initiator); without it the credentials are empty and
+/// the type is `0`. The initiator remembers the credentials with the static
+/// target, so `QLoginTarget` does not have to repeat them.
+fn add_target_arguments(options: &AttachOptions) -> Result<Vec<String>> {
+    let (host, port) = split_address(&options.address);
+    let (user, secret, auth_type) = match &options.chap_from {
+        Some(path) => (
+            vcrs_core::CHAP_USER.to_string(),
+            chap_secret_for(path, &options.iqn)?,
+            "1",
+        ),
+        None => (String::new(), String::new(), "0"),
+    };
+    Ok(vec![
+        "AddTarget".to_string(),
+        options.iqn.clone(),
+        "vcrs".to_string(),
+        host,
+        port.to_string(),
+        "0".to_string(), // target flags
+        "0".to_string(), // persist
+        "0".to_string(), // login flags
+        "0".to_string(), // header digest
+        "0".to_string(), // data digest
+        "8".to_string(), // max connections
+        "0".to_string(), // DefaultTime2Wait
+        "0".to_string(), // DefaultTime2Retain
+        user,
+        secret,
+        auth_type.to_string(),
+        "0".to_string(), // mapping count
+    ])
+}
+
+/// The CHAP secret both halves of this mount use. The target derives the same
+/// one from the same bytes; see [`vcrs_core::chap_secret`].
+fn chap_secret_for(path: &Path, iqn: &str) -> Result<String> {
+    // Both halves of a mount call the same helper in `vcrs-core`, so the target
+    // and the elevated `iscsicli` cannot drift apart on how the secret is made.
+    Ok(vcrs_core::chap_secret_for_file(path, iqn)?)
+}
+
 fn attach_arguments(options: &AttachOptions, log: Option<&Path>, json: bool) -> Vec<String> {
     let mut args = vec![
         "attach".to_string(),
@@ -419,6 +495,10 @@ fn attach_arguments(options: &AttachOptions, log: Option<&Path>, json: bool) -> 
     if let Some(size) = options.disk_size {
         args.push("--disk-size".to_string());
         args.push(size.to_string());
+    }
+    if let Some(path) = &options.chap_from {
+        args.push("--chap-from".to_string());
+        args.push(path.display().to_string());
     }
     if let Some(log) = log {
         args.push("--log".to_string());
@@ -1293,7 +1373,50 @@ mod tests {
             disk_size: Some(11272192),
             wait: DISK_WAIT,
             log: None,
+            chap_from: None,
         }
+    }
+
+    #[test]
+    fn the_add_target_call_carries_the_chap_credentials() {
+        // Without CHAP the two credential positions stay empty and the
+        // authentication type is 0.
+        let args = add_target_arguments(&options()).unwrap();
+        assert_eq!(args.len(), 17);
+        assert_eq!(args[0], "AddTarget");
+        assert_eq!(args[13], "");
+        assert_eq!(args[14], "");
+        assert_eq!(args[15], "0");
+
+        // With CHAP they carry the user and the secret the target derives from
+        // the same 64 bytes, and the authentication type is
+        // `ISCSI_CHAP_AUTH_TYPE` (one-way CHAP).
+        let salt = [7u8; 64];
+        let path = std::env::temp_dir().join("vcrs-chap-secret-test.vc");
+        std::fs::write(&path, salt).unwrap();
+        let with_chap = AttachOptions {
+            chap_from: Some(path.clone()),
+            ..options()
+        };
+        let args = add_target_arguments(&with_chap).unwrap();
+        assert_eq!(args[13], vcrs_core::CHAP_USER);
+        let secret = vcrs_core::chap_secret(&salt, "iqn.2025-12.io.vcrs:secret").unwrap();
+        assert_eq!(args[14], secret);
+        assert_eq!(args[15], "1");
+        assert!((12..=16).contains(&secret.len()), "{secret}");
+
+        // A file that is too short to hold a salt is refused rather than
+        // silently logging in with a secret derived from nothing.
+        std::fs::write(&path, [1u8; 8]).unwrap();
+        assert!(add_target_arguments(&with_chap).is_err());
+        let _ = std::fs::remove_file(&path);
+
+        // And a missing file is an error too.
+        let missing = AttachOptions {
+            chap_from: Some(std::env::temp_dir().join("vcrs-chap-does-not-exist.vc")),
+            ..options()
+        };
+        assert!(add_target_arguments(&missing).is_err());
     }
 
     #[test]

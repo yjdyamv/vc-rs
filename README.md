@@ -205,7 +205,21 @@ vcrs decrypt-in-place V: --password pw --yes     # and back to a plain filesyste
 
 # Mount the outer volume, but refuse any write that would destroy the hidden volume inside:
 vcrs mount both.vc --password outer --protect-hidden --hidden-password inner
+
+# Require the initiator to authenticate before it may log in (CHAP):
+vcrs mount both.vc --password outer --chap --letter S
 ```
+
+`vcrs` serves the volume to the in-box Microsoft iSCSI Initiator over loopback TCP.
+That target has no authentication of its own and hands out the decrypted volume, which
+is why a non-loopback `--bind` is refused unless `--allow-remote` says it was meant
+(`--allow-remote` adds no authentication and no encryption). On Windows, `--chap` makes
+the target ask for CHAP; both halves derive the same 16-character secret from the
+container's header salt, so the secret is never typed, passed on a command line or
+written anywhere — a process can only log in if it can read the container file, which is
+what keeps another local user's process off the loopback port. It is not a cryptographic
+secret: anyone who can read the container can derive it, and they could attack the
+container offline anyway. Details: `docs/research/security-review.md`.
 
 `--password-stdin` (raw bytes) and `$VCRS_PASSWORD` are supported; prefer those over
 `--password` for anything real, since command lines are visible to other processes. At a
