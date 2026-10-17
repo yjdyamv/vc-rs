@@ -53,6 +53,13 @@ pub mod net;
 /// NTFS/exFAT drivers then mount it).
 pub mod iscsi;
 
+/// Starting the detached server and handing it its secrets.
+pub mod spawn;
+
+#[cfg(unix)]
+/// Logging in, mounting and unmounting through the system's iSCSI initiator.
+pub mod initiator;
+
 pub use device::{DataArea, VolumeDevice, SECTOR_SIZE};
 pub use iscsi::{
     mount_iscsi, mount_iscsi_with, DiskMode, IscsiMount, IscsiMountOptions, ScsiVolume,

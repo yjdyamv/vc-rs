@@ -535,7 +535,18 @@ impl Volume {
             let size = device.len();
             (device.into_file(), size)
         } else {
-            let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(|err| {
+                    // "No such file or directory" alone does not say which name
+                    // was wrong, and the caller passed it on the command line.
+                    Error::Io(std::io::Error::new(
+                        err.kind(),
+                        format!("{}: {err}", path.display()),
+                    ))
+                })?;
             let size = file.metadata()?.len();
             (file, size)
         };

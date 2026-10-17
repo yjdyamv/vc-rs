@@ -414,28 +414,45 @@ vcrs attach --iqn iqn.2025-12.io.vcrs:secret --letter S
 
 ### Mounting on Linux
 
-The same target serves there; only the initiator differs, and Linux has several. The
-recipe `vcrs mount` prints works with open-iscsi, and unlike the Microsoft initiator it
-can scan a portal (so no static target is needed). Verified end to end on Ubuntu 26.04:
-`/dev/sdX1` appeared with the volume's filesystem label, a file written inside it was
-still there when a **fresh** server process served the same container afterwards.
+`vcrs mount` does the same job there as `--letter` does on Windows: it starts the target
+in the background, logs the kernel in with open-iscsi, mounts the filesystem and returns.
+One command in, one command out — the only difference is that the two commands need
+`sudo`, because an iSCSI login creates a block device and `mount(8)` needs `CAP_SYS_ADMIN`:
 
 ```bash
-sudo apt install open-iscsi && sudo modprobe iscsi_tcp
+sudo apt install open-iscsi          # once; the kernel module loads by itself
+sudo vcrs mount secret.vc -p "correct horse"
+#   mounted secret.vc on /media/vcrs/<label>
 
-# terminal 1 (no special rights): serve the volume; it prints these same two lines
-vcrs mount secret.vc -p "correct horse"
+ls /media/vcrs/<label>               # ordinary filesystem, ordinary user rights
+sudo vcrs dismount secret.vc         # unmounts, logs out, stops the server
+```
 
-# terminal 2 (root): log the kernel in, the way `--letter` does on Windows
+The mount point is chosen from the volume's filesystem label (`/media/vcrs/<label>`, with
+`-2`, `-3`… for a second volume with the same label); `--mount-point <DIR>` picks another
+one. `vcrs list` shows what is mounted, where, on which device and under which IQN, and
+`vcrs dismount --all` takes everything off. `--foreground` keeps the old behaviour of
+serving in the terminal (that is what the background command runs internally, and what the
+manual recipe below used to be needed for).
+
+Everything below is only for an initiator that is *not* the Microsoft one and not
+open-iscsi — the two lines `--foreground` prints are the same information a hand-written
+setup needs:
+
+```bash
+# terminal 1: serve in this terminal (Ctrl-C stops it)
+vcrs mount secret.vc -p "correct horse" --foreground
+
+# terminal 2 (root)
 sudo iscsiadm -m discovery -t sendtargets -p 127.0.0.1:3260
 sudo iscsiadm -m node -T iqn.2025-12.io.vcrs:xxxx -l     # → /dev/sdX, partition /dev/sdX1
-sudo mount /dev/sdX1 /mnt/vcrs                           # any filesystem Linux supports
-
-# detach again
-sudo umount /mnt/vcrs
-sudo iscsiadm -m node -T iqn.2025-12.io.vcrs:xxxx -u
-sudo iscsiadm -m node -T iqn.2025-12.io.vcrs:xxxx -o delete
+sudo mount /dev/sdX1 /mnt/vcrs
 ```
+
+Unlike the Microsoft initiator, open-iscsi can scan a portal, so no static target is
+needed and nothing is left in a registry. Verified end to end on Ubuntu 26.04:
+`/dev/sdX1` appeared with the volume's filesystem label, a file written inside it was
+still there when a **fresh** server process served the same container afterwards.
 
 The synthetic MBR (`--disk-mode partition`, the default) is what makes the data area
 show up as `/dev/sdX1`; `--disk-mode raw` presents the bare data area instead, for an

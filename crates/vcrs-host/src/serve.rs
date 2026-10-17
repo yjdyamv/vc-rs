@@ -157,18 +157,11 @@ fn slug(iqn: &str) -> String {
 /// the command line, so it does not end up in a second process's arguments.
 /// The tag that tells the framed stdin payload from a password that simply *is*
 /// all of stdin. The CLI reads the same constant, so the two cannot drift apart.
-pub const STDIN_SECRETS_TAG: &str = "vcrs-stdin-secrets v1";
+pub const STDIN_SECRETS_TAG: &str = vcrs_mount::spawn::STDIN_SECRETS_TAG;
 
-/// Hex, for the framed stdin payload: a password may contain a newline, which is
-/// what a line-per-secret payload would otherwise lose.
+/// Hex, for the framed stdin payload (shared with the Linux mount path).
 fn hex_encode(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(DIGITS[(byte >> 4) as usize] as char);
-        out.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    out
+    vcrs_mount::spawn::hex_encode(bytes)
 }
 
 pub fn spawn(
@@ -638,110 +631,17 @@ pub fn stop(server: &Server, report: &mut Report) -> bool {
     }
 }
 
-/// Whether an *option* names a secret that must not be copied into a second,
-/// long-lived process's command line.
-///
-/// This is a *rule* rather than a list of flag names on purpose. The list this
-/// replaces missed `--hidden-password`, `--protection-password` and the attached
-/// `-phunter2` form, and a list is a thing that goes stale the next time a flag is
-/// added; "no password goes into an argument" does not. Only option-like
-/// arguments are considered: a *container* may well be called `secret.vc`.
-/// (`--password-stdin` and friends match too and are dropped, because the parent
-/// adds its own back.)
-fn is_secret_argument(argument: &str) -> bool {
-    let lower = argument.to_ascii_lowercase();
-    lower.contains("password") || lower.contains("secret") || lower.contains("master-key")
-}
-
 /// This program's own `mount` arguments, minus what only the foreground wants,
-/// plus the pinned target name, the pinned portal and the stdin secrets.
+/// plus the pinned target name, a pinned portal and the stdin secrets.
+///
+/// The rule lives in `vcrs_mount::spawn` because the Linux mount path needs the
+/// same one, and two copies of "no password in an argument" would drift apart.
 fn child_arguments(
     iqn: &str,
     bind: &str,
-    mut iter: impl Iterator<Item = OsString>,
+    iter: impl Iterator<Item = OsString>,
 ) -> Result<Vec<OsString>> {
-    let _exe = iter.next();
-    let subcommand = iter.next();
-    if subcommand.as_deref() != Some(std::ffi::OsStr::new("mount")) {
-        bail!("the background server can only be started from `vcrs mount`");
-    }
-    let mut out: Vec<OsString> = vec![subcommand.expect("checked above")];
-    // With hidden-volume protection the child needs the hidden password too, and
-    // the only way left to hand it over is the pipe.
-    let mut protect_hidden = false;
-    while let Some(arg) = iter.next() {
-        let text = arg.to_string_lossy().to_string();
-        if text == "--protect-hidden" {
-            protect_hidden = true;
-        }
-        match text.as_str() {
-            // The drive letter is dealt with by the parent, and a child that
-            // also asked for it would fight over the same session.
-            "--letter" | "--target-name" | "--bind" => {
-                let _ = iter.next();
-            }
-            // `--foreground` is a switch and takes no value, so the next argument
-            // must not be swallowed with it. The old filter listed it with the
-            // value-taking options and so ate the argument that followed it —
-            // `vcrs mount --foreground secret.vc` lost the container.
-            "--foreground" => {}
-            // Both are re-added below, from the parent's own knowledge.
-            "--password-stdin" | "--hidden-password-stdin" => {}
-            // `-phunter2` is `--password hunter2` in one token, and bare `-p`
-            // takes the next one.
-            "-p" => {
-                let _ = iter.next();
-            }
-            _ if text.starts_with("-p") && !text.starts_with("--") => {}
-            _ if text.starts_with("--letter=")
-                || text.starts_with("--target-name=")
-                || text.starts_with("--bind=") =>
-            {
-                // Skip: the value is inside this argument.
-            }
-            _ if text.starts_with('-') && is_secret_argument(&text) => {
-                // A secret's value goes with it, or it would be left behind as a
-                // stray positional — which clap would then read as the volume.
-                if !text.contains('=') && !text.ends_with("-stdin") {
-                    let _ = iter.next();
-                }
-            }
-            _ => out.push(arg),
-        }
-    }
-    // The parent's summary promises the volume stays mounted until `vcrs
-    // dismount`, so the background server should not linger long after its
-    // session is gone: three seconds is enough for the rescan the default
-    // grace period exists for, and it keeps the dismount from waiting on a
-    // process that is about to exit anyway.
-    if !out
-        .iter()
-        .any(|arg| arg.to_string_lossy().starts_with("--idle-timeout"))
-    {
-        out.push(OsString::from("--idle-timeout"));
-        // Long enough to ride out the initiator dropping and re-establishing its
-        // connection a second after the login (the log shows `Connection closed`
-        // right after `FullFeaturePhase`); with three seconds the server used to
-        // walk away in the middle of its own attach, and the mount then failed
-        // with `Windows did not show the disk`. Once the volume is mounted the
-        // session stays connected, so this grace period is never reached.
-        out.push(OsString::from("30"));
-    }
-    out.push(OsString::from("--target-name"));
-    out.push(OsString::from(iqn));
-    out.push(OsString::from("--bind"));
-    out.push(OsString::from(bind));
-    // The parent only lets a non-loopback bind through when the user asked for it
-    // (`--allow-remote`), so the child has to be told the same thing — it re-runs
-    // the same validation on the arguments it is given.
-    if !crate::attach::is_loopback_addr(bind) {
-        out.push(OsString::from("--allow-remote"));
-    }
-    out.push(OsString::from("--password-stdin"));
-    if protect_hidden {
-        out.push(OsString::from("--hidden-password-stdin"));
-    }
-    Ok(out)
+    vcrs_mount::spawn::child_arguments(iqn, bind, iter).map_err(|err| anyhow::anyhow!("{err}"))
 }
 
 /// Stop this process's console handles from being inherited by the detached

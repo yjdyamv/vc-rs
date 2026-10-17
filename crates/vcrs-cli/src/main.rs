@@ -549,10 +549,18 @@ struct MountArgs {
     /// or the `iscsiadm` lines on Linux, instead).
     #[arg(long, value_name = "LETTER")]
     letter: Option<char>,
-    /// Serve the volume in this terminal even when `--letter` is given (Ctrl-C
-    /// then stops the target).
+    /// Serve the volume in this terminal instead of mounting it and returning.
     #[arg(long)]
     foreground: bool,
+    /// Directory to mount the volume on (instead of `/media/vcrs/<label>`).
+    ///
+    /// Linux has no drive letters: the volume's filesystem is mounted here, and
+    /// `vcrs dismount` unmounts it again. Without this flag the mount point is
+    /// derived from the filesystem label, so `vcrs mount secret.vc` is all a user
+    /// has to type.
+    #[cfg(not(windows))]
+    #[arg(long, value_name = "DIR", conflicts_with = "foreground")]
+    mount_point: Option<PathBuf>,
     #[command(flatten)]
     kind: VolumeKindArgs,
     #[command(flatten)]
@@ -639,6 +647,11 @@ struct DismountArgs {
     /// The target by name, exactly as `vcrs mount` printed it.
     #[arg(long, value_name = "IQN", conflicts_with = "all")]
     iscsi: Option<String>,
+    /// The directory the volume is mounted on (Linux), instead of naming the
+    /// container.
+    #[cfg(not(windows))]
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["iscsi", "letter", "all"])]
+    mount_point: Option<PathBuf>,
     /// Every target vc-rs serves — what a bare `vcrs dismount` does, like
     /// VeraCrypt's `/dismount` without a volume.
     #[arg(long)]
@@ -1497,39 +1510,9 @@ fn run() -> Result<()> {
                 // session and pull in the wrong disk — or be refused outright.
                 iscsi.target_name = format!("{}-hidden", iscsi.target_name);
             }
+            #[cfg(windows)]
             match a.letter {
-                None => {
-                    if json {
-                        // Nothing is mounted yet and the command keeps serving, so
-                        // the document says what a caller needs to attach it.
-                        let hook = |mount: &vcrs_mount::IscsiMount, disk_size: u64| {
-                            println!(
-                                "{}",
-                                serde_json::json!({
-                                    "attached": false,
-                                    "iqn": mount.target_name(),
-                                    "address": mount.addr().to_string(),
-                                    "disk_size": disk_size,
-                                    "mount_point": serde_json::Value::Null,
-                                })
-                            );
-                        };
-                        vcrs_mount::mount_iscsi_with(&a.path, &options, &iscsi, Some(&hook))?
-                    } else {
-                        vcrs_mount::mount_iscsi(&a.path, &options, &iscsi)?
-                    }
-                }
-                // On this platform there is no drive letter to put the volume
-                // on: the target is served and the platform's own initiator logs
-                // in to it, which is what the `None` arm does.
-                #[cfg(not(windows))]
-                Some(_) => bail!(
-                    "--letter needs the Microsoft iSCSI Initiator, which only Windows has; on \
-                     this platform `vcrs mount <volume>` serves the target and your own \
-                     initiator logs in to it (open-iscsi: `iscsiadm -m discovery -t sendtargets \
-                     -p <address>`, then `iscsiadm -m node -T <iqn> -l`)"
-                ),
-                #[cfg(windows)]
+                None => serve_in_foreground(&a.path, &options, &iscsi, json)?,
                 Some(letter) => {
                     // Refuse a letter that cannot work before a target is left
                     // running behind it.
@@ -1623,6 +1606,26 @@ fn run() -> Result<()> {
                     vcrs_mount::mount_iscsi_with(&a.path, &options, &iscsi, Some(&hook))?;
                 }
             }
+            // Without the Windows initiator there is no drive letter to attach
+            // to, so the default is the other thing a user wants from `vcrs
+            // mount`: mount the volume and give the prompt back. `--foreground`
+            // still serves in this terminal.
+            #[cfg(not(windows))]
+            {
+                if a.letter.is_some() {
+                    bail!(
+                        "--letter is a Windows drive letter; on this platform the volume is \
+                         mounted on a directory (chosen from the filesystem label, or pass \
+                         --mount-point <DIR>)"
+                    );
+                }
+                if a.foreground {
+                    serve_in_foreground(&a.path, &options, &iscsi, json)?;
+                } else {
+                    mount_on_this_host(&a, &options, &iscsi, json)?;
+                    return Ok(());
+                }
+            }
             println!("iSCSI target stopped");
             Ok(())
         }
@@ -1631,7 +1634,7 @@ fn run() -> Result<()> {
             {
                 let _ = &a;
                 bail!(
-                    "attaching a served target to a drive letter drives the Microsoft iSCSI Initiator, which only Windows has; on this platform `vcrs mount <volume>` serves the target and your own initiator logs in to it (open-iscsi: `iscsiadm -m discovery -t sendtargets -p <address>`, then `iscsiadm -m node -T <iqn> -l`)"
+                    "attaching a served target to a drive letter drives the Microsoft iSCSI Initiator, which only Windows has; on this platform `vcrs mount <volume>` logs in through open-iscsi and mounts the filesystem itself, so there is nothing to attach by hand"
                 );
             }
             #[cfg(windows)]
@@ -1703,10 +1706,52 @@ fn run() -> Result<()> {
         Command::Dismount(a) => {
             #[cfg(not(windows))]
             {
-                let _ = &a;
-                bail!(
-                    "dismounting drives the Microsoft iSCSI Initiator, which only Windows has; on this platform log the session out with your own initiator (open-iscsi: `iscsiadm -m node -u`)"
-                );
+                use vcrs_mount::initiator;
+                let hint = match (&a.path, &a.iscsi, &a.mount_point) {
+                    (Some(path), _, _) => format!("sudo vcrs dismount {}", path.display()),
+                    (_, Some(iqn), _) => format!("sudo vcrs dismount --iscsi {iqn}"),
+                    (_, _, Some(dir)) => format!("sudo vcrs dismount --mount-point {}", dir.display()),
+                    (None, None, None) => "sudo vcrs dismount --all".to_string(),
+                };
+                need_root("unmount a volume", &hint)?;
+                let mounted = initiator::sessions();
+                let chosen: Vec<initiator::Session> = match (&a.path, &a.iscsi, &a.mount_point) {
+                    (Some(path), _, _) => mounted
+                        .iter()
+                        .filter(|session| same_file(&session.container, path))
+                        .cloned()
+                        .collect(),
+                    (None, _, Some(point)) => mounted
+                        .iter()
+                        .filter(|session| same_file(&session.mount_point, point))
+                        .cloned()
+                        .collect(),
+                    (None, Some(iqn), None) => mounted
+                        .iter()
+                        .filter(|session| &session.iqn == iqn)
+                        .cloned()
+                        .collect(),
+                    (None, None, None) => mounted.clone(),
+                };
+                if chosen.is_empty() {
+                    println!("no vcrs volume is mounted");
+                    return Ok(());
+                }
+                let mut problems: Vec<String> = Vec::new();
+                for session in &chosen {
+                    match initiator::unmount(session) {
+                        Ok(()) => println!(
+                            "unmounted {} ({}): the volume is closed",
+                            session.mount_point.display(),
+                            session.container.display()
+                        ),
+                        Err(err) => problems.push(format!("{err}")),
+                    }
+                }
+                if !problems.is_empty() {
+                    return Err(anyhow::anyhow!("{}", problems.join("\n")));
+                }
+                Ok(())
             }
             #[cfg(windows)]
             {
@@ -2176,11 +2221,209 @@ fn create_keyfile(a: &CreateKeyfileArgs) -> Result<()> {
 
 /// List the iSCSI sessions (ours, or all of them), the serving processes and the
 /// disks Windows has.
+/// Serve a volume over iSCSI in this terminal.
+fn serve_in_foreground(
+    path: &Path,
+    options: &OpenOptions,
+    iscsi: &vcrs_mount::IscsiMountOptions,
+    json: bool,
+) -> Result<()> {
+    // Say so before the slow part: unlocking tries every layout, PRF and cipher
+    // in turn, which a wrong password or PIM makes take a long time (and whoever
+    // started this process is waiting for the line below in the log).
+    eprintln!("opening {} …", path.display());
+    if json {
+        // Nothing is mounted yet and the command keeps serving, so the document
+        // says what a caller needs to attach it.
+        let hook = |mount: &vcrs_mount::IscsiMount, disk_size: u64| {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "attached": false,
+                    "iqn": mount.target_name(),
+                    "address": mount.addr().to_string(),
+                    "disk_size": disk_size,
+                    "mount_point": serde_json::Value::Null,
+                })
+            );
+        };
+        vcrs_mount::mount_iscsi_with(path, options, iscsi, Some(&hook))?;
+    } else {
+        vcrs_mount::mount_iscsi(path, options, iscsi)?;
+    }
+    Ok(())
+}
+
+/// Mounting and unmounting are root's business; say so instead of letting
+/// `iscsiadm` or `mount` fail with a permission error that looks like a bug.
+#[cfg(not(windows))]
+fn need_root(what: &str, how: &str) -> Result<()> {
+    if vcrs_mount::initiator::is_root() {
+        return Ok(());
+    }
+    let reason = format!("to {what} this program needs root: an iSCSI login creates a block device");
+    let because = "and mount(8) needs CAP_SYS_ADMIN";
+    bail!("{reason} {because}. Run\n  {how}\ninstead of the same command without `sudo`")
+}
+
+/// Whether two paths name the same file, without requiring either to exist.
+#[cfg(not(windows))]
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// Mount a volume with one command: hand it to a detached copy of this program,
+/// log in with the system's iSCSI initiator, and put the filesystem on a
+/// directory.
+#[cfg(not(windows))]
+fn mount_on_this_host(
+    a: &MountArgs,
+    options: &OpenOptions,
+    iscsi: &vcrs_mount::IscsiMountOptions,
+    json: bool,
+) -> Result<()> {
+    use vcrs_mount::initiator;
+    need_root(
+        "mount a volume",
+        &format!("sudo vcrs mount {}", a.path.display()),
+    )?;
+    // Serving one container twice would give two servers writing the same file.
+    if let Some(existing) = vcrs_mount::initiator::sessions()
+        .into_iter()
+        .find(|session| same_file(&session.container, &a.path))
+    {
+        println!(
+            "{} is already mounted on {} (`vcrs dismount {}` takes it off)",
+            a.path.display(),
+            existing.mount_point.display(),
+            a.path.display()
+        );
+        return Ok(());
+    }
+    // Unlock once here, for the same reason `--foreground` is slow to say no: a
+    // wrong password makes the trial loop run every layout with every PRF, and
+    // Argon2 alone takes about half a minute, so the server would sit silent far
+    // past the wait for its ready line. This also fails before anything is
+    // spawned, so a typo leaves no log behind.
+    drop(vcrs_core::Volume::open(&a.path, options)?);
+    let log = initiator::log_path(&iscsi.target_name);
+    let mut child = vcrs_mount::spawn::child_arguments(
+        &iscsi.target_name,
+        &iscsi.bind_addr,
+        std::env::args_os(),
+    )
+    .map_err(|err| anyhow::anyhow!("{err}"))?;
+    // The child has to serve in the foreground: without `--letter` the default
+    // `vcrs mount` is the one that attaches, so a child that did not ask to serve
+    // would try to mount the volume again — and again.
+    child.push(std::ffi::OsString::from("--foreground"));
+    let hidden_password: &[u8] = iscsi
+        .protect_hidden
+        .as_ref()
+        .map(|hidden| hidden.password.as_slice())
+        .unwrap_or(&[]);
+    let mut detached = vcrs_mount::spawn::spawn_detached(
+        &child,
+        &[options.password.as_slice(), hidden_password],
+        &log,
+    )
+    .map_err(|err| anyhow::anyhow!("{err}"))?;
+    let pid = detached.pid();
+    let cleanup = |pid: u32| {
+        initiator::stop(pid);
+        let _ = std::fs::remove_file(&log);
+    };
+    if let Err(err) = vcrs_mount::spawn::wait_for_ready(
+        &mut detached,
+        &log,
+        "iSCSI target ready",
+        initiator::READY_WAIT,
+    ) {
+        cleanup(pid);
+        return Err(anyhow::anyhow!("{err}"));
+    }
+    let container = a.path.canonicalize().unwrap_or_else(|_| a.path.clone());
+    let session = match initiator::mount_served(
+        &iscsi.target_name,
+        &iscsi.bind_addr,
+        &container,
+        a.mount_point.as_deref(),
+        pid,
+        log.clone(),
+    ) {
+        Ok(session) => session,
+        Err(err) => {
+            cleanup(pid);
+            return Err(anyhow::anyhow!("{err}"));
+        }
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "attached": true,
+                "iqn": session.iqn,
+                "address": session.portal,
+                "container": session.container.display().to_string(),
+                "device": session.device.display().to_string(),
+                "mount_point": session.mount_point.display().to_string(),
+                "pid": session.pid,
+            })
+        );
+        return Ok(());
+    }
+    println!(
+        "mounted {} on {}",
+        a.path.display(),
+        session.mount_point.display()
+    );
+    println!(
+        "`vcrs dismount {}` takes it off again (that needs `sudo` too).",
+        a.path.display()
+    );
+    Ok(())
+}
+
 fn list_mounts(a: &ListArgs, json: bool) -> Result<()> {
     #[cfg(not(windows))]
     {
-        let _ = (a, json);
-        bail!("listing iSCSI sessions needs the Microsoft iSCSI Initiator (Windows only)");
+        let _ = a;
+        let sessions = vcrs_mount::initiator::sessions();
+        if json {
+            let listed: Vec<serde_json::Value> = sessions
+                .iter()
+                .map(|session| {
+                    serde_json::json!({
+                        "iqn": session.iqn,
+                        "address": session.portal,
+                        "container": session.container.display().to_string(),
+                        "device": session.device.display().to_string(),
+                        "mount_point": session.mount_point.display().to_string(),
+                        "pid": session.pid,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&listed)?);
+            return Ok(());
+        }
+        if sessions.is_empty() {
+            println!("no vcrs volume is mounted");
+        } else {
+            for session in &sessions {
+                println!(
+                    "{} on {}  (device {}, {}, pid {})",
+                    session.container.display(),
+                    session.mount_point.display(),
+                    session.device.display(),
+                    session.iqn,
+                    session.pid
+                );
+            }
+        }
+        Ok(())
     }
     #[cfg(windows)]
     {
