@@ -252,8 +252,11 @@ what keeps another local user's process off the loopback port. It is not a crypt
 secret: anyone who can read the container can derive it, and they could attack the
 container offline anyway. Details: `docs/research/security-review.md`.
 
-`--password-stdin` (raw bytes) and `$VCRS_PASSWORD` are supported; prefer those over
-`--password` for anything real, since command lines are visible to other processes. At a
+`--password-stdin` (raw bytes), `--password-file PATH` (its first line) and
+`$VCRS_PASSWORD` are supported; prefer those over `--password` for anything real, since
+command lines are visible to other processes. `--password-file` also has a spelling for
+every other credential `vcrs` reads (`--new-password-file`, `--hidden-password-file`,
+`--master-key-file`), and it warns when the file is readable by other users. At a
 terminal with none of them given, `vcrs` asks for the password itself with the echo
 off — and asks twice when it is *setting* a new one (`create`, `--new-password`), so one
 typo cannot lock a volume away. A piped stdin keeps the old immediate refusal, so a

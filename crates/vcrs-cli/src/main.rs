@@ -214,6 +214,13 @@ struct PasswordArgs {
     /// Read the password from stdin (raw bytes, one trailing newline trimmed).
     #[arg(long, conflicts_with = "password")]
     password_stdin: bool,
+    /// Read the password from the first line of a file.
+    ///
+    /// The file has to be readable by this program only: unlike `--password`, the
+    /// secret never appears in the argument list (which every process on the
+    /// machine can read) and unlike `--password-stdin` nothing has to be piped in.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["password", "password_stdin"])]
+    password_file: Option<PathBuf>,
     /// Personal iterations multiplier (0 = VeraCrypt default).
     #[arg(long, default_value_t = 0, value_parser = parse_pim)]
     pim: i32,
@@ -232,7 +239,9 @@ impl PasswordArgs {
         read_password(
             self.password.as_deref(),
             self.password_stdin,
-            "no password given (use --password, $VCRS_PASSWORD or --password-stdin)",
+            self.password_file.as_deref(),
+            "no password given (use --password, $VCRS_PASSWORD, --password-file \
+             or --password-stdin)",
             false,
             self.slot,
         )
@@ -241,7 +250,10 @@ impl PasswordArgs {
     /// True when a credential was supplied, so a volume can be opened without
     /// having to ask.
     fn is_given(&self) -> bool {
-        self.password.is_some() || self.password_stdin || !self.keyfiles.is_empty()
+        self.password.is_some()
+            || self.password_stdin
+            || self.password_file.is_some()
+            || !self.keyfiles.is_empty()
     }
     fn open_options(
         &self,
@@ -363,10 +375,14 @@ fn hex_decode(text: &str) -> Option<Vec<u8>> {
 fn read_password(
     value: Option<&str>,
     from_stdin: bool,
+    from_file: Option<&Path>,
     missing: &str,
     fresh: bool,
     slot: SecretSlot,
 ) -> Result<Vec<u8>> {
+    if let Some(path) = from_file {
+        return password_from_file(path);
+    }
     if from_stdin {
         if let Some(mut secrets) = stdin_secrets() {
             // The parent framed them, so the raw form's newline trimming does not
@@ -403,6 +419,61 @@ fn read_password(
     }
 }
 
+/// The largest password file worth reading.
+const PASSWORD_FILE_LIMIT: u64 = 64 * 1024;
+
+/// Read a password from the first line of a file.
+///
+/// A file is the one way to hand a password over without putting it in the
+/// argument list (visible to every process) or in an environment variable
+/// (inherited by everything the process starts).
+fn password_from_file(path: &Path) -> Result<Vec<u8>> {
+    secret_from_file(path, "password")
+}
+
+/// Read a secret from the first line of a file. `what` names the secret in the
+/// messages, so a master key does not complain about a "password file".
+fn secret_from_file(path: &Path, what: &str) -> Result<Vec<u8>> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("cannot read the {what} file {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("the {what} file {} is not a regular file", path.display());
+    }
+    if metadata.len() > PASSWORD_FILE_LIMIT {
+        bail!(
+            "the {what} file {} holds {} bytes; such a file has to be a single line",
+            path.display(),
+            metadata.len()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            eprintln!(
+                "warning: the {what} file {} is readable by other users; \
+                 `chmod 600 {}` keeps its contents to you",
+                path.display(),
+                path.display()
+            );
+        }
+    }
+    let mut buf = std::fs::read(path)
+        .with_context(|| format!("cannot read the {what} file {}", path.display()))?;
+    // The first line is the secret: a line editor leaves one newline behind, and
+    // a password with a newline in it could not be typed at the prompt either.
+    if let Some(end) = buf.iter().position(|byte| *byte == b'\n') {
+        buf.truncate(end);
+    }
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    if buf.is_empty() {
+        bail!("the {what} file {} is empty", path.display());
+    }
+    Ok(buf)
+}
+
 /// The credentials to put into a header, for `vcrs change`. VeraCrypt's
 /// change-password dialog asks for the same fields.
 #[derive(Args, Clone)]
@@ -417,6 +488,16 @@ struct NewPasswordArgs {
     /// Read the new password from stdin (raw bytes, one trailing newline trimmed).
     #[arg(long = "new-password-stdin", conflicts_with = "new_password")]
     new_password_stdin: bool,
+    /// Read the new password from the first line of a file.
+    ///
+    /// The file has to be readable by this program only: unlike `--new-password`,
+    /// the secret never appears in the argument list.
+    #[arg(
+        long = "new-password-file",
+        value_name = "PATH",
+        conflicts_with_all = ["new_password", "new_password_stdin"]
+    )]
+    new_password_file: Option<PathBuf>,
     /// New keyfile (repeatable); replaces the volume's current keyfiles.
     #[arg(long = "new-keyfile", value_name = "PATH", action = clap::ArgAction::Append)]
     new_keyfiles: Vec<PathBuf>,
@@ -434,8 +515,9 @@ impl NewPasswordArgs {
         read_password(
             self.new_password.as_deref(),
             self.new_password_stdin,
-            "no new password given (use --new-password, $VCRS_NEW_PASSWORD or \
-             --new-password-stdin)",
+            self.new_password_file.as_deref(),
+            "no new password given (use --new-password, $VCRS_NEW_PASSWORD, \
+             --new-password-file or --new-password-stdin)",
             true,
             SecretSlot::New,
         )
@@ -762,7 +844,7 @@ struct BackupHeadersArgs {
 
 /// Restores a header from one of the three sources.
 #[derive(Args)]
-#[command(group = clap::ArgGroup::new("source").required(true).args(["from", "embedded", "master_key", "master_key_stdin"]))]
+#[command(group = clap::ArgGroup::new("source").required(true).args(["from", "embedded", "master_key", "master_key_stdin", "master_key_file"]))]
 struct RestoreHeadersArgs {
     /// Volume file whose header is restored.
     path: PathBuf,
@@ -782,6 +864,9 @@ struct RestoreHeadersArgs {
     /// and the master key opens the data area on its own.
     #[arg(long, conflicts_with = "master_key")]
     master_key_stdin: bool,
+    /// Read the master key, in hex, from the first line of a file.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["master_key", "master_key_stdin"])]
+    master_key_file: Option<PathBuf>,
     /// Size of the volume's data area when rebuilding from a master key. An
     /// ordinary volume's data area is `container size - 262144` and is computed
     /// automatically; a hidden volume's has to be given here.
@@ -907,6 +992,13 @@ struct HiddenProtectionArgs {
     /// Read the hidden volume's password from stdin (raw bytes).
     #[arg(long = "hidden-password-stdin", conflicts_with = "hidden_password")]
     hidden_password_stdin: bool,
+    /// Read the hidden volume's password from the first line of a file.
+    #[arg(
+        long = "hidden-password-file",
+        value_name = "PATH",
+        conflicts_with_all = ["hidden_password", "hidden_password_stdin"]
+    )]
+    hidden_password_file: Option<PathBuf>,
     /// PIM of the hidden volume.
     #[arg(
         long = "hidden-pim",
@@ -931,15 +1023,19 @@ impl HiddenProtectionArgs {
         if !self.protect_hidden {
             if self.hidden_password.is_some()
                 || self.hidden_password_stdin
+                || self.hidden_password_file.is_some()
                 || !self.hidden_keyfiles.is_empty()
             {
-                bail!("--hidden-password/--hidden-pim/--hidden-keyfile need --protect-hidden");
+                bail!(
+                    "--hidden-password/--hidden-pim/--hidden-keyfile need --protect-hidden"
+                );
             }
             return Ok(None);
         }
         let creds = PasswordArgs {
             password: self.hidden_password.clone(),
             password_stdin: self.hidden_password_stdin,
+            password_file: self.hidden_password_file.clone(),
             pim: self.hidden_pim,
             keyfiles: self.hidden_keyfiles.clone(),
             slot: SecretSlot::Hidden,
@@ -3195,30 +3291,39 @@ fn default_header_backup_path(path: &Path) -> PathBuf {
 fn restore_headers(a: &RestoreHeadersArgs) -> Result<()> {
     let volume_type = a.kind.volume_type().unwrap_or(VolumeType::Normal);
 
-    if a.data_size.is_some() && a.master_key.is_none() && !a.master_key_stdin {
+    if a.data_size.is_some()
+        && a.master_key.is_none()
+        && !a.master_key_stdin
+        && a.master_key_file.is_none()
+    {
         bail!(
             "--data-size says how big the volume's data area was, so it only means something \
-             together with --master-key or --master-key-stdin"
+             together with --master-key, --master-key-file or --master-key-stdin"
         );
     }
 
     // The master key opens the data area on its own, so the command line is the
     // worst place to put it: any process that can read this one's command line
     // (Task Manager, WMI, an audit log) gets the volume with it.
-    let master_key = match (&a.master_key, a.master_key_stdin) {
-        (Some(key), _) => {
+    let master_key = match (&a.master_key, a.master_key_stdin, &a.master_key_file) {
+        (Some(key), _, _) => {
             eprintln!(
                 "warning: --master-key puts the master key in this process's command line, where\n  \
                  any process that can read it sees it, and in the shell's history. Use\n  \
-                 --master-key-stdin to read it from a pipe or from the terminal without echo."
+                 --master-key-stdin to read it from a pipe or from the terminal without echo,\n  \
+                 or --master-key-file to read it from a file only you can read."
             );
             Some(key.clone())
         }
-        (None, true) => Some(prompt::secret_line(
+        (None, true, _) => Some(prompt::secret_line(
             "Master key (hex, not shown): ",
             "no master key was given",
         )?),
-        (None, false) => None,
+        (None, false, Some(path)) => {
+            let bytes = secret_from_file(path, "master key")?;
+            Some(String::from_utf8_lossy(&bytes).into_owned())
+        }
+        (None, false, None) => None,
     };
 
     if let Some(key) = &master_key {
@@ -3269,7 +3374,10 @@ fn restore_headers(a: &RestoreHeadersArgs) -> Result<()> {
     } else if a.embedded {
         vcrs_core::restore_headers_from_embedded(&a.path, volume_type, verify.as_ref())?
     } else {
-        bail!("pass --from <FILE>, --embedded, --master-key <HEX> or --master-key-stdin")
+        bail!(
+            "pass --from <FILE>, --embedded, --master-key <HEX>, --master-key-file <PATH> \
+             or --master-key-stdin"
+        )
     };
 
     match volume {
@@ -3406,8 +3514,8 @@ fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_read_range, format_master_key, human_size, parse_sector_size, refuse_to_clobber, Cli,
-        Command,
+        check_read_range, format_master_key, human_size, parse_sector_size, password_from_file,
+        refuse_to_clobber, Cli, Command,
     };
     use clap::Parser;
 
@@ -3463,6 +3571,42 @@ mod tests {
         assert!(check_read_range(65536, 999_999_999_999, 1).is_err());
         assert!(check_read_range(65536, u64::MAX, 1).is_err());
         assert!(check_read_range(u64::MAX, 0, u64::MAX).is_ok());
+    }
+
+    #[test]
+    fn a_password_file_gives_its_first_line() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("vcrs-password-file-test.txt");
+
+        std::fs::write(&path, "hunter2\n").unwrap();
+        assert_eq!(password_from_file(&path).unwrap(), b"hunter2".to_vec());
+
+        // A CRLF line, i.e. a file written on this platform, loses both bytes.
+        std::fs::write(&path, "hunter2\r\n").unwrap();
+        assert_eq!(password_from_file(&path).unwrap(), b"hunter2".to_vec());
+
+        // No newline at all is fine, and so is a password with a space in it.
+        std::fs::write(&path, "pass phrase").unwrap();
+        assert_eq!(password_from_file(&path).unwrap(), b"pass phrase".to_vec());
+
+        // A password that is only a newline is empty, which is not a password.
+        std::fs::write(&path, "\n").unwrap();
+        let err = password_from_file(&path).unwrap_err();
+        assert!(err.to_string().contains("is empty"), "unexpected: {err}");
+
+        std::fs::write(&path, "hunter2\nsecond line\n").unwrap();
+        assert_eq!(
+            password_from_file(&path).unwrap(),
+            b"hunter2".to_vec(),
+            "VeraCrypt looks at the first line only"
+        );
+
+        // A directory, a missing file and a file that cannot be a password are
+        // all refused instead of being read as empty.
+        assert!(password_from_file(&dir).is_err());
+        assert!(password_from_file(&dir.join("vcrs-password-file-missing.txt")).is_err());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
