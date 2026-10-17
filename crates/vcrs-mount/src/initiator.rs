@@ -27,6 +27,12 @@ pub const READY_WAIT: Duration = Duration::from_secs(60);
 /// How long the kernel gets to produce `/dev/disk/by-path/...` after a login.
 const DISK_WAIT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(200);
+/// How long a partitioned volume's disk may exist without a partition node
+/// before the disk itself is taken to be what the initiator published. The
+/// kernel creates the disk node first and scans it for partitions afterwards, so
+/// the partition node can lag by a few hundred milliseconds — mounting the disk
+/// in that window reads the partition table as if it were the filesystem.
+const PARTITION_GRACE: Duration = Duration::from_secs(5);
 /// How many times `umount` is retried before giving up (a process still holding
 /// a file open is the usual reason for the first refusal).
 const UMOUNT_TRIES: u32 = 5;
@@ -386,25 +392,40 @@ enum DeviceChoice {
 /// creates a partition node and that is where the filesystem is; raw mode has no
 /// partition table, so the disk itself is the filesystem.  Raw mode ignores a
 /// partition node on purpose: a stale one would be the wrong device.
-fn pick_device(raw: bool, disk: bool, part: bool) -> Option<DeviceChoice> {
+/// Which node to mount.
+///
+/// `settled` says the disk has been there for [`PARTITION_GRACE`] with no
+/// partition node next to it, so the volume really is laid out as a bare disk.
+fn pick_device(raw: bool, disk: bool, part: bool, settled: bool) -> Option<DeviceChoice> {
     if raw {
         disk.then_some(DeviceChoice::Disk)
     } else if part {
         Some(DeviceChoice::Partition)
-    } else {
-        // No partition: either udev has not got there yet, or the initiator sees
-        // the raw layout.  The disk is still worth a try, and `mount` will say no.
+    } else if settled {
+        // No partition: either the volume is not partitioned at all (a raw image,
+        // `--disk-mode raw`), or its partition table has no entry the kernel
+        // knows. The disk is still worth a try, and `mount` will say no.
         disk.then_some(DeviceChoice::Disk)
+    } else {
+        None
     }
 }
 
 /// Wait for the kernel to publish the disk, and return the device to mount.
 fn wait_for_device(portal: &str, iqn: &str, raw: bool) -> Result<PathBuf> {
     let start = Instant::now();
+    let mut disk_seen: Option<Instant> = None;
     loop {
         let disk = by_path(portal, iqn, "");
         let part = by_path(portal, iqn, "-part1");
-        if let Some(choice) = pick_device(raw, disk.exists(), part.exists()) {
+        let disk_exists = disk.exists();
+        if disk_exists && disk_seen.is_none() {
+            disk_seen = Some(Instant::now());
+        }
+        let settled = disk_seen
+            .map(|seen| seen.elapsed() >= PARTITION_GRACE)
+            .unwrap_or(false);
+        if let Some(choice) = pick_device(raw, disk_exists, part.exists(), settled) {
             // Give udev a moment to finish the partition scan before deciding,
             // except in raw mode, where there is no partition to wait for.
             if !raw {
@@ -934,13 +955,20 @@ mod tests {
     fn the_disk_mode_decides_which_node_is_mounted() {
         use DeviceChoice::{Disk, Partition};
         // Raw mode: the disk itself, even if a partition node is lying around.
-        assert_eq!(pick_device(true, true, true), Some(Disk));
-        assert_eq!(pick_device(true, true, false), Some(Disk));
-        assert_eq!(pick_device(true, false, true), None);
-        // Partitioned mode prefers the partition, and falls back to the disk.
-        assert_eq!(pick_device(false, true, true), Some(Partition));
-        assert_eq!(pick_device(false, true, false), Some(Disk));
-        assert_eq!(pick_device(false, false, false), None);
+        assert_eq!(pick_device(true, true, true, false), Some(Disk));
+        assert_eq!(pick_device(true, true, false, false), Some(Disk));
+        assert_eq!(pick_device(true, false, true, true), None);
+        // Partitioned mode prefers the partition, whenever it turns up.
+        assert_eq!(pick_device(false, true, true, false), Some(Partition));
+        assert_eq!(pick_device(false, true, true, true), Some(Partition));
+        // A disk whose partition node has not appeared yet is not mounted: the
+        // kernel publishes the disk before it scans the partition table, and
+        // mounting the disk in that window fails on the partition table.
+        assert_eq!(pick_device(false, true, false, false), None);
+        // Once the grace period is over, a disk with no partition is what the
+        // volume is: an unpartitioned image.
+        assert_eq!(pick_device(false, true, false, true), Some(Disk));
+        assert_eq!(pick_device(false, false, false, true), None);
     }
 
     #[test]
