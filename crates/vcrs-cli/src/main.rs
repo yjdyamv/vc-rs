@@ -1623,6 +1623,26 @@ fn run() -> Result<()> {
                     // running behind it.
                     let letter = attach::check_letter(letter)?;
                     if !a.foreground {
+                        // Serving one container twice would give the volume two
+                        // servers writing the same data area. The Linux path
+                        // refuses this too, from its own state files.
+                        if let Some(existing) = serve::serving(&a.path) {
+                            println!(
+                                "{} is already mounted{}{} (`vcrs dismount {}` takes it off)",
+                                a.path.display(),
+                                match existing.letter {
+                                    Some(letter) => format!(" on {letter}:"),
+                                    None => String::new(),
+                                },
+                                if existing.iqn.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" (target {})", existing.iqn)
+                                },
+                                a.path.display()
+                            );
+                            return Ok(());
+                        }
                         // With `--letter` the mount is finished by the time this
                         // command returns, so holding the terminal open for as
                         // long as the volume stays mounted buys nothing. The
@@ -1643,6 +1663,7 @@ fn run() -> Result<()> {
                             &iscsi.target_name,
                             &[options.password.as_slice(), hidden_password],
                             Some(letter),
+                            &a.path,
                             &iscsi.bind_addr,
                             &mut report,
                         )?;

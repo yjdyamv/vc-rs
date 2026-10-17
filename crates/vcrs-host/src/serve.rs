@@ -57,6 +57,9 @@ pub struct Server {
     /// The drive letter the volume was mounted on, so `vcrs dismount --letter`
     /// finds this server even after its session is gone.
     pub letter: Option<char>,
+    /// The container being served, so a second mount of the same file can be
+    /// refused: two servers on one container are two writers to one data area.
+    pub container: Option<PathBuf>,
 }
 
 impl Server {
@@ -168,6 +171,7 @@ pub fn spawn(
     iqn: &str,
     secrets: &[&[u8]],
     letter: Option<char>,
+    container: &std::path::Path,
     bind: &str,
     report: &mut Report,
 ) -> Result<Server> {
@@ -215,6 +219,7 @@ pub fn spawn(
         pid: child.id(),
         log,
         letter,
+        container: Some(container.to_path_buf()),
     };
 
     // The secrets are framed rather than sent raw: the hidden volume's password has
@@ -309,6 +314,9 @@ pub fn remember(server: &Server) -> Result<()> {
     if let Some(letter) = server.letter {
         text.push_str(&format!("letter={letter}\n"));
     }
+    if let Some(container) = &server.container {
+        text.push_str(&format!("container={}\n", container.display()));
+    }
     fs::write(&state, text).with_context(|| format!("writing {}", state.display()))?;
     Ok(())
 }
@@ -319,8 +327,7 @@ pub fn state(iqn: &str) -> Option<Server> {
 }
 
 /// Every server still recorded, newest state files included.
-pub fn states() -> Vec<Server> {
-    let Ok(entries) = fs::read_dir(state_dir()) else {
+pub fn states() -> Vec<Server> {    let Ok(entries) = fs::read_dir(state_dir()) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -337,6 +344,50 @@ pub fn states() -> Vec<Server> {
     out
 }
 
+/// The live server that is serving this container, if there is one.
+///
+/// Serving one container twice gives the volume two servers, two page caches and
+/// two writers to one data area, so whichever flushes last wins and everything
+/// the other wrote in between is lost. VeraCrypt refuses the same thing ("the
+/// volume is already mounted").
+pub fn serving(container: &std::path::Path) -> Option<Server> {
+    let wanted = container.canonicalize().unwrap_or_else(|_| container.to_path_buf());
+    states().into_iter().find(|server| {
+        server
+            .container
+            .as_ref()
+            .map(|served| served == &wanted || served.canonicalize().map(|p| p == wanted).unwrap_or(false))
+            .unwrap_or(false)
+            && is_running(server.pid)
+    })
+}
+
+/// Whether a process id is a living process.
+pub fn is_running(pid: u32) -> bool {
+    #[cfg(windows)]
+    unsafe {
+        use winapi::um::handleapi::CloseHandle;
+        use winapi::um::processthreadsapi::{GetExitCodeProcess, OpenProcess};
+        use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
+
+        const STILL_ACTIVE: u32 = 259;
+
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut code = 0;
+        let running = GetExitCodeProcess(handle, &mut code) != 0 && code == STILL_ACTIVE;
+        CloseHandle(handle);
+        running
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// The server a state file describes. The file is the source of truth: the
 /// slugged file name cannot be turned back into an IQN exactly.
 fn read_state(path: &std::path::Path) -> Option<Server> {
@@ -345,6 +396,7 @@ fn read_state(path: &std::path::Path) -> Option<Server> {
     let mut log = None;
     let mut iqn = None;
     let mut letter = None;
+    let mut container = None;
     for line in text.lines() {
         match line.split_once('=') {
             Some(("pid", value)) => pid = value.trim().parse::<u32>().ok(),
@@ -361,6 +413,9 @@ fn read_state(path: &std::path::Path) -> Option<Server> {
             }
             Some(("iqn", value)) => iqn = Some(value.trim().to_string()),
             Some(("letter", value)) => letter = value.trim().chars().next(),
+            // Only ever used to compare and to print, never opened, so no path
+            // check is needed here.
+            Some(("container", value)) => container = Some(PathBuf::from(value.trim())),
             _ => {}
         }
     }
@@ -376,6 +431,7 @@ fn read_state(path: &std::path::Path) -> Option<Server> {
         pid: pid?,
         log: log.unwrap_or_else(|| Server::log_path("")),
         letter,
+        container,
     })
 }
 
@@ -900,6 +956,7 @@ mod tests {
             pid: 1,
             log: state_dir().join("vcrs-serve-size-test.log"),
             letter: None,
+            container: None,
         };
         fs::write(
             &server.log,
@@ -909,6 +966,38 @@ mod tests {
         .expect("write");
         assert_eq!(disk_size(&server), Some(11272192));
         let _ = fs::remove_file(&server.log);
+    }
+
+    #[test]
+    fn a_container_that_is_being_served_is_found() {
+        let dir = state_dir();
+        let _ = fs::create_dir_all(&dir);
+        let container = std::env::temp_dir().join("vcrs-serving-test.vc");
+        fs::write(&container, b"x").expect("write");
+        let iqn = "iqn.2025-12.io.vcrs:serving-test-8b1f";
+        let state = Server::state_path(iqn);
+        fs::write(
+            &state,
+            format!(
+                "iqn={iqn}\npid={}\nlog={}\ncontainer={}\n",
+                std::process::id(),
+                Server::log_path(iqn).display(),
+                container.display()
+            ),
+        )
+        .expect("write");
+
+        // The same file under another spelling of the path counts as the same
+        // container, and the process serving it is this (living) one.
+        assert!(serving(&container).is_some());
+        assert!(serving(&std::env::temp_dir().join(".").join("vcrs-serving-test.vc")).is_some());
+        assert!(serving(&std::env::temp_dir().join("vcrs-serving-other.vc")).is_none());
+
+        // A record whose process is gone is a leftover, not a mount.
+        assert!(serving(&container).is_some());
+        fs::remove_file(&state).expect("remove");
+        assert!(serving(&container).is_none());
+        let _ = fs::remove_file(&container);
     }
 
     #[test]
@@ -922,8 +1011,9 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "pid=4242\nlog={}\niqn=iqn.2025-12.io.vcrs:secret\nletter=Y\n",
-                log.display()
+                "pid=4242\nlog={}\niqn=iqn.2025-12.io.vcrs:secret\nletter=Y\ncontainer={}\n",
+                log.display(),
+                std::env::temp_dir().join("secret.vc").display()
             ),
         )
         .expect("write");
@@ -932,6 +1022,11 @@ mod tests {
         assert_eq!(server.iqn, "iqn.2025-12.io.vcrs:secret");
         assert_eq!(server.log, log);
         assert_eq!(server.letter, Some('Y'));
+        // The container is what a second mount is compared against.
+        assert_eq!(
+            server.container,
+            Some(std::env::temp_dir().join("secret.vc"))
+        );
 
         // A `log=` that points outside the temporary directory is not followed.
         fs::write(&path, "pid=4242\nlog=C:\\Windows\\System32\\config\\SAM\n").expect("write");
