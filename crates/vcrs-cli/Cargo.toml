@@ -16,7 +16,6 @@ path = "src/main.rs"
 [dependencies]
 vcrs-core = { path = "../vcrs-core" }
 vcrs-mount = { path = "../vcrs-mount" }
-vcrs-host = { path = "../vcrs-host" }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 log.workspace = true
@@ -26,6 +25,7 @@ serde_json = "1"
 zeroize.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+vcrs-host = { path = "../vcrs-host" }
 winapi = { version = "0.3", features = [
     "cfgmgr32",
     "consoleapi",

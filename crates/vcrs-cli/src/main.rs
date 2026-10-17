@@ -16,7 +16,9 @@ use vcrs_core::header::{
 use vcrs_core::volume::{CreateOptions, OpenOptions, ProtectedRange, RestoreHeaderOptions, Volume};
 use vcrs_core::{EncryptionAlgorithm, Prf, VolumeLayout, VolumeType};
 
-use vcrs_cli::{agent, attach, detach, prompt, serve, status};
+#[cfg(windows)]
+use vcrs_cli::{agent, attach, detach, serve, status};
+use vcrs_cli::prompt;
 
 #[derive(Parser)]
 #[command(name = "vcrs", version, about = "VeraCrypt-compatible volume tooling")]
@@ -294,9 +296,14 @@ impl SecretSlot {
 }
 
 /// The tag that tells a framed payload from a password that simply *is* all of
-/// stdin. It is written by [`vcrs_host::serve::spawn`], which is the only thing
-/// that frames one.
-const STDIN_SECRETS_TAG: &str = vcrs_host::serve::STDIN_SECRETS_TAG;
+/// stdin. It is written by `serve::spawn`, which is the only thing that frames
+/// one, and a test below keeps the two spellings equal.
+const STDIN_SECRETS_TAG: &str = "vcrs-stdin-secrets v1";
+
+/// How long the cached agent waits for work before it stops, in minutes. It has
+/// to stay equal to [`vcrs_host::agent::DEFAULT_IDLE`], which lives on the side
+/// that only exists on Windows; a test below keeps the two in step there.
+const AGENT_IDLE_MINUTES: f64 = 10.0;
 
 /// All of stdin, read once: two `--*-stdin` flags would otherwise fight over it.
 fn stdin_all() -> &'static [u8] {
@@ -527,7 +534,8 @@ struct MountArgs {
     /// `/mountoption headerbak`). Useful when the primary header is damaged.
     #[arg(long)]
     backup: bool,
-    /// Put the mounted volume on this drive letter, e.g. `--letter Y`.
+    /// Put the mounted volume on this drive letter, e.g. `--letter Y` (Windows
+    /// only: it drives the Microsoft iSCSI Initiator).
     ///
     /// The attach needs an elevated prompt, so this asks Windows for one (a
     /// single UAC prompt) and waits for it; from an already elevated prompt
@@ -536,7 +544,9 @@ struct MountArgs {
     /// the prompt comes back — the volume stays mounted until `vcrs dismount`
     /// (or until the initiator logs out and the idle timeout runs out).
     /// `--foreground` keeps serving in this terminal instead, which is what
-    /// `vcrs mount` does without `--letter`.
+    /// `vcrs mount` does without `--letter` — and what it does on every
+    /// platform that has no iSCSI initiator to drive (it prints the commands,
+    /// or the `iscsiadm` lines on Linux, instead).
     #[arg(long, value_name = "LETTER")]
     letter: Option<char>,
     /// Serve the volume in this terminal even when `--letter` is given (Ctrl-C
@@ -565,7 +575,7 @@ struct AgentArgs {
     #[arg(long, conflicts_with_all = ["serve", "stop"])]
     status: bool,
     /// Minutes with no requests after which the helper ends itself.
-    #[arg(long, value_name = "MINUTES", default_value_t = agent::DEFAULT_IDLE.as_secs_f64() / 60.0)]
+    #[arg(long, value_name = "MINUTES", default_value_t = AGENT_IDLE_MINUTES)]
     idle: f64,
 }
 
@@ -1045,6 +1055,7 @@ fn main() -> ExitCode {
                 std::process::exit(INTERRUPTED_EXIT_CODE);
             }
             eprintln!("vcrs: error: {e:#}");
+            #[cfg(windows)]
             if e.downcast_ref::<attach::Cancelled>().is_some() {
                 // `std::process::exit` keeps the whole 32-bit code; an `ExitCode`
                 // built from a `u8` would truncate 1223 to 199.
@@ -1455,6 +1466,9 @@ fn run() -> Result<()> {
             iscsi.chap = a.chap;
             // The elevated half derives the same CHAP secret from the same file
             // (`attach::read_salt`), so the path is all it needs.
+            // Only the drive-letter path hands the file to an elevated half; a
+            // target served in this terminal derives the secret itself.
+            #[cfg(windows)]
             let chap_from = if a.chap { Some(a.path.clone()) } else { None };
             if let Some(bind) = &a.bind {
                 iscsi.bind_addr = bind.clone();
@@ -1464,9 +1478,9 @@ fn run() -> Result<()> {
                 // with `os error 10048` although nothing is wrong with it. The
                 // initiator is told the portal in `AddTarget`, so a different port
                 // costs nothing.
-                iscsi.bind_addr = attach::free_bind_addr(&iscsi.bind_addr)?;
+                iscsi.bind_addr = vcrs_mount::net::free_bind_addr(&iscsi.bind_addr)?;
             }
-            if !a.allow_remote && !attach::is_loopback_addr(&iscsi.bind_addr) {
+            if !a.allow_remote && !vcrs_mount::net::is_loopback_addr(&iscsi.bind_addr) {
                 bail!(
                     "{} is not a loopback address, so the volume would be served to the network; \
                      the served disk is the decrypted volume and the target authenticates no \
@@ -1505,6 +1519,17 @@ fn run() -> Result<()> {
                         vcrs_mount::mount_iscsi(&a.path, &options, &iscsi)?
                     }
                 }
+                // On this platform there is no drive letter to put the volume
+                // on: the target is served and the platform's own initiator logs
+                // in to it, which is what the `None` arm does.
+                #[cfg(not(windows))]
+                Some(_) => bail!(
+                    "--letter needs the Microsoft iSCSI Initiator, which only Windows has; on \
+                     this platform `vcrs mount <volume>` serves the target and your own \
+                     initiator logs in to it (open-iscsi: `iscsiadm -m discovery -t sendtargets \
+                     -p <address>`, then `iscsiadm -m node -T <iqn> -l`)"
+                ),
+                #[cfg(windows)]
                 Some(letter) => {
                     // Refuse a letter that cannot work before a target is left
                     // running behind it.
@@ -1602,196 +1627,236 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::Attach(a) => {
-            // The elevated half checks both fields again (`attach::attach` calls
-            // `validate_target`), and it is the half that actually runs `iscsicli`.
-            // Checking here as well means a typo or a payload in `--iqn`/`--address`
-            // is refused before a UAC prompt is raised for it, and the caller sees
-            // the reason instead of the worker's bare exit code.
-            attach::validate_iqn(&a.iqn)?;
-            attach::validate_portal(&a.address)?;
-            // The elevated half of a mount has to run to the end; a console control
-            // event (a Ctrl-C in some arrangements, or a closing console) killed it
-            // with STATUS_CONTROL_C_EXIT in the middle of the work.
-            attach::ignore_console_control_events();
-            if !attach::is_detached_worker() {
-                return attach::wait_for_detached_worker();
-            }
-            // This is the run that had a prompt approved, so it is the run that can
-            // leave an agent behind: the commands after it need no prompt at all.
-            agent::start_if_absent();
-            let log = a.log.clone();
-            let request = attach::AttachOptions {
-                iqn: a.iqn,
-                address: a.address,
-                letter: a.letter,
-                disk_size: a.disk_size,
-                wait: std::time::Duration::from_secs(a.wait),
-                log: a.log,
-                chap_from: a.chap_from,
-            };
-            let attached = match attach::attach(&request) {
-                Ok(attached) => attached,
-                Err(err) => {
-                    // The elevated child gets a console of its own, so the process
-                    // that asked for it reads this file back: a failure has to be
-                    // in it, or all the parent sees is a bare exit code.
-                    if let Some(path) = &log {
-                        use std::io::Write as _;
-                        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
-                            let _ = writeln!(file, "vcrs: error: {err:#}");
-                            let _ = writeln!(file, "{}", attach::FAILED);
-                        }
-                    }
-                    return Err(err);
-                }
-            };
-            if json {
-                // The caller asked for a document, and the log is the only channel
-                // an elevated run has: it travels in there under a marker.
-                let letter = attached.letter.map(|letter| letter.to_string());
-                attach::report_json(
-                    log.as_deref(),
-                    &serde_json::json!({
-                        "attached": true,
-                        "iqn": request.iqn,
-                        "address": request.address,
-                        "mount_point": letter.as_deref().map(|letter| format!("{letter}:")),
-                        "disk": attached.disk,
-                        "partition": attached.partition,
-                        "note": attached.note,
-                    }),
+            #[cfg(not(windows))]
+            {
+                let _ = &a;
+                bail!(
+                    "attaching a served target to a drive letter drives the Microsoft iSCSI Initiator, which only Windows has; on this platform `vcrs mount <volume>` serves the target and your own initiator logs in to it (open-iscsi: `iscsiadm -m discovery -t sendtargets -p <address>`, then `iscsiadm -m node -T <iqn> -l`)"
                 );
             }
-            attach::mark_done(log.as_deref());
-            Ok(())
+            #[cfg(windows)]
+            {
+                // The elevated half checks both fields again (`attach::attach` calls
+                // `validate_target`), and it is the half that actually runs `iscsicli`.
+                // Checking here as well means a typo or a payload in `--iqn`/`--address`
+                // is refused before a UAC prompt is raised for it, and the caller sees
+                // the reason instead of the worker's bare exit code.
+                attach::validate_iqn(&a.iqn)?;
+                attach::validate_portal(&a.address)?;
+                // The elevated half of a mount has to run to the end; a console control
+                // event (a Ctrl-C in some arrangements, or a closing console) killed it
+                // with STATUS_CONTROL_C_EXIT in the middle of the work.
+                attach::ignore_console_control_events();
+                if !attach::is_detached_worker() {
+                    return attach::wait_for_detached_worker();
+                }
+                // This is the run that had a prompt approved, so it is the run that can
+                // leave an agent behind: the commands after it need no prompt at all.
+                agent::start_if_absent();
+                let log = a.log.clone();
+                let request = attach::AttachOptions {
+                    iqn: a.iqn,
+                    address: a.address,
+                    letter: a.letter,
+                    disk_size: a.disk_size,
+                    wait: std::time::Duration::from_secs(a.wait),
+                    log: a.log,
+                    chap_from: a.chap_from,
+                };
+                let attached = match attach::attach(&request) {
+                    Ok(attached) => attached,
+                    Err(err) => {
+                        // The elevated child gets a console of its own, so the process
+                        // that asked for it reads this file back: a failure has to be
+                        // in it, or all the parent sees is a bare exit code.
+                        if let Some(path) = &log {
+                            use std::io::Write as _;
+                            if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+                                let _ = writeln!(file, "vcrs: error: {err:#}");
+                                let _ = writeln!(file, "{}", attach::FAILED);
+                            }
+                        }
+                        return Err(err);
+                    }
+                };
+                if json {
+                    // The caller asked for a document, and the log is the only channel
+                    // an elevated run has: it travels in there under a marker.
+                    let letter = attached.letter.map(|letter| letter.to_string());
+                    attach::report_json(
+                        log.as_deref(),
+                        &serde_json::json!({
+                            "attached": true,
+                            "iqn": request.iqn,
+                            "address": request.address,
+                            "mount_point": letter.as_deref().map(|letter| format!("{letter}:")),
+                            "disk": attached.disk,
+                            "partition": attached.partition,
+                            "note": attached.note,
+                        }),
+                    );
+                }
+                attach::mark_done(log.as_deref());
+                Ok(())
+            }
         }
         Command::Dismount(a) => {
-            let target = match (&a.path, a.letter, &a.iscsi, a.all) {
-                (Some(path), _, _, _) => {
-                    // The same derivation `vcrs mount` uses for the target name:
-                    // the file stem, so `secret.vc` and `secret.hc` are one name.
-                    if path.file_stem().and_then(|stem| stem.to_str()).is_none() {
-                        bail!(
-                            "cannot tell which target {} is: pass a container path, \
-                             `--letter <LETTER>` or `--iscsi <IQN>`",
-                            path.display()
-                        );
+            #[cfg(not(windows))]
+            {
+                let _ = &a;
+                bail!(
+                    "dismounting drives the Microsoft iSCSI Initiator, which only Windows has; on this platform log the session out with your own initiator (open-iscsi: `iscsiadm -m node -u`)"
+                );
+            }
+            #[cfg(windows)]
+            {
+                let target = match (&a.path, a.letter, &a.iscsi, a.all) {
+                    (Some(path), _, _, _) => {
+                        // The same derivation `vcrs mount` uses for the target name:
+                        // the file stem, so `secret.vc` and `secret.hc` are one name.
+                        if path.file_stem().and_then(|stem| stem.to_str()).is_none() {
+                            bail!(
+                                "cannot tell which target {} is: pass a container path, \
+                                 `--letter <LETTER>` or `--iscsi <IQN>`",
+                                path.display()
+                            );
+                        }
+                        detach::Target::Iqn(vcrs_mount::IscsiMountOptions::for_volume(path).target_name)
                     }
-                    detach::Target::Iqn(vcrs_mount::IscsiMountOptions::for_volume(path).target_name)
-                }
-                (None, Some(letter), _, _) => detach::Target::Letter(letter),
-                (None, None, Some(iqn), _) => detach::Target::Iqn(iqn.clone()),
-                (None, None, None, true) => detach::Target::All,
-                // A bare `vcrs dismount` detaches everything vc-rs serves, the
-                // way VeraCrypt's `/dismount` without a volume dismounts all —
-                // but say so first, so nobody loses two volumes to a missing
-                // argument.
-                (None, None, None, false) => {
-                    println!(
-                        "no volume named: detaching every volume vc-rs serves (name one with a \
-                         container path, `--letter <LETTER>` or `--iqn <IQN>`)"
-                    );
-                    detach::Target::All
-                }
-            };
-            let options = detach::DetachOptions { target, log: a.log };
-            detach::detach_with_elevation(&options, json)?;
-            Ok(())
+                    (None, Some(letter), _, _) => detach::Target::Letter(letter),
+                    (None, None, Some(iqn), _) => detach::Target::Iqn(iqn.clone()),
+                    (None, None, None, true) => detach::Target::All,
+                    // A bare `vcrs dismount` detaches everything vc-rs serves, the
+                    // way VeraCrypt's `/dismount` without a volume dismounts all —
+                    // but say so first, so nobody loses two volumes to a missing
+                    // argument.
+                    (None, None, None, false) => {
+                        println!(
+                            "no volume named: detaching every volume vc-rs serves (name one with a \
+                             container path, `--letter <LETTER>` or `--iqn <IQN>`)"
+                        );
+                        detach::Target::All
+                    }
+                };
+                let options = detach::DetachOptions { target, log: a.log };
+                detach::detach_with_elevation(&options, json)?;
+                Ok(())
+            }
         }
         Command::Agent(a) => {
-            if a.status {
-                match agent::status() {
-                    Some(pid) => println!("the agent (pid {pid}) is running"),
-                    None => println!(
-                        "no agent is running; the next `vcrs mount --letter` or `vcrs dismount` \
-                         asks for a prompt once and leaves one behind"
-                    ),
-                }
-                return Ok(());
-            }
-            if a.stop {
-                if agent::stop() {
-                    println!("the agent was asked to stop");
-                } else {
-                    println!("no agent is running");
-                }
-                return Ok(());
-            }
-            if !a.serve {
+            #[cfg(not(windows))]
+            {
+                let _ = &a;
                 bail!(
-                    "say what to do: `vcrs agent --serve` starts one, `--status` asks after it, \
-                     `--stop` ends it"
+                    "the cached agent exists because `iscsicli` needs an administrator token, so it only exists on Windows"
                 );
             }
-            // The launcher's console is a window somebody can close, and a console
-            // app is killed with it (`0xC000013A`). The agent has to outlive its
-            // launcher, so it hands the job to a console-less child of its own and
-            // returns; that child is the agent.
-            attach::ignore_console_control_events();
-            if !attach::is_detached_worker() {
-                attach::spawn_detached_worker()?;
-                return Ok(());
+            #[cfg(windows)]
+            {
+                if a.status {
+                    match agent::status() {
+                        Some(pid) => println!("the agent (pid {pid}) is running"),
+                        None => println!(
+                            "no agent is running; the next `vcrs mount --letter` or `vcrs dismount` \
+                             asks for a prompt once and leaves one behind"
+                        ),
+                    }
+                    return Ok(());
+                }
+                if a.stop {
+                    if agent::stop() {
+                        println!("the agent was asked to stop");
+                    } else {
+                        println!("no agent is running");
+                    }
+                    return Ok(());
+                }
+                if !a.serve {
+                    bail!(
+                        "say what to do: `vcrs agent --serve` starts one, `--status` asks after it, \
+                         `--stop` ends it"
+                    );
+                }
+                // The launcher's console is a window somebody can close, and a console
+                // app is killed with it (`0xC000013A`). The agent has to outlive its
+                // launcher, so it hands the job to a console-less child of its own and
+                // returns; that child is the agent.
+                attach::ignore_console_control_events();
+                if !attach::is_detached_worker() {
+                    attach::spawn_detached_worker()?;
+                    return Ok(());
+                }
+                agent::serve(std::time::Duration::from_secs_f64(a.idle.max(0.0) * 60.0))?;
+                Ok(())
             }
-            agent::serve(std::time::Duration::from_secs_f64(a.idle.max(0.0) * 60.0))?;
-            Ok(())
         }
         Command::Detach(a) => {
-            attach::ignore_console_control_events();
-            if !attach::is_detached_worker() {
-                return attach::wait_for_detached_worker();
-            }
-            // The elevated run leaves an agent behind (see the `Attach` arm above).
-            agent::start_if_absent();
-            let log = a.log.clone();
-            let target = match (&a.iqn, a.letter, a.all) {
-                (Some(iqn), _, _) => detach::Target::Iqn(iqn.clone()),
-                (None, Some(letter), _) => detach::Target::Letter(letter),
-                (None, None, _) => detach::Target::All,
-            };
-            let options = detach::DetachOptions { target, log: a.log };
-            let mut report = attach::Report::new(log.as_deref());
-            if json {
-                // The document is the answer, so the lines written for a person are
-                // kept out of stdout (they still go into the log, which is where the
-                // caller picks the document out of).
-                report.quiet();
-            }
-            let outcome = match detach::detach(&options, &mut report) {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    // The elevated child gets a console of its own, so the process
-                    // that asked for it reads this file back: a failure has to be
-                    // in it, or all the parent sees is a bare exit code.
-                    if let Some(path) = &log {
-                        use std::io::Write as _;
-                        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
-                            let _ = writeln!(file, "vcrs: error: {err:#}");
-                            let _ = writeln!(file, "{}", attach::FAILED);
-                        }
-                    }
-                    return Err(err);
-                }
-            };
-            if json {
-                let letters: Vec<String> = outcome
-                    .letters
-                    .iter()
-                    .map(|letter| format!("{letter}:"))
-                    .collect();
-                attach::report_json(
-                    log.as_deref(),
-                    &serde_json::json!({
-                        "targets": outcome.targets,
-                        "letters": letters,
-                        "stopped": outcome.stopped,
-                        "sessions": outcome.sessions,
-                        "devices": outcome.devices,
-                        "notes": outcome.notes,
-                    }),
+            #[cfg(not(windows))]
+            {
+                let _ = &a;
+                bail!(
+                    "detaching drives the Microsoft iSCSI Initiator, which only Windows has; on this platform log the session out with your own initiator (open-iscsi: `iscsiadm -m node -u`)"
                 );
             }
-            attach::mark_done(log.as_deref());
-            Ok(())
+            #[cfg(windows)]
+            {
+                attach::ignore_console_control_events();
+                if !attach::is_detached_worker() {
+                    return attach::wait_for_detached_worker();
+                }
+                // The elevated run leaves an agent behind (see the `Attach` arm above).
+                agent::start_if_absent();
+                let log = a.log.clone();
+                let target = match (&a.iqn, a.letter, a.all) {
+                    (Some(iqn), _, _) => detach::Target::Iqn(iqn.clone()),
+                    (None, Some(letter), _) => detach::Target::Letter(letter),
+                    (None, None, _) => detach::Target::All,
+                };
+                let options = detach::DetachOptions { target, log: a.log };
+                let mut report = attach::Report::new(log.as_deref());
+                if json {
+                    // The document is the answer, so the lines written for a person are
+                    // kept out of stdout (they still go into the log, which is where the
+                    // caller picks the document out of).
+                    report.quiet();
+                }
+                let outcome = match detach::detach(&options, &mut report) {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        // The elevated child gets a console of its own, so the process
+                        // that asked for it reads this file back: a failure has to be
+                        // in it, or all the parent sees is a bare exit code.
+                        if let Some(path) = &log {
+                            use std::io::Write as _;
+                            if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+                                let _ = writeln!(file, "vcrs: error: {err:#}");
+                                let _ = writeln!(file, "{}", attach::FAILED);
+                            }
+                        }
+                        return Err(err);
+                    }
+                };
+                if json {
+                    let letters: Vec<String> = outcome
+                        .letters
+                        .iter()
+                        .map(|letter| format!("{letter}:"))
+                        .collect();
+                    attach::report_json(
+                        log.as_deref(),
+                        &serde_json::json!({
+                            "targets": outcome.targets,
+                            "letters": letters,
+                            "stopped": outcome.stopped,
+                            "sessions": outcome.sessions,
+                            "devices": outcome.devices,
+                            "notes": outcome.notes,
+                        }),
+                    );
+                }
+                attach::mark_done(log.as_deref());
+                Ok(())
+            }
         }
     }
 }
@@ -1900,7 +1965,9 @@ static INTERRUPTIBLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// exits with it, because it is not a success (even though it is resumable).
 const INTERRUPTED_EXIT_CODE: i32 = 130;
 
-/// How many times Ctrl-C has been pressed.
+/// How many times Ctrl-C has been pressed. Only the Windows handler counts
+/// them, but the test below drives it everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
 static INTERRUPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Let the first Ctrl-C ask for a clean stop instead of killing the process where
@@ -3048,6 +3115,23 @@ mod tests {
         Command,
     };
     use clap::Parser;
+
+    /// The tag is written by the server half, which is compiled out elsewhere, so
+    /// only here can the two spellings be compared.
+    #[cfg(windows)]
+    #[test]
+    fn the_framed_secrets_tag_matches_the_server() {
+        assert_eq!(super::STDIN_SECRETS_TAG, vcrs_host::serve::STDIN_SECRETS_TAG);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_agent_idle_default_matches_the_agent() {
+        assert_eq!(
+            std::time::Duration::from_secs_f64(super::AGENT_IDLE_MINUTES * 60.0),
+            super::agent::DEFAULT_IDLE
+        );
+    }
 
     #[test]
     fn an_output_may_not_be_the_volume_it_comes_from() {

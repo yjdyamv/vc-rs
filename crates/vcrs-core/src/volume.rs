@@ -12,7 +12,9 @@
 //!   offset is `host_offset / 512` regardless of where the data area starts.
 
 use std::fs::File;
-use std::io::{ErrorKind, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
+#[cfg(windows)]
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;

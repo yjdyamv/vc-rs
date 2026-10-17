@@ -378,7 +378,7 @@ mod windows {
                 )));
             }
             let partition = query_partition(&file);
-            let boot = read_boot_sector(&file, &device_path)?;
+            let boot = boot_sector_fs(&file, &device_path)?;
             let ntfs = query_ntfs(&file);
             let volume_path = dos_device_path(&device_path);
             let is_system_volume = match &volume_path {
@@ -746,31 +746,6 @@ mod windows {
         })
     }
 
-    /// Read the first sector and name the filesystem in it.
-    fn read_boot_sector(file: &File, path: &Path) -> Result<Option<String>> {
-        let mut sector = [0u8; 512];
-        match crate::volume::read_exact_at(file, 0, &mut sector) {
-            Ok(()) => {}
-            Err(e) => {
-                log::warn!("could not read the boot sector of {}: {e}", path.display());
-                return Ok(None);
-            }
-        }
-        // Name the filesystem from the boot sector the way VeraCrypt's own
-        // checks do (src/Format/InPlace.c).
-        let name = if sector[3..11].starts_with(b"NTFS") {
-            Some("NTFS")
-        } else if sector[3..11] == *b"EXFAT   " {
-            Some("exFAT")
-        } else if sector[82..90] == *b"FAT32   " {
-            Some("FAT32")
-        } else if sector[3..11].starts_with(b"MSDOS") || sector[3..11].starts_with(b"MSWIN") {
-            Some("FAT")
-        } else {
-            None
-        };
-        Ok(name.map(|name| name.to_string()))
-    }
 
     /// The `\Device\HarddiskVolumeN` name behind a device path, when the
     /// system knows one.
@@ -844,61 +819,207 @@ mod windows {
     }
 }
 
-#[cfg(not(windows))]
-pub struct Device {
-    _private: (),
+/// A raw device opened for byte access on Unix.
+///
+/// A partition is a block device node here, so the same `File` reads and writes
+/// that a container file gets work unchanged. What Windows queries through
+/// ioctls has no portable equivalent and is not guessed at: `ntfs` stays `None`,
+/// so the in-place device paths refuse with their "only NTFS can be shrunk"
+/// reason instead of writing somewhere this program cannot verify. (VeraCrypt on
+/// Linux takes the same position: you shrink the filesystem yourself and then
+/// map the device.)
+#[cfg(unix)]
+mod unix {
+    use super::*;
+    use std::fs::File;
+    use std::io::{Seek, SeekFrom};
+    use std::os::unix::fs::FileTypeExt;
+
+    /// `BLKSSZGET`: the logical sector size of a block device.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const BLKSSZGET: std::ffi::c_ulong = 0x1268;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    extern "C" {
+        fn ioctl(fd: std::ffi::c_int, request: std::ffi::c_ulong, ...) -> std::ffi::c_int;
+    }
+
+    /// Whether the path is a block device (`/dev/sdb1`, `/dev/loop0`, ...).
+    pub fn is_block_device(path: &Path) -> bool {
+        std::fs::metadata(path)
+            .map(|metadata| metadata.file_type().is_block_device())
+            .unwrap_or(false)
+    }
+
+    /// The sector size the device reports, when the platform can say.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn sector_size(file: &File) -> Option<u32> {
+        use std::os::fd::AsRawFd;
+        let mut size: u32 = 0;
+        // SAFETY: the descriptor is open for the whole call and `BLKSSZGET`
+        // writes exactly one `u32` through the pointer.
+        let rc = unsafe { ioctl(file.as_raw_fd(), BLKSSZGET, &mut size as *mut u32) };
+        (rc == 0 && size != 0).then_some(size)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn sector_size(_file: &File) -> Option<u32> {
+        None
+    }
+
+    fn unsupported(path: &Path) -> Error {
+        Error::Unsupported(format!(
+            "encrypting a device in place needs the filesystem to shrink itself so that the volume \
+             header fits, and only NTFS can be asked to do that from here, so {} is refused. \
+             Shrink the filesystem yourself and encrypt an image of it with `encrypt-in-place`",
+            path.display()
+        ))
+    }
+
+    /// A raw device (partition or whole disk) opened for byte access.
+    pub struct Device {
+        file: File,
+        info: DeviceInfo,
+    }
+
+    impl Device {
+        /// Open a block device for raw access.
+        pub fn open(path: &Path, writable: bool) -> Result<Device> {
+            if !is_block_device(path) {
+                return Err(Error::InvalidParameter(format!(
+                    "'{}' is not a block device; pass a device node such as /dev/sdb1 (a mounted \
+                     filesystem is refused, because raw access to it would corrupt it)",
+                    path.display()
+                )));
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(writable)
+                .open(path)
+                .map_err(|e| {
+                    Error::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("opening {}: {e}", path.display()),
+                    ))
+                })?;
+            // `metadata().len()` is 0 for a block device; seeking to its end
+            // reports the size, which is what the header offsets are computed
+            // from.
+            let size = file.seek(SeekFrom::End(0)).map_err(|e| {
+                Error::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("asking {} for its size: {e}", path.display()),
+                ))
+            })?;
+            if size == 0 {
+                return Err(Error::InvalidParameter(format!(
+                    "the device {} reports a size of 0 bytes",
+                    path.display()
+                )));
+            }
+            file.seek(SeekFrom::Start(0))?;
+            let info = DeviceInfo {
+                path: path.to_path_buf(),
+                volume_path: None,
+                size,
+                sector_size: sector_size(&file).unwrap_or(512),
+                partition_style: None,
+                partition_number: None,
+                is_service_partition: false,
+                is_system_volume: false,
+                boot_sector_fs: boot_sector_fs(&file, path)?,
+                ntfs: None,
+            };
+            Ok(Device { file, info })
+        }
+
+        /// What was found on the device.
+        pub fn info(&self) -> &DeviceInfo {
+            &self.info
+        }
+
+        /// The underlying handle, so the container code can read and write
+        /// through it.
+        pub fn file(&self) -> &File {
+            &self.file
+        }
+
+        /// Hand over the handle, so `Volume` can own it.
+        pub fn into_file(self) -> File {
+            self.file
+        }
+
+        /// Size of the device in bytes.
+        pub fn len(&self) -> u64 {
+            self.info.size
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len() == 0
+        }
+
+        /// Windows needs an ioctl to reach the sectors a filesystem driver
+        /// guards; a Unix block device has no such guard.
+        pub fn allow_extended_dasd_io(&self) -> Result<()> {
+            Ok(())
+        }
+
+        pub fn probe_shrink(&self, _new_size: u64) -> Result<ShrinkProbe> {
+            Err(unsupported(&self.info.path))
+        }
+
+        /// Refused on purpose: the in-place paths would otherwise write plaintext
+        /// over a filesystem this program cannot shrink, and there is no portable
+        /// "dismount this volume" call to make first.
+        pub fn lock_and_dismount(&self) -> Result<()> {
+            Err(unsupported(&self.info.path))
+        }
+
+        pub fn shrink_ntfs_to(&self, _new_size: u64) -> Result<()> {
+            Err(unsupported(&self.info.path))
+        }
+
+        pub fn shrink_ntfs_for_in_place(&self) -> Result<u64> {
+            Err(unsupported(&self.info.path))
+        }
+
+        pub fn conceal(&self, _on: bool) -> Result<()> {
+            Ok(())
+        }
+    }
 }
 
-#[cfg(not(windows))]
-impl Device {
-    pub fn open(_path: &Path, _writable: bool) -> Result<Device> {
-        Err(Error::Unsupported(
-            "raw device access is only implemented on Windows".to_string(),
-        ))
+#[cfg(unix)]
+pub use unix::Device;
+/// Read the first sector and name the filesystem in it.
+///
+/// Only NTFS can be shrunk, so this decides whether a device can host an
+/// in-place run, and `device-info` reports it everywhere.
+fn boot_sector_fs(file: &std::fs::File, path: &Path) -> Result<Option<String>> {
+    let mut sector = [0u8; 512];
+    match crate::volume::read_exact_at(file, 0, &mut sector) {
+        Ok(()) => {}
+        Err(e) => {
+            log::warn!("could not read the boot sector of {}: {e}", path.display());
+            return Ok(None);
+        }
     }
-
-    pub fn info(&self) -> &DeviceInfo {
-        unreachable!()
-    }
-
-    pub fn file(&self) -> &std::fs::File {
-        unreachable!()
-    }
-
-    pub fn len(&self) -> u64 {
-        0
-    }
-
-    pub fn is_empty(&self) -> bool {
-        true
-    }
-
-    pub fn allow_extended_dasd_io(&self) -> Result<()> {
-        Ok(())
-    }
-
-    pub fn probe_shrink(&self, _new_size: u64) -> Result<ShrinkProbe> {
-        Err(Error::Unsupported(
-            "raw device access is only implemented on Windows".to_string(),
-        ))
-    }
-
-    pub fn shrink_ntfs_to(&self, _new_size: u64) -> Result<()> {
-        Err(Error::Unsupported(
-            "raw device access is only implemented on Windows".to_string(),
-        ))
-    }
-
-    pub fn lock_and_dismount(&self) -> Result<()> {
-        Ok(())
-    }
-
-    pub fn conceal(&self, _on: bool) -> Result<()> {
-        Ok(())
-    }
+    let name = if sector[3..11].starts_with(b"NTFS") {
+        Some("NTFS")
+    } else if sector[3..11] == *b"EXFAT   " {
+        Some("exFAT")
+    } else if sector[82..90] == *b"FAT32   " {
+        Some("FAT32")
+    } else if sector[3..11].starts_with(b"MSDOS") || sector[3..11].starts_with(b"MSWIN") {
+        Some("FAT")
+    } else {
+        None
+    };
+    Ok(name.map(|name| name.to_string()))
 }
 
 /// Whether a path looks like a raw device rather than a file.
+#[cfg(windows)]
 pub fn looks_like_device(path: &Path) -> bool {
     let text = path.to_string_lossy();
     if text.starts_with(r"\\.\") {
@@ -906,6 +1027,17 @@ pub fn looks_like_device(path: &Path) -> bool {
     }
     let bytes = text.as_bytes();
     bytes.len() == 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
+}
+
+/// Whether a path looks like a raw device rather than a file.
+///
+/// On Unix a partition is a block device node, so that is what a raw device
+/// looks like: `/dev/sdb1`, `/dev/nvme0n1p2`, `/dev/loop0`, `/dev/mapper/x`.
+#[cfg(unix)]
+pub fn looks_like_device(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| std::os::unix::fs::FileTypeExt::is_block_device(&metadata.file_type()))
+        .unwrap_or(false)
 }
 
 /// Open a device and describe it without changing anything.

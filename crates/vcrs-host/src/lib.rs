@@ -13,6 +13,16 @@
 //! `serve::spawn`, `status::snapshot`). It is the implementation of the CLI rather
 //! than a frozen API yet; the crypto and block-device layers underneath are
 //! `vcrs-core` and `vcrs-mount`.
+//!
+//! # Platform support
+//!
+//! Windows only, and deliberately so: every module here drives a Win32 facility
+//! (the iSCSI initiator service, drive letters, named pipes, the process token).
+//! On other platforms this crate compiles to nothing, and the `vcrs` command line
+//! serves a volume over iSCSI for the platform's own initiator to pick up instead
+//! of attaching it to a letter itself.
+
+#![cfg(windows)]
 
 pub mod agent;
 pub mod attach;

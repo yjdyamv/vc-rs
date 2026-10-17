@@ -1201,39 +1201,6 @@ pub fn first_line(text: &str) -> Option<String> {
         .map(|line| line.to_string())
 }
 
-/// The address a server should listen on: `preferred` when it is free, the first
-/// free port above it otherwise.
-///
-/// Two volumes cannot share a portal, and the default portal is `127.0.0.1:3260`,
-/// so without this a second `vcrs mount` fails with `os error 10048` (address
-/// already in use) although nothing is wrong with the request. Windows' initiator
-/// is told the portal in `AddTarget`, so a different port costs nothing.
-pub fn free_bind_addr(preferred: &str) -> Result<String> {
-    let (host, port) = split_address(preferred);
-    let mut last = None;
-    for candidate in port..port.saturating_add(PORT_SEARCH) {
-        let address = format!("{host}:{candidate}");
-        match std::net::TcpListener::bind(&address) {
-            Ok(listener) => {
-                // Free right now: the server that is about to start binds it for
-                // real. Nothing else can take it in between but this program.
-                drop(listener);
-                return Ok(address);
-            }
-            Err(err) => last = Some(err),
-        }
-    }
-    bail!(
-        "no free port between {port} and {} for the iSCSI target on {host}: {}",
-        port.saturating_add(PORT_SEARCH - 1),
-        last.map(|err| err.to_string()).unwrap_or_default()
-    )
-}
-
-/// How many ports above the preferred one are tried before giving up.
-const PORT_SEARCH: u16 = 32;
-
-/// Split `host:port` (the form `IscsiMount::addr` uses) for `iscsicli`.
 /// Check the two `AttachOptions` fields that end up in an `iscsicli` call before
 /// any of it runs, so a bad value fails here rather than after a UAC prompt.
 fn validate_target(options: &AttachOptions) -> Result<()> {
@@ -1313,61 +1280,16 @@ pub fn validate_portal(address: &str) -> Result<()> {
     Ok(())
 }
 
-fn split_address(address: &str) -> (String, u16) {
-    // A bare IPv6 address is nothing but colons, so `rsplit_once(':')` would read its
-    // last group as the port: `--address ::1` used to come out as the host `::` (every
-    // interface) and the port `1`.  A string that parses as an address in full is
-    // therefore an address without a port, in the bare form and in the bracketed form
-    // with the port left out.  An address *with* a port stays unambiguous only when
-    // the brackets are there (`[::1]:3260`), which is what the RFCs require.
-    let bare = address.trim();
-    let unbracketed = bare
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .unwrap_or(bare);
-    if let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() {
-        return (ip.to_string(), 3260);
-    }
-    match address.rsplit_once(':') {
-        Some((host, port)) => match port.parse() {
-            Ok(port) => (host.trim_matches(['[', ']']).to_string(), port),
-            Err(_) => (address.to_string(), 3260),
-        },
-        None => (address.to_string(), 3260),
-    }
-}
+/// The portal arithmetic lives in `vcrs_mount::net`, because `vcrs mount` needs
+/// it on every platform and only the `iscsicli` call behind it is Windows-only.
+pub use vcrs_mount::net::{is_loopback_addr, split_address};
 
-/// Whether an iSCSI portal is one only this machine can reach.
+/// Kept here so the Windows half keeps one entry point for the portal it picks.
 ///
-/// The threat this guards is `--bind 0.0.0.0:3260`: the disk the target serves is
-/// the *decrypted* volume, the vendored target stores `AuthConfig::None` and
-/// never checks a CHAP exchange or an allowed-initiator list, and its sessions
-/// are plaintext. A loopback bind is the only one that is safe by default, so
-/// anything else has to be asked for explicitly.
-pub fn is_loopback_addr(address: &str) -> bool {
-    let address = address.trim();
-    // A bare IPv6 address is all colons, and `split_address` would read its last
-    // group as a port, so try the whole string first.
-    if let Ok(ip) = address.parse::<std::net::IpAddr>() {
-        return ip.is_loopback();
-    }
-    let (host, port) = split_address(address);
-    if port == 0 {
-        return false;
-    }
-    let host = host.trim();
-    if host.is_empty() {
-        // `:3260` listens on every interface.
-        return false;
-    }
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    match host.parse::<std::net::IpAddr>() {
-        Ok(ip) => ip.is_loopback(),
-        // A name this cannot resolve is assumed to be reachable.
-        Err(_) => false,
-    }
+/// The arithmetic itself is in `vcrs_mount::net`, because `vcrs mount` needs it
+/// on every platform and only the `iscsicli` call behind it is Windows-only.
+pub fn free_bind_addr(preferred: &str) -> Result<String> {
+    vcrs_mount::net::free_bind_addr(preferred).map_err(Into::into)
 }
 
 /// Output that goes to the terminal and, for an elevated child, to a log file.

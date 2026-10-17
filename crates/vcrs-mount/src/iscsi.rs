@@ -943,54 +943,7 @@ pub fn mount_iscsi_with(
             // serves the volume but does not log the initiator in, so no drive
             // letter appears until something runs the two commands below. Say so
             // before printing them.
-            eprintln!("nothing is attached yet, so no drive letter has appeared: this command only");
-            eprintln!("serves the volume. `vcrs mount <volume> --letter Y` does the rest of the work");
-            eprintln!("(it asks for one elevation prompt); by hand, from an ELEVATED prompt:");
-            // The manual recipe has to match how the session was actually
-            // started: with CHAP the two credential arguments carry the user
-            // and the derived secret (see `vcrs_core::chap_secret`, and
-            // `vcrs attach --chap-from <volume>` does this for you), and the
-            // authentication type is 1 instead of 0.
-            if opts.chap {
-                eprintln!(
-                    "    iscsicli AddTarget {} vcrs {} {} 0 0 0 0 0 8 0 0 {} <secret> 1 0",
-                    mount.target_name(),
-                    portal_host(mount.addr()),
-                    portal_port(mount.addr()),
-                    vcrs_core::CHAP_USER,
-                );
-            } else {
-                eprintln!(
-                    "    iscsicli AddTarget {} vcrs {} {} 0 0 0 0 0 8 0 0 \"\" \"\" 0 0",
-                    mount.target_name(),
-                    portal_host(mount.addr()),
-                    portal_port(mount.addr()),
-                );
-            }
-            eprintln!("    iscsicli QLoginTarget {}", mount.target_name());
-            eprintln!();
-            eprintln!("(a *static* target is registered because the target crate cannot complete the");
-            eprintln!(" initiator's multi-PDU login during a portal *scan*)");
-            if opts.chap {
-                eprintln!("(this target asks for CHAP: the two arguments before the 1 are the user and");
-                eprintln!(" the secret, which is derived from the container's header salt, so a hand-");
-                eprintln!(" written command has to use `vcrs attach --chap-from <volume>` to get it right)");
-            } else {
-                eprintln!("(the two empty strings are the CHAP user/password and the trailing 0 means");
-                eprintln!(" 'no authentication'; use `--chap` to require authentication instead)");
-            }
-            eprintln!();
-            eprintln!("Windows then shows the volume as a partitioned disk: the data area appears as a");
-            eprintln!("single partition (the container itself keeps its VeraCrypt layout).");
-            eprintln!("detach it again with:");
-            eprintln!("    iscsicli QLogoutTarget {}", mount.target_name());
-            eprintln!("    iscsicli LogoutTarget <SessionId>      (see: iscsicli SessionList 1)");
-            eprintln!("    iscsicli RemoveTarget {}", mount.target_name());
-            eprintln!(
-                "    (or: vcrs dismount --iscsi {} -- it also takes the disk offline first,",
-                mount.target_name()
-            );
-            eprintln!("     because Windows refuses to log out a session whose disk is still in use)");
+            print_manual_instructions(&mount, opts.chap);
         }
     }
     eprintln!();
@@ -1000,14 +953,127 @@ pub fn mount_iscsi_with(
         eprintln!(
             "this process keeps serving the volume until you press Ctrl-C, and stops by itself\n\
              {} s after the last initiator logs out (pass --idle-timeout 0 to keep serving\n\
-             through a logout, e.g. while Windows reboots).",
+             through a logout, e.g. while the initiator reboots).",
             opts.idle_timeout.as_secs_f32(),
         );
     }
     mount.wait()
 }
 
+/// Prints how to log an initiator in to the target that is now serving.
+///
+/// The recipe differs per platform: on Windows it drives the Microsoft iSCSI
+/// Initiator (`iscsicli`, which needs an elevated prompt), everywhere else it
+/// drives open-iscsi (`iscsiadm`, which needs root). CHAP changes both, because
+/// the credentials have to reach the initiator.
+#[cfg(windows)]
+fn print_manual_instructions(mount: &IscsiMount, chap: bool) {
+    // The trap this wording exists for: `vcrs mount` without `--letter` serves
+    // the volume but does not log the initiator in, so no drive letter appears
+    // until something runs the commands below. Say so before printing them.
+    eprintln!("nothing is attached yet, so no drive letter has appeared: this command only");
+    eprintln!("serves the volume. `vcrs mount <volume> --letter Y` does the rest of the work");
+    eprintln!("(it asks for one elevation prompt); by hand, from an ELEVATED prompt:");
+    // The manual recipe has to match how the session was actually started: with
+    // CHAP the two credential arguments carry the user and the derived secret
+    // (see `vcrs_core::chap_secret`, and `vcrs attach --chap-from <volume>` does
+    // this for you), and the authentication type is 1 instead of 0.
+    if chap {
+        eprintln!(
+            "    iscsicli AddTarget {} vcrs {} {} 0 0 0 0 0 8 0 0 {} <secret> 1 0",
+            mount.target_name(),
+            portal_host(mount.addr()),
+            portal_port(mount.addr()),
+            vcrs_core::CHAP_USER,
+        );
+    } else {
+        eprintln!(
+            "    iscsicli AddTarget {} vcrs {} {} 0 0 0 0 0 8 0 0 \"\" \"\" 0 0",
+            mount.target_name(),
+            portal_host(mount.addr()),
+            portal_port(mount.addr()),
+        );
+    }
+    eprintln!("    iscsicli QLoginTarget {}", mount.target_name());
+    eprintln!();
+    eprintln!("(a *static* target is registered because the target crate cannot complete the");
+    eprintln!(" initiator's multi-PDU login during a portal *scan*)");
+    if chap {
+        eprintln!("(this target asks for CHAP: the two arguments before the 1 are the user and");
+        eprintln!(" the secret, which is derived from the container's header salt, so a hand-");
+        eprintln!(" written command has to use `vcrs attach --chap-from <volume>` to get it right)");
+    } else {
+        eprintln!("(the two empty strings are the CHAP user/password and the trailing 0 means");
+        eprintln!(" 'no authentication'; use `--chap` to require authentication instead)");
+    }
+    eprintln!();
+    eprintln!("Windows then shows the volume as a partitioned disk: the data area appears as a");
+    eprintln!("single partition (the container itself keeps its VeraCrypt layout).");
+    eprintln!("detach it again with:");
+    eprintln!("    iscsicli QLogoutTarget {}", mount.target_name());
+    eprintln!("    iscsicli LogoutTarget <SessionId>      (see: iscsicli SessionList 1)");
+    eprintln!("    iscsicli RemoveTarget {}", mount.target_name());
+    eprintln!(
+        "    (or: vcrs dismount --iscsi {} -- it also takes the disk offline first,",
+        mount.target_name()
+    );
+    eprintln!("     because Windows refuses to log out a session whose disk is still in use)");
+}
+
+/// Prints how to log an initiator in to the target that is now serving.
+///
+/// On this platform that is open-iscsi: `iscsiadm` attaches the target as a
+/// `/dev/sdX`, and `vcrs` deliberately does not run it, because it needs root
+/// and the disk it creates has to be mounted like any other block device.
+#[cfg(not(windows))]
+fn print_manual_instructions(mount: &IscsiMount, chap: bool) {
+    eprintln!("nothing is attached yet: this command only serves the volume. Log the initiator in");
+    eprintln!("from another terminal (root is needed, not UAC):");
+    eprintln!();
+    eprintln!(
+        "    iscsiadm -m discovery -t sendtargets -p {}",
+        mount.addr()
+    );
+    eprintln!("    iscsiadm -m node -T {} -l", mount.target_name());
+    eprintln!();
+    eprintln!("the volume then appears as a new block device (look at `dmesg | tail` for the name)");
+    eprintln!("with the data area as its only partition; mount that partition like any other.");
+    if chap {
+        eprintln!();
+        eprintln!(
+            "this target asks for CHAP: the user is `{}` and the secret is derived from the",
+            vcrs_core::CHAP_USER
+        );
+        eprintln!("container's header salt, so set it on the node entry:");
+        eprintln!(
+            "    iscsiadm -m node -T {} --op=update --name=node.session.auth.authmethod --value=CHAP",
+            mount.target_name()
+        );
+        eprintln!(
+            "    iscsiadm -m node -T {} --op=update --name=node.session.auth.username --value={}",
+            mount.target_name(),
+            vcrs_core::CHAP_USER
+        );
+        eprintln!(
+            "    iscsiadm -m node -T {} --op=update --name=node.session.auth.password --<secret>",
+            mount.target_name()
+        );
+        eprintln!("(`vcrs attach --chap-from <volume>` prints the secret to type in)");
+    } else {
+        eprintln!();
+        eprintln!("this target asks for no authentication: use `--chap` to require it.");
+    }
+    eprintln!();
+    eprintln!("detach it again with:");
+    eprintln!("    iscsiadm -m node -T {} -u", mount.target_name());
+    eprintln!(
+        "    (or: iscsiadm -m node -T {} -o delete)",
+        mount.target_name()
+    );
+}
+
 /// The host part of a `host:port` address, as `iscsicli` expects it.
+#[cfg(windows)]
 fn portal_host(addr: &str) -> &str {
     match addr.rsplit_once(':') {
         Some((host, _port)) => host,
@@ -1016,6 +1082,7 @@ fn portal_host(addr: &str) -> &str {
 }
 
 /// The port part of a `host:port` address, as `iscsicli AddTarget` expects it.
+#[cfg(windows)]
 fn portal_port(addr: &str) -> &str {
     match addr.rsplit_once(':') {
         Some((_host, port)) => port,

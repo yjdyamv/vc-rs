@@ -24,6 +24,24 @@ iSCSI 发起程序（加 `--letter S` 就在同一条命令里挂到指定盘符
   attaches it, so Windows' own signed NTFS/exFAT/FAT drivers do the filesystem work. The
   [iscsi-target](https://github.com/lawless-m/iscsi-crate) crate is vendored (patched) under
   `vendor/iscsi-target` — see [Mounting](#mounting-how-and-why).
+## Platform support
+
+VeraCrypt's format and every container operation are platform-independent; only the
+*hosting* half is Windows-shaped, because the only iSCSI initiator this project drives is
+the one Microsoft ships.
+
+| | Windows | Linux / macOS |
+| --- | --- | --- |
+| Containers: `create`, `create-hidden`, `info`, `header`, `read`, `write`, `format`, `change`, `backup-headers`, `restore-headers`, `expand`, `encrypt-in-place`, `decrypt-in-place`, `create-keyfile`, `test` | yes | yes |
+| Byte compatibility | yes | yes (verified both ways: a container written on Linux reads back identical on Windows and the other way round) |
+| `vcrs mount` (serve the decrypted data area over iSCSI) | yes | yes (prints the `iscsiadm` lines; any initiator that speaks iSCSI works) |
+| `vcrs mount --letter`, `vcrs attach`, `vcrs dismount`, `vcrs detach`, `vcrs list`, `vcrs agent` | yes | no: they drive `iscsicli` and the Microsoft initiator, so they say what to run by hand instead |
+| In-place encryption of a mounted **NTFS partition** (`/encdev`) | yes (shrinks and locks the filesystem first) | no: no shrink/lock support, so encrypt an image of the partition with `encrypt-in-place` instead |
+
+The Linux build is exercised by the full test suite; `crates/vcrs-core` has no platform
+dependencies at all, `crates/vcrs-mount` talks to `/dev` block devices directly, and
+`crates/vcrs-host` (the `iscsicli`/drive-letter half) is compiled to nothing off Windows.
+
 * Not used: Dokany/WinFsp. They are *filesystem* frameworks, so they could only ever expose a
   filesystem we implement ourselves (FAT), never NTFS. See
   [Why not Dokany](#why-not-dokany); the removed implementation lives in the git history.
@@ -89,7 +107,9 @@ touching any volume, so a broken build shows up before it writes a container.
 
 ## Build
 
-The vendored Botan build compiles its own C++, so **MSVC must be on the environment**.
+The vendored Botan build compiles its own C++, so **MSVC must be on the environment**
+on Windows (a C++ compiler and CMake are enough on Linux and macOS, where `cargo build`
+just works: `sudo apt install build-essential cmake`).
 Use the wrapper:
 
 ```bash

@@ -45,6 +45,10 @@
 mod device;
 mod fat;
 
+/// Portal arithmetic (`host:port`) shared by the Windows attach half and the
+/// foreground server on every platform.
+pub mod net;
+
 /// Present the volume as a raw block device over iSCSI (the initiator's own
 /// NTFS/exFAT drivers then mount it).
 pub mod iscsi;
