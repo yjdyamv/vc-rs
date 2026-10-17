@@ -131,6 +131,15 @@ pub fn spawn(
         .stdin(Stdio::piped())
         .stdout(Stdio::from(file.try_clone()?))
         .stderr(Stdio::from(file));
+    // This process writes what it says to a file that outlives the command, and at the
+    // default level that includes `opened V2Hidden volume with PRF … and AES` — a line
+    // that says a hidden volume exists, which is the one thing it exists to hide. Nobody
+    // asking for `RUST_LOG` gets overruled; without it the file keeps warnings and errors
+    // only, and the handshake line the parent waits for is printed straight to stderr and
+    // is not affected by the filter.
+    if std::env::var_os("RUST_LOG").is_none() {
+        command.env("RUST_LOG", "warn");
+    }
 
     #[cfg(windows)]
     {
