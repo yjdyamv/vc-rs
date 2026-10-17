@@ -2845,6 +2845,18 @@ pub fn read_header_group(path: &Path) -> Result<Vec<u8>> {
 ///
 /// Returns the number of bytes written.
 pub fn backup_headers(path: &Path, out: &Path) -> Result<u64> {
+    // `std::fs::write` truncates, so writing the backup over the container it was
+    // taken from would leave a 128 KiB file where the volume used to be.
+    let same = match (path.canonicalize(), out.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => path == out,
+    };
+    if same {
+        return Err(Error::InvalidParameter(format!(
+            "the header backup would be written over {} itself; give it another name",
+            out.display()
+        )));
+    }
     let group = read_header_group(path)?;
     std::fs::write(out, &group)?;
     Ok(group.len() as u64)
@@ -3345,6 +3357,31 @@ mod tests {
             data_size
         ));
         assert!(!in_place_area_is_sane(u64::MAX, 1, data_size));
+    }
+
+    #[test]
+    fn a_header_backup_may_not_land_on_the_container() {
+        let dir = std::env::temp_dir();
+        let container = dir.join(format!("vcrs-clobber-{}.vc", std::process::id()));
+        let backup = dir.join(format!("vcrs-clobber-{}.hc", std::process::id()));
+        std::fs::write(&container, b"not really a volume").unwrap();
+        let _ = std::fs::remove_file(&backup);
+
+        // The refusal happens before the header is even read, so a file that is not
+        // a volume is enough to prove it — and the container is left alone.
+        let err = super::backup_headers(&container, &container).unwrap_err();
+        assert!(format!("{err}").contains("another name"), "{err}");
+        assert_eq!(std::fs::read(&container).unwrap(), b"not really a volume");
+
+        // Another name gets past the guard and fails on the contents instead, which is
+        // what says the guard is about the *path* and not about the file not being a
+        // volume.
+        let err = super::backup_headers(&container, &backup).unwrap_err();
+        assert!(!format!("{err}").contains("another name"), "{err}");
+        assert!(!backup.exists());
+
+        let _ = std::fs::remove_file(&container);
+        let _ = std::fs::remove_file(&backup);
     }
 }
 

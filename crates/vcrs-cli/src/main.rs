@@ -1202,6 +1202,9 @@ fn run() -> Result<()> {
         }
         Command::Header(a) => dump_header_region(&a, json),
         Command::Read(a) => {
+            if let Some(out) = &a.out {
+                refuse_to_clobber(out, &a.path)?;
+            }
             let volume = open_ro(&a.path, &a.password, a.kind.volume_type())?;
             check_read_range(volume.data_size, a.offset, a.length)?;
             if let Some(out) = a.out {
@@ -2606,6 +2609,28 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     create_private(path)?.write_all(bytes)
 }
 
+/// Refuse an output path that is the volume it is about to be filled from.
+///
+/// `vcrs read <volume> --out <volume>` used to truncate the container and *then*
+/// try to read the data area out of it, which destroyed the volume and lost the
+/// data. Resolving both paths also catches the same file reached through a
+/// symlink or a `..`; when the output does not exist yet (the usual case)
+/// canonicalize fails, and the paths are compared as they were written.
+fn refuse_to_clobber(output: &std::path::Path, input: &std::path::Path) -> Result<()> {
+    let same = match (output.canonicalize(), input.canonicalize()) {
+        (Ok(output), Ok(input)) => output == input,
+        _ => output == input,
+    };
+    if same {
+        bail!(
+            "the output {} is the volume being read, so writing there would destroy it; \
+             give the output another name",
+            output.display()
+        );
+    }
+    Ok(())
+}
+
 /// Check a `read` request against the volume before it decides an allocation.
 ///
 /// `--length` is whatever the caller typed: turning a terabyte straight into a
@@ -3020,9 +3045,28 @@ fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_read_range, format_master_key, human_size, parse_sector_size, Cli, Command,
+        check_read_range, format_master_key, human_size, parse_sector_size, refuse_to_clobber, Cli,
+        Command,
     };
     use clap::Parser;
+
+    #[test]
+    fn an_output_may_not_be_the_volume_it_comes_from() {
+        let dir = std::env::temp_dir();
+        let volume = dir.join("vcrs-clobber-cli.vc");
+        std::fs::write(&volume, b"x").unwrap();
+
+        // The same path, and the same file reached through another spelling of the
+        // same path, are both refused.
+        assert!(refuse_to_clobber(&volume, &volume).is_err());
+        assert!(refuse_to_clobber(&dir.join(".").join("vcrs-clobber-cli.vc"), &volume).is_err());
+
+        // A different output is fine, whether or not it exists yet.
+        assert!(refuse_to_clobber(&dir.join("vcrs-clobber-cli.out"), &volume).is_ok());
+        assert!(refuse_to_clobber(&dir.join("vcrs-clobber-cli-missing.out"), &volume).is_ok());
+
+        let _ = std::fs::remove_file(&volume);
+    }
 
     #[test]
     fn a_read_longer_than_the_data_area_is_refused() {
