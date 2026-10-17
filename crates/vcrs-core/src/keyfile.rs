@@ -128,6 +128,14 @@ fn process_path(
     })?;
 
     if !metadata.is_dir() {
+        // A keyfile is read from the start; a device or a pipe would either block for
+        // ever or hand back whatever is on it, so only a regular file is accepted.
+        if !metadata.is_file() {
+            return Err(Error::InvalidParameter(format!(
+                "keyfile {} is neither a regular file nor a directory",
+                path.display()
+            )));
+        }
         process_file(pool, path)?;
         *used += 1;
         return Ok(());
@@ -146,7 +154,7 @@ fn process_path(
         if metadata.is_dir() {
             continue; // VeraCrypt does not scan recursively
         }
-        if is_hidden(&metadata) {
+        if is_hidden(&candidate, &metadata) {
             continue;
         }
         if let Some(volume) = volume {
@@ -171,6 +179,18 @@ fn process_file(pool: &mut [u8], path: &Path) -> Result<()> {
     let mut file = File::open(path).map_err(|e| {
         Error::InvalidParameter(format!("cannot open keyfile {}: {e}", path.display()))
     })?;
+    // The metadata comes from the open handle, not from the name that was checked a
+    // moment ago: whatever this name pointed at when it was checked, *this* is the
+    // file about to be read, and reading it has to be a plain file read.
+    let metadata = file.metadata().map_err(|e| {
+        Error::InvalidParameter(format!("cannot examine keyfile {}: {e}", path.display()))
+    })?;
+    if !metadata.is_file() {
+        return Err(Error::InvalidParameter(format!(
+            "keyfile {} is not a regular file",
+            path.display()
+        )));
+    }
 
     let mut crc: u32 = 0xFFFF_FFFF;
     let mut write_pos = 0usize;
@@ -210,14 +230,18 @@ fn process_file(pool: &mut [u8], path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn is_hidden(metadata: &std::fs::Metadata) -> bool {
+fn is_hidden(_path: &Path, metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     metadata.file_attributes() & 0x2 != 0 // FILE_ATTRIBUTE_HIDDEN
 }
 
+/// On Unix a dot file is the hidden file (this is what VeraCrypt's Linux build
+/// skips as well); the metadata is not needed for it.
 #[cfg(not(windows))]
-fn is_hidden(_metadata: &std::fs::Metadata) -> bool {
-    false
+fn is_hidden(path: &Path, _metadata: &std::fs::Metadata) -> bool {
+    path.file_name()
+        .map(|name| name.to_string_lossy().starts_with('.'))
+        .unwrap_or(false)
 }
 
 fn is_same_file(a: &Path, b: &Path) -> bool {
