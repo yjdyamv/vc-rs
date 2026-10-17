@@ -490,11 +490,12 @@ struct MountArgs {
     bind: Option<String>,
     /// Serve the volume on a portal other machines can reach.
     ///
-    /// The iSCSI target this program starts does not authenticate or encrypt its
-    /// sessions and stores `AuthConfig::None` for the target, so anyone who can
-    /// open a TCP connection to a non-loopback bind address reads and writes the
-    /// mounted volume in the clear. Only pass this on a network you trust.
-    #[arg(long, requires = "bind")]
+    /// The iSCSI target this program starts does not encrypt its sessions, so anyone
+    /// who can open a TCP connection to a non-loopback bind address can read the
+    /// bytes that travel over it. `--chap` is required as well: without it the
+    /// target also accepts a session from anyone at all. Only pass this on a network
+    /// you trust.
+    #[arg(long, requires_all = ["bind", "chap"])]
     allow_remote: bool,
     /// IQN the iSCSI target is published under.
     #[arg(long, value_name = "IQN")]
@@ -1466,7 +1467,7 @@ fn run() -> Result<()> {
                 bail!(
                     "{} is not a loopback address, so the volume would be served to the network; \
                      the served disk is the decrypted volume and the target authenticates no \
-                     session, so pass --allow-remote if that is really what you want",
+                     session, so pass --allow-remote --chap if that is really what you want",
                     iscsi.bind_addr
                 );
             }

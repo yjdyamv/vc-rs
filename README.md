@@ -213,7 +213,8 @@ vcrs mount both.vc --password outer --chap --letter S
 `vcrs` serves the volume to the in-box Microsoft iSCSI Initiator over loopback TCP.
 That target has no authentication of its own and hands out the decrypted volume, which
 is why a non-loopback `--bind` is refused unless `--allow-remote` says it was meant
-(`--allow-remote` adds no authentication and no encryption). On Windows, `--chap` makes
+(and `--allow-remote` now requires `--chap`, so a remote bind is never unauthenticated;
+it adds no encryption). On Windows, `--chap` makes
 the target ask for CHAP; both halves derive the same 16-character secret from the
 container's header salt, so the secret is never typed, passed on a command line or
 written anywhere — a process can only log in if it can read the container file, which is
