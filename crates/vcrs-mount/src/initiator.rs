@@ -134,20 +134,36 @@ fn slug(name: &str) -> String {
 /// home when the command ran through `sudo` — the record has to be readable by
 /// the unprivileged `vcrs list` that follows.
 pub fn state_dir() -> PathBuf {
-    let base = match sudo_uid() {
-        Some(_) => sudo_home(),
-        None => None,
-    };
-    if let Some(home) = base {
-        return home.join(".cache").join("vcrs");
+    // The privileged command writes these records and the unprivileged one reads
+    // them, so both have to land in the same directory. `sudo` resets HOME and
+    // XDG_RUNTIME_DIR to root's, which is why the invoking user's candidates are
+    // built from their uid (and their /etc/passwd home) instead of the
+    // environment.
+    let sudo = sudo_uid();
+    let mut bases: Vec<PathBuf> = Vec::new();
+    if sudo.is_none() {
+        if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
+            bases.push(PathBuf::from(dir));
+        }
     }
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
-        return PathBuf::from(dir).join("vcrs");
+    let uid = sudo.unwrap_or_else(|| unsafe { libc::geteuid() });
+    bases.push(PathBuf::from(format!("/run/user/{uid}")));
+    let home = sudo_home().or_else(|| {
+        std::env::var_os("HOME")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+    });
+    if let Some(home) = home {
+        bases.push(home.join(".cache"));
     }
-    if let Some(home) = std::env::var_os("HOME").filter(|dir| !dir.is_empty()) {
-        return PathBuf::from(home).join(".cache").join("vcrs");
+    bases.push(std::env::temp_dir());
+    let first = bases.first().cloned().unwrap_or_default();
+    for base in &bases {
+        if base.is_dir() {
+            return base.join("vcrs");
+        }
     }
-    std::env::temp_dir().join("vcrs")
+    first.join("vcrs")
 }
 
 /// The log file the detached server will write.
@@ -405,6 +421,11 @@ pub fn mount_served(
     ensure_initiator()?;
     // Discovery is what makes `iscsiadm -m node` know the target; it is
     // idempotent, so running it for every mount is fine.
+    // A record left behind by an earlier run of this IQN would point at the
+    // portal of that run, and `--login` would go there instead of here.
+    let _ = Command::new("iscsiadm")
+        .args(["-m", "node", "-T", iqn, "-o", "delete"])
+        .output();
     run("iscsiadm", &["-m", "discovery", "-t", "sendtargets", "-p", portal])?;
     run(
         "iscsiadm",

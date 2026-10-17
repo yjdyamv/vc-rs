@@ -1321,10 +1321,10 @@ fn handle_multi_target_connection(
     stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(IscsiError::Io)?;
     stream.set_write_timeout(Some(Duration::from_secs(5))).map_err(IscsiError::Io)?;
 
-    let target_address = match local_addr {
-        std::net::SocketAddr::V4(addr) => addr.ip().to_string(),
-        std::net::SocketAddr::V6(addr) => format!("[{}]", addr.ip()),
-    };
+    // The port belongs in a SendTargets reply: an initiator that records the
+    // target without one falls back to the well-known 3260 whatever port the
+    // server is really on. `SocketAddr`'s Display already brackets IPv6.
+    let target_address = local_addr.to_string();
 
     // Create initial session for login phase
     let _session = AnySession::new();
@@ -1505,10 +1505,10 @@ fn handle_connection_with_first_pdu_boxed(
 ) -> ScsiResult<bool> {
     // Similar to handle_connection but with first PDU already read
     let local_addr = stream.local_addr().map_err(IscsiError::Io)?;
-    let target_address = match local_addr {
-        std::net::SocketAddr::V4(addr) => addr.ip().to_string(),
-        std::net::SocketAddr::V6(addr) => format!("[{}]", addr.ip()),
-    };
+    // The port belongs in a SendTargets reply: an initiator that records the
+    // target without one falls back to the well-known 3260 whatever port the
+    // server is really on. `SocketAddr`'s Display already brackets IPv6.
+    let target_address = local_addr.to_string();
 
     // The session that answers the *first* login PDU has to carry the target's
     // authentication configuration: that PDU is where the initiator offers

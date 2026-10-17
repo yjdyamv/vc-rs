@@ -175,3 +175,14 @@ These change no behaviour; they are here so that `cargo clippy --workspace
   `TARGET_VERSION > login.version_max` half was dead code — both sides are
   unsigned, so it was never true (`clippy::absurd_extreme_comparisons`, denied by
   default).
+
+## (8) `src/target.rs` — a SendTargets reply has to name the port
+
+The multi-target connection handlers built the advertised address from
+`local_addr.ip()` alone, so a target listening on anything other than the
+well-known 3260 answered discovery with `TargetAddress=127.0.0.1,1`. open-iscsi
+then records the node at 3260 and `iscsiadm --login` either finds no record for
+the portal the server really uses ("No records found") or connects to whatever
+else is on 3260. Both handlers now use `local_addr.to_string()`, which carries
+the port and brackets IPv6. Windows never noticed: `iscsicli AddTarget` is given
+the portal explicitly.
