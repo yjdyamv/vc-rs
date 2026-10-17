@@ -699,10 +699,12 @@ impl TypestateSession<SecurityNegotiation> {
 
                 if supports_chap || chap_in_progress {
                     if chap_a.is_none() && self.data.chap_state.is_none() {
-                        Ok((false, vec![
-                            ("TargetPortalGroupTag".to_string(), "1".to_string()),
-                            ("AuthMethod".to_string(), "CHAP".to_string()),
-                        ]))
+                        // `TargetPortalGroupTag` does not belong in a security
+                        // negotiation reply: open-iscsi aborts the login with
+                        // "Unexpected key present". The final login response
+                        // carries it (the Microsoft initiator did not mind, but
+                        // the tag was never valid here).
+                        Ok((false, vec![("AuthMethod".to_string(), "CHAP".to_string())]))
                     } else if chap_a.is_some() && self.data.chap_state.is_none() {
                         let chap_state = ChapAuthState::new(false);
                         // `AuthMethod` has to be in this reply as well. An
@@ -714,13 +716,24 @@ impl TypestateSession<SecurityNegotiation> {
                         // "the initiator requires CHAP for login authentication,
                         // but the target did not offer CHAP". RFC 3720 12.10
                         // shows AuthMethod in this response too.
-                        let result = vec![
-                            ("AuthMethod".to_string(), "CHAP".to_string()),
-                            ("TargetPortalGroupTag".to_string(), "1".to_string()),
+                        // Only echo `AuthMethod` when the initiator offered the
+                        // method and the algorithm in one PDU (the Microsoft one
+                        // does, and without the echo it concludes the target
+                        // does not offer CHAP at all: iScsiPrt event 38).
+                        // open-iscsi sends `CHAP_A` in a PDU of its own, after
+                        // the `AuthMethod=CHAP` reply, and calls anything but
+                        // `CHAP_A`/`CHAP_I`/`CHAP_C` here "Unexpected key
+                        // present", which ends the login.
+                        let offered_method = params.iter().any(|(k, _)| k == "AuthMethod");
+                        let mut result = Vec::new();
+                        if offered_method {
+                            result.push(("AuthMethod".to_string(), "CHAP".to_string()));
+                        }
+                        result.extend([
                             ("CHAP_A".to_string(), "5".to_string()),
                             ("CHAP_I".to_string(), chap_state.identifier_str()),
                             ("CHAP_C".to_string(), chap_state.challenge_hex()),
-                        ];
+                        ]);
                         self.data.chap_state = Some(chap_state);
                         Ok((false, result))
                     } else if self.data.chap_state.is_some() {

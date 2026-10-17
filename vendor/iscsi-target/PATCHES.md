@@ -101,8 +101,9 @@ Covered by `typestate_session::tests::a_login_that_skips_security_negotiation_*`
 SecurityNegotiation request and its response; the Microsoft initiator requires
 it and does not answer a challenge that omits it.
 
-**Fix.** The challenge reply now carries `AuthMethod=CHAP` in front of
-`TargetPortalGroupTag`, `CHAP_A`, `CHAP_I` and `CHAP_C`.
+**Fix.** The challenge reply carries `AuthMethod=CHAP` in front of `CHAP_A`,
+`CHAP_I` and `CHAP_C` — but only when the initiator put `AuthMethod` in the same
+login PDU (see (9); open-iscsi sends `CHAP_A` on its own and rejects the echo).
 
 ## (6) `src/target.rs` — the connection handler has to use the configured session
 
@@ -186,3 +187,26 @@ the portal the server really uses ("No records found") or connects to whatever
 else is on 3260. Both handlers now use `local_addr.to_string()`, which carries
 the port and brackets IPv6. Windows never noticed: `iscsicli AddTarget` is given
 the portal explicitly.
+
+## (9) `src/typestate_session.rs` — keep `TargetPortalGroupTag` and a repeated `AuthMethod` out of the security negotiation
+
+**Cause.** Two replies in `handle_chap_auth` broke open-iscsi (which is
+stricter than the Microsoft initiator):
+
+* both carried `TargetPortalGroupTag=1`.  That key belongs to the operational
+  negotiation stage; `iscsiadm` aborts the login with
+  `Login authentication failed with target , Unexpected key present`.
+* the challenge reply always echoed `AuthMethod=CHAP`.  When `iscsiadm` sends
+  `AuthMethod=CHAP` first and then `CHAP_A=5` in a PDU of its own, that echo is
+  an unexpected key and the login dies the same way.  The Microsoft initiator
+  offers `AuthMethod` *and* `CHAP_A` in one PDU and needs the echo (see (5)).
+
+**Fix.** `TargetPortalGroupTag` is gone from both security-negotiation replies
+(the final login response still carries it), and `AuthMethod` is echoed only
+when the incoming PDU contained it.
+
+**Verified.** Against the vendored `examples/chap_target` with `open-iscsi`
+2.1.11 on Ubuntu 26.04: before, `iscsiadm -m discoverydb … --discover` failed
+with "Unexpected key present"; after, discovery succeeds, `iscsiadm --login`
+succeeds and `/dev/sdb` (160 MB) appears.  Windows was re-checked afterwards:
+`vcrs mount --chap --letter Y` still logs in and reads a file.

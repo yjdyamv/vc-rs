@@ -12,6 +12,14 @@ use byteorder::{BigEndian, ByteOrder};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, Shutdown};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+/// The address a SendTargets reply advertises: the local end of the accepted
+/// connection, which is the address the initiator just reached. The port has to
+/// be part of it, or an initiator records the target at the well-known 3260
+/// whatever port the server is really on.
+fn advertised_address(local_addr: std::net::SocketAddr) -> String {
+    local_addr.to_string()
+}
+
 use std::thread;
 use std::time::Duration;
 
@@ -214,7 +222,7 @@ fn handle_connection<D: ScsiBlockDevice>(
 
     // Address for discovery responses. On a connected socket, local_addr
     // resolves to the actual interface IP even when bound to 0.0.0.0.
-    let target_address = local_addr.to_string();
+    let target_address = advertised_address(local_addr);
 
     // Clone stream for writer — reader thread handles NOP-Out directly
     let mut write_stream = stream.try_clone().map_err(IscsiError::Io)?;
@@ -1324,7 +1332,7 @@ fn handle_multi_target_connection(
     // The port belongs in a SendTargets reply: an initiator that records the
     // target without one falls back to the well-known 3260 whatever port the
     // server is really on. `SocketAddr`'s Display already brackets IPv6.
-    let target_address = local_addr.to_string();
+    let target_address = advertised_address(local_addr);
 
     // Create initial session for login phase
     let _session = AnySession::new();
@@ -1508,7 +1516,7 @@ fn handle_connection_with_first_pdu_boxed(
     // The port belongs in a SendTargets reply: an initiator that records the
     // target without one falls back to the well-known 3260 whatever port the
     // server is really on. `SocketAddr`'s Display already brackets IPv6.
-    let target_address = local_addr.to_string();
+    let target_address = advertised_address(local_addr);
 
     // The session that answers the *first* login PDU has to carry the target's
     // authentication configuration: that PDU is where the initiator offers
@@ -2128,6 +2136,25 @@ mod tests {
     /// CHAP for login authentication, but the target did not offer CHAP") and
     /// CHAP could not be turned on at all. This drives the real handler over a
     /// real socket pair.
+    #[test]
+    fn a_sendtargets_reply_names_the_port_and_brackets_ipv6() {
+        use std::net::SocketAddr;
+        // The bug this pins: the address used to be built from `ip()` alone, so
+        // open-iscsi recorded the node at 3260 and the login never found it.
+        assert_eq!(
+            advertised_address("127.0.0.1:3261".parse::<SocketAddr>().unwrap()),
+            "127.0.0.1:3261"
+        );
+        assert_eq!(
+            advertised_address("0.0.0.0:3260".parse::<SocketAddr>().unwrap()),
+            "0.0.0.0:3260"
+        );
+        assert_eq!(
+            advertised_address("[::1]:3262".parse::<SocketAddr>().unwrap()),
+            "[::1]:3262"
+        );
+    }
+
     #[test]
     fn a_configured_connection_answers_the_first_login_with_chap() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

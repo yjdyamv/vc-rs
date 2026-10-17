@@ -2346,6 +2346,24 @@ fn mount_on_this_host(
         return Err(anyhow::anyhow!("{err}"));
     }
     let container = a.path.canonicalize().unwrap_or_else(|_| a.path.clone());
+    // A CHAP target refuses a login that cannot prove the secret, and the
+    // secret is derived from the container both halves already have, so the
+    // mounted side computes it exactly the way the serving side did.
+    let chap = if iscsi.chap {
+        Some((
+            vcrs_core::CHAP_USER.to_string(),
+            vcrs_core::chap_secret_for_file(&container, &iscsi.target_name)
+                .map_err(|err| anyhow::anyhow!("{err}"))?,
+        ))
+    } else {
+        None
+    };
+    let knobs = initiator::MountKnobs {
+        read_only: iscsi.read_only,
+        auth: chap
+            .as_ref()
+            .map(|(user, secret)| (user.as_str(), secret.as_str())),
+    };
     let session = match initiator::mount_served(
         &iscsi.target_name,
         &iscsi.bind_addr,
@@ -2353,6 +2371,7 @@ fn mount_on_this_host(
         a.mount_point.as_deref(),
         pid,
         log.clone(),
+        knobs,
     ) {
         Ok(session) => session,
         Err(err) => {

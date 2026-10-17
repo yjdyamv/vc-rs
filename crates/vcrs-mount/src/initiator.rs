@@ -354,13 +354,28 @@ fn filesystem_label(device: &Path) -> Option<String> {
 /// Mount options that make the files usable by the person who asked for the
 /// mount, for the filesystems that need to be told (Windows' drive letters are
 /// owned by their user too, and a root-owned FAT volume would be a regression).
-fn mount_options(filesystem: Option<&str>) -> Option<String> {
-    let (uid, gid) = (sudo_uid()?, sudo_gid()?);
-    match filesystem {
-        Some("vfat") | Some("exfat") | Some("ntfs") | Some("ntfs3") | Some("fuseblk") => {
-            Some(format!("uid={uid},gid={gid},umask=0022"))
+fn mount_options(filesystem: Option<&str>, read_only: bool) -> Option<String> {
+    let mut options: Vec<String> = Vec::new();
+    if read_only {
+        options.push("ro".to_string());
+    }
+    if matches!(
+        filesystem,
+        Some("vfat" | "exfat" | "ntfs" | "ntfs3" | "fuseblk")
+    ) {
+        // FAT and NTFS cannot carry unix ownership, so the mount has to be told
+        // whose files these are; otherwise everything is root's and the caller
+        // cannot write to a volume they just unlocked.
+        if let (Some(uid), Some(gid)) = (sudo_uid(), sudo_gid()) {
+            options.push(format!("uid={uid}"));
+            options.push(format!("gid={gid}"));
+            options.push("umask=0022".to_string());
         }
-        _ => None,
+    }
+    if options.is_empty() {
+        None
+    } else {
+        Some(options.join(","))
     }
 }
 
@@ -410,6 +425,79 @@ fn is_mounted(path: &Path) -> bool {
 ///
 /// Returns the record that `vcrs dismount` needs. On failure everything this call
 /// did is undone, so a failed mount does not leave a logged-in session behind.
+/// How the served target should be mounted.
+#[derive(Clone, Copy, Default)]
+pub struct MountKnobs<'a> {
+    /// Mount the filesystem read-only (the volume itself may also be read-only).
+    pub read_only: bool,
+    /// CHAP credentials `(user, secret)` the login has to present, when the
+    /// target asks for CHAP.
+    pub auth: Option<(&'a str, &'a str)>,
+}
+
+/// Configure `iscsiadm`'s persistent node record with the CHAP credentials.
+fn set_auth(iqn: &str, portal: &str, user: &str, secret: &str) -> Result<()> {
+    run(
+        "iscsiadm",
+        &[
+            "-m",
+            "node",
+            "-T",
+            iqn,
+            "-p",
+            portal,
+            "-o",
+            "update",
+            "-n",
+            "node.session.auth.authmethod",
+            "-v",
+            "CHAP",
+            "-n",
+            "node.session.auth.username",
+            "-v",
+            user,
+            "-n",
+            "node.session.auth.password",
+            "-v",
+            secret,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Discovery is its own iSCSI session and is authenticated separately, so the
+/// same credentials have to go into the discovery database as well.
+fn set_discovery_auth(portal: &str, user: &str, secret: &str) -> Result<()> {
+    let _ = Command::new("iscsiadm")
+        .args(["-m", "discoverydb", "-t", "sendtargets", "-p", portal, "--op=new"])
+        .output();
+    run(
+        "iscsiadm",
+        &[
+            "-m",
+            "discoverydb",
+            "-t",
+            "sendtargets",
+            "-p",
+            portal,
+            "--op=update",
+            "-n",
+            "discovery.sendtargets.auth.authmethod",
+            "-v",
+            "CHAP",
+            "-n",
+            "discovery.sendtargets.auth.username",
+            "-v",
+            user,
+            "-n",
+            "discovery.sendtargets.auth.password",
+            "-v",
+            secret,
+        ],
+    )?;
+    Ok(())
+}
+
 pub fn mount_served(
     iqn: &str,
     portal: &str,
@@ -417,6 +505,7 @@ pub fn mount_served(
     mount_point: Option<&Path>,
     pid: u32,
     log: PathBuf,
+    knobs: MountKnobs<'_>,
 ) -> Result<Session> {
     ensure_initiator()?;
     // Discovery is what makes `iscsiadm -m node` know the target; it is
@@ -426,7 +515,13 @@ pub fn mount_served(
     let _ = Command::new("iscsiadm")
         .args(["-m", "node", "-T", iqn, "-o", "delete"])
         .output();
+    if let Some((user, secret)) = knobs.auth {
+        set_discovery_auth(portal, user, secret)?;
+    }
     run("iscsiadm", &["-m", "discovery", "-t", "sendtargets", "-p", portal])?;
+    if let Some((user, secret)) = knobs.auth {
+        set_auth(iqn, portal, user, secret)?;
+    }
     run(
         "iscsiadm",
         &["-m", "node", "-T", iqn, "-p", portal, "--login"],
@@ -445,7 +540,7 @@ pub fn mount_served(
     };
     let filesystem = filesystem_type(&device);
     let mut command = Command::new("mount");
-    if let Some(options) = mount_options(filesystem.as_deref()) {
+    if let Some(options) = mount_options(filesystem.as_deref(), knobs.read_only) {
         command.arg("-o").arg(options);
     }
     let created = std::fs::create_dir_all(&mount_point).is_ok();
@@ -464,7 +559,7 @@ pub fn mount_served(
                 || reason.contains("can't read superblock")
                 || reason.contains("bad option")
             {
-                "; the volume has no filesystem this system can read — `vcrs format <volume>`                  puts a FAT32 one inside it"
+                "; the volume has no filesystem this system can read — `vcrs format <volume>` puts a FAT32 one inside it; if it is NTFS, `apt install ntfs-3g` (or use a kernel with ntfs3)"
             } else {
                 ""
             };
@@ -626,13 +721,20 @@ mod tests {
         std::env::set_var("SUDO_UID", "1000");
         std::env::set_var("SUDO_GID", "1000");
         assert_eq!(
-            mount_options(Some("vfat")).as_deref(),
+            mount_options(Some("vfat"), false).as_deref(),
             Some("uid=1000,gid=1000,umask=0022")
         );
-        assert_eq!(mount_options(Some("ext4")), None);
-        assert_eq!(mount_options(None), None);
+        assert_eq!(mount_options(Some("ext4"), false), None);
+        assert_eq!(mount_options(None, false), None);
+        // A read-only volume must be mounted read-only, and a filesystem that
+        // needs no id options still needs `ro`.
+        assert_eq!(
+            mount_options(Some("vfat"), true).as_deref(),
+            Some("ro,uid=1000,gid=1000,umask=0022")
+        );
+        assert_eq!(mount_options(Some("ext4"), true).as_deref(), Some("ro"));
         std::env::remove_var("SUDO_UID");
         std::env::remove_var("SUDO_GID");
-        assert_eq!(mount_options(Some("vfat")), None);
+        assert_eq!(mount_options(Some("vfat"), false), None);
     }
 }
