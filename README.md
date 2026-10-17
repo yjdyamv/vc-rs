@@ -721,15 +721,22 @@ from moving while it is mounted, and `Volume` freezes them before its first read
 one trace out of several, and it is the only one this program touches. Writing to a
 container still leaves, untouched: NTFS `$UsnJrnl` records (append-only, with offsets and
 timestamps), Prefetch and Amcache entries for `vcrs.exe`, ETW/Defender telemetry, the
-SRUM database, and — for `--letter` mounts — the container-derived or random IQN in the
-Microsoft iSCSI Initiator's registry list and event log. Assume that *when* a container was
+SRUM database, and — for `--letter` mounts — the IQN in the Microsoft iSCSI Initiator's
+registry list and event log (random per mount unless `--target-name` gives one). Assume that *when* a container was
 used is recoverable on Windows even with timestamp preservation on; what the flag buys is
 that the container's own timestamp does not testify to it.
 
 Two more things are deliberately not defended against, because they cannot be fixed inside
-this program. A crash dump (WER or a manual one) contains the process's memory, including
-the pages `VirtualLock`ed for the master key, and only a policy outside the process can stop
-dumps from being written. And the unlock itself is observable: a larger PIM or a slower KDF
-makes `--password`-based opens measurably slower, so a local process that can time them
-learns something about the volume's parameters (the PIM is not stored in the header, but it
-is not hidden by timing either).
+this program. A crash dump (WER or a manual one) contains the process's memory: the master
+key is excluded from the dumps Windows Error Reporting writes
+(`WerRegisterExcludedMemoryBlock`), but a manually taken dump, a `LocalDumps` policy or
+`hiberfil.sys` can still contain it, and only a policy outside the process can stop them.
+And the unlock itself is observable: a larger PIM or a slower KDF makes `--password`-based
+opens measurably slower, so a local process that can time them learns something about the
+volume's parameters (the PIM is not stored in the header, but it is not hidden by timing
+either).
+
+The program's own leftovers are kept out of `%TEMP%`: the background server's state file and
+log live in `%LOCALAPPDATA%\vcrs` (0700/0600 on Unix), are removed when the volume is
+dismounted, and are swept if a server died without one. A log that is left behind says
+nothing about the volume's layout unless `RUST_LOG` asked for it.
