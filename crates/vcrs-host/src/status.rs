@@ -47,6 +47,9 @@ pub struct Server {
     pub pid: u32,
     /// The drive letter it was mounted on, when it was mounted on one.
     pub letter: Option<char>,
+    /// The container it is serving, as recorded when it was started (a state
+    /// file written by an older version does not have it).
+    pub container: Option<std::path::PathBuf>,
 }
 
 /// One disk Windows shows under the vc-rs disk name.
@@ -85,6 +88,7 @@ pub fn snapshot(all: bool) -> Snapshot {
             iqn: server.iqn,
             pid: server.pid,
             letter: server.letter,
+            container: server.container,
         })
         .collect();
 

@@ -2618,12 +2618,15 @@ fn list_mounts(a: &ListArgs, json: bool) -> Result<()> {
         if !state.servers.is_empty() {
             println!("serving in the background:");
             for server in &state.servers {
-                match server.letter {
-                    Some(letter) => {
-                        println!("  {}  (pid {}, on {letter}:)", server.iqn, server.pid)
+                let where_ = match (&server.container, server.letter) {
+                    (Some(container), Some(letter)) => {
+                        format!("{}, on {letter}:", container.display())
                     }
-                    None => println!("  {}  (pid {})", server.iqn, server.pid),
-                }
+                    (Some(container), None) => container.display().to_string(),
+                    (None, Some(letter)) => format!("on {letter}:"),
+                    (None, None) => "no container recorded".to_string(),
+                };
+                println!("  {}  (pid {}, {where_})", server.iqn, server.pid);
             }
         }
         if state.disks.is_empty() {
